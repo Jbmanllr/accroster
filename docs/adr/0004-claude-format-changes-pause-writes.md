@@ -19,4 +19,8 @@ The app relies on undocumented Claude formats: Sidebar entries and their folder 
   - an unknown live-process `status`, or a desktop Claude Code child process with no live-process file, means "busy" or "can't tell" for the Guided switch guard;
   - an unknown limit `kind` is shown and counts toward the tightest limit.
 - If a Profile directory's `auth status` identity disagrees with its `oauthAccount`, or every Profile reports the same identity, CLI switching gets a Safety pause: the pointer is frozen and the menu bar label shows `?`.
+- The self-check also reads the `env` block of the shared `settings.json` and of managed settings, again whenever the shared file's mtime changes (checked on menu open and before each pointer write). The shim can't clear these values, and they apply under every Profile:
+  - `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` or `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` gives CLI switching a Safety pause: the first overrides the pointer, the others put one account behind every Profile's name;
+  - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or a provider variable only warns once that those Sessions don't use the Profile's subscription;
+  - `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` only warns once that a nested `claude` follows the CLI's Active Profile instead of its Session's.
 - Only a replaced `projects/`, `file-history/` or `session-env/` link pauses anything, and its Profile's row shows "Transcripts not shared". Other replaced links only warn in that Profile's details.

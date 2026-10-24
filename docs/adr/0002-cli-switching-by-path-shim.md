@@ -11,7 +11,8 @@ A `claude` shell script in the app's own `bin/` directory, put first on PATH by 
 
 ## Consequences
 
-- A `CLAUDE_CONFIG_DIR` already in the environment wins over the pointer. That is the per-shell override, and it keeps a `claude` started inside a Session on that Session's Profile. The shim always unsets `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+- A `CLAUDE_CONFIG_DIR` already in the environment wins over the pointer. That is the per-shell override, and it keeps a `claude` started inside a Session on that Session's Profile.
+- On every launch, whether or not an inherited `CLAUDE_CONFIG_DIR` wins, the shim silently unsets the variables that would put another identity or credential under the Profile's name: `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `CLAUDE_CODE_ACCOUNT_UUID`, `CLAUDE_CODE_USER_EMAIL`, `CLAUDE_CODE_ORGANIZATION_UUID`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER`. This also stops the desktop app's injected token from reaching a `claude` started inside a desktop Session. API-key and provider variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, `CLAUDE_CODE_USE_*`, `ANTHROPIC_BASE_URL`) pass through: they are deliberate, and `/status` shows them. There is no opt-out; running the real binary directly is the escape hatch. The app's own Claude Code spawns clear every `CLAUDE*` and `ANTHROPIC_*` variable except the `CLAUDE_CONFIG_DIR` they set.
 - The IDE extensions, the desktop app and anything not started from a zsh shell bypass the shim and use `~/.claude`.
 - Profiles are linked only where Claude Code's writes keep the link, checked against the 2.1.296 bundle:
   - **Directories** (every writer is safe): `projects`, `file-history`, `tasks`, `plans`, `session-env`, `skills`, `agents`, `commands`, `hooks`, `output-styles`, `plugins`.
