@@ -20,6 +20,10 @@ _Avoid_: account, identity
 The Profile a given client (the desktop app or the CLI) is currently signed in as; the two clients can differ.
 _Avoid_: current account
 
+**Discovered Profile**:
+A Profile the app has evidence of on the Mac but holds no sign-in for; listed greyed until signed in.
+_Avoid_: found profile, ghost profile, unsigned profile
+
 **Guided switch**:
 Changing the desktop app's Active Profile by the user signing out and in themselves, led and then confirmed by the app.
 _Avoid_: desktop switch (alone), auto-switch
