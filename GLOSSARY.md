@@ -30,6 +30,10 @@ _Avoid_: hourly limit, session (alone)
 The rolling 7-day usage allowance of a Profile, including any model-specific weekly allowance.
 _Avoid_: monthly limit
 
+**Banked reset**:
+A saved, not-yet-used reset of one of a Profile's limits, redeemable until its expiry date.
+_Avoid_: reset grant, reset credit
+
 ## Sessions
 
 **Session**:
