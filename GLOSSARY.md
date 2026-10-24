@@ -20,6 +20,10 @@ _Avoid_: account, identity
 The Profile a given client (the desktop app or the CLI) is currently signed in as; the two clients can differ.
 _Avoid_: current account
 
+**Guided switch**:
+Changing the desktop app's Active Profile by the user signing out and in themselves, led and then confirmed by the app.
+_Avoid_: desktop switch (alone), auto-switch
+
 ## Usage
 
 **Session limit**:
