@@ -38,6 +38,10 @@ _Avoid_: monthly limit
 A saved, not-yet-used reset of one of a Profile's limits, redeemable until its expiry date.
 _Avoid_: reset grant, reset credit
 
+**Limit reading**:
+All of a Profile's limits as fetched at one moment, with the time it was taken.
+_Avoid_: usage data, snapshot, figures
+
 ## Sessions
 
 **Session**:
