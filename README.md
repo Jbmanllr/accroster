@@ -2,6 +2,8 @@
 
 Notes and tooling for using several Claude accounts on one Mac with the Claude desktop app and Claude Code CLI.
 
+Full report: [research/claude-multi-account](research/claude-multi-account/README.md).
+
 ## How Claude stores data on macOS
 
 There is one desktop app (`/Applications/Claude.app`) and one CLI (`~/.local/bin/claude`). Switching accounts in the app does not create another install; it changes which per-account index the app reads.
