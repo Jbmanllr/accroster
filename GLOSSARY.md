@@ -67,3 +67,9 @@ _Avoid_: session browser, merged sidebar
 **Sidebar sync**:
 Making a Session's Sidebar entry exist in every Profile's sidebar, so the desktop app shows all Sessions whichever Profile is active.
 _Avoid_: session sync (ambiguous), merge
+
+## Safety
+
+**Safety pause**:
+A feature that writes Claude's files, stopped by the app itself because Claude changed something the feature relies on; only the user resumes it.
+_Avoid_: error, disabled, off (those suggest the user turned it off)
