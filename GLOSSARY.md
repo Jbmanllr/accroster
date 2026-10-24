@@ -1,4 +1,4 @@
-# Claude account manager
+# AccRoster
 
 A macOS menu bar app that gathers every Claude account used on one Mac: their usage limits, their sessions, and switching between them for the desktop app and the CLI.
 
