@@ -8,7 +8,8 @@
 #    stdin it read, the key and its pid.
 # 3. Answers from replies/<key>/<seq>/: copies files/ into $CLAUDE_CONFIG_DIR,
 #    prints stdout and stderr, exits with exit_code. Replies are consumed in
-#    order; the last one repeats. With no reply, exits 97. A reply marked
+#    order; the last one repeats until another is queued after it. With no
+#    reply, exits 97. A reply marked
 #    hang never answers: it waits until killed.
 set -u
 state="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,14 +43,20 @@ if [ "$key" = other ]; then
 fi
 
 mkdir -p "$state/calls"
+# Claim the next call number with mkdir, which fails if another stub running
+# at the same time took it first.
 n=$(( $(ls "$state/calls" | wc -l) + 1 ))
+until mkdir "$state/calls/$(printf '%04d' "$n")" 2>/dev/null; do
+  n=$((n + 1))
+done
 call="$state/calls/$(printf '%04d' "$n")"
-mkdir -p "$call"
 printf '%s\0' "$@" > "$call/args"
 /usr/bin/env -0 > "$call/env"
 printf '%s' "$stdin_line" > "$call/stdin"
 printf %s "$key" > "$call/key"
-printf %s "$$" > "$call/pid"
+# Written then renamed: a reader never sees an empty pid file.
+printf %s "$$" > "$call/pid.tmp"
+mv "$call/pid.tmp" "$call/pid"
 
 replies="$state/replies/$key"
 first=""
@@ -60,11 +67,20 @@ if [ -d "$replies" ]; then
     [ -z "$first" ] && first="$seq"
   done
 fi
+# A last reply that already answered (and so repeated) gives way to replies
+# queued after it.
+if [ "$count" -gt 1 ] && [ -f "$replies/$first/answered" ]; then
+  mkdir -p "$state/used/$key"
+  mv "$replies/$first" "$state/used/$key/$first"
+  count=$((count - 1))
+  first=$(ls "$replies" | sort -n | head -n 1)
+fi
 if [ -z "$first" ]; then
   echo "stub claude: no canned reply for $key" >&2
   exit 97
 fi
 reply="$replies/$first"
+[ "$count" -eq 1 ] && : > "$reply/answered"
 
 # A hanging reply waits, like a sign-in nobody finishes, until killed. exec
 # keeps the pid, so killing the recorded pid kills the wait. It is consumed

@@ -689,3 +689,105 @@ fn the_desktop_apps_active_profile_is_read_every_3_minutes_too() {
     pass(&mac, &mut core, SignedDuration::from_secs(1));
     assert_eq!(usage_reads(&mac), 2);
 }
+
+/// Claude Code saying limits aren't available to this Login any more: the
+/// Login expired.
+fn rate_limits_unavailable() -> Reply {
+    Reply::json(&serde_json::json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "accroster-usage", "response": {
+            "subscription_type": null,
+            "rate_limits_available": false,
+            "rate_limits": null,
+            "behaviors": null,
+        }},
+    }))
+}
+
+#[test]
+fn an_expired_profile_is_no_longer_read_and_keeps_its_last_reading_dimmed() {
+    let mac = mac_signing_in_as(&work(), body(62, 41));
+    mac.claude
+        .reply(StubCall::GetUsage, rate_limits_unavailable());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+
+    at(&mac, &mut core, "14:17");
+    assert_eq!(usage_reads(&mac), 2);
+    let row = rows(&core).remove(0);
+    assert_eq!(row.note.as_deref(), Some("Login expired"));
+    assert!(row.dimmed);
+    assert_eq!(
+        row.limits,
+        [bar("Session", 62), bar("Weekly", 41)],
+        "the last reading stays"
+    );
+
+    pass(&mac, &mut core, SignedDuration::from_hours(3));
+    core.event(Event::MenuOpened);
+    settle(&mut core);
+    core.event(Event::WillSleep);
+    core.event(Event::DidWake);
+    settle(&mut core);
+    assert_eq!(usage_reads(&mac), 2, "polling stopped");
+    assert!(rows(&core)[0].dimmed);
+
+    drop(core);
+    let mut core = mac.launch();
+    pass(&mac, &mut core, SignedDuration::from_hours(1));
+    assert_eq!(usage_reads(&mac), 2, "still stopped after a relaunch");
+}
+
+#[test]
+fn removing_a_profile_forgets_its_backoff() {
+    let mac = mac_signing_in_as(&work(), body(62, 41));
+    mac.claude
+        .reply(StubCall::GetUsage, failed_fetch())
+        .reply(StubCall::AuthLogout, signed_out());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    at(&mac, &mut core, "14:17");
+    let backoff = format!("{APP_FOLDER}/state/backoff.json");
+    let id = mac.list(PROFILES).remove(0);
+    assert!(
+        mac.read_json(&backoff).unwrap()["profiles"]
+            .get(&id)
+            .is_some()
+    );
+
+    let confirm = click_in_row(&mut core, 0, "Remove…")
+        .into_iter()
+        .find_map(|effect| match effect {
+            accroster_core::Effect::ConfirmRemoval { confirm, .. } => Some(confirm),
+            _ => None,
+        })
+        .expect("a removal confirmation");
+    core.command(confirm);
+
+    assert!(rows(&core).is_empty());
+    assert_eq!(
+        mac.read_json(&backoff).unwrap()["profiles"],
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn the_menu_bar_figure_counts_unknown_limit_kinds() {
+    let mac = mac_signing_in_as(
+        &work(),
+        serde_json::json!({
+            "limits": [
+                { "kind": "session", "percent": 62, "resets_at": "2026-10-25T23:00:00Z" },
+                { "kind": "weekly_all", "percent": 41, "resets_at": "2026-10-30T09:00:00Z" },
+                { "kind": "monthly_new", "percent": 97, "resets_at": "2026-11-01T00:00:00Z" },
+            ],
+        }),
+    );
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    core.command(accroster_core::Command::SetCliSwitching(true));
+    let use_it = rows(&core)[0].command.clone().expect("a row click");
+    core.command(use_it);
+
+    assert_eq!(core.view().menu_bar.label, "me 97%");
+}

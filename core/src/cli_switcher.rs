@@ -84,6 +84,55 @@ pub(crate) fn set_pointer(paths: &AppPaths, config_dir: &Path) -> io::Result<()>
     )
 }
 
+/// Turns the CLI's Active Profile's "Remove…" into a submenu asking which
+/// Profile new CLI runs use next: each other signed-in Profile, or Default.
+fn ask_next_cli_on_removal(listed: &mut [Listed<'_>], active: usize) {
+    let id = listed[active].id.to_owned();
+    let mut choices: Vec<MenuItem> = listed
+        .iter()
+        .enumerate()
+        .filter(|(index, profile)| *index != active && profile.signed_in)
+        .map(|(_, profile)| MenuItem::Action {
+            title: profile.row.title.clone(),
+            command: Command::AskRemoveProfileWithNextCli {
+                id: id.clone(),
+                next: Some(profile.id.to_owned()),
+            },
+        })
+        .collect();
+    choices.insert(0, MenuItem::Detail("Then use for new CLI runs:".into()));
+    choices.push(MenuItem::Action {
+        title: "Default (~/.claude)".into(),
+        command: Command::AskRemoveProfileWithNextCli {
+            id: id.clone(),
+            next: None,
+        },
+    });
+    for item in &mut listed[active].row.submenu {
+        if matches!(
+            item,
+            MenuItem::Action {
+                command: Command::AskRemoveProfile(_),
+                ..
+            }
+        ) {
+            *item = MenuItem::Submenu {
+                title: "Remove…".into(),
+                items: choices,
+            };
+            return;
+        }
+    }
+}
+
+/// Back to Default: deletes the pointer, so new CLI runs use `~/.claude`.
+pub(crate) fn clear_pointer(paths: &AppPaths) -> io::Result<()> {
+    match fs::remove_file(paths.bin().join(POINTER)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// What CLI switching adds to the menu.
 pub(crate) struct CliMenu {
     /// The menu bar label (`Perso 62%`), when CLI switching is on.
@@ -103,7 +152,8 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>]) -> CliMenu {
         let is_active = pointer.as_deref() == Some(profile.config_dir);
         let row = &mut profile.row;
         let mut items = Vec::new();
-        if on {
+        // A signed-out Profile offers nothing to run `claude` with.
+        if on && profile.signed_in {
             let command = Command::UseForNewCliRuns(profile.id.to_owned());
             row.command = Some(command.clone());
             items.push(MenuItem::Check {
@@ -112,16 +162,24 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>]) -> CliMenu {
                 command,
             });
         }
-        items.push(MenuItem::Action {
-            title: "Copy shell override".into(),
-            command: Command::CopyShellOverride(profile.id.to_owned()),
-        });
+        if profile.signed_in {
+            items.push(MenuItem::Action {
+                title: "Copy shell override".into(),
+                command: Command::CopyShellOverride(profile.id.to_owned()),
+            });
+        }
         row.submenu.splice(0..0, items);
         if is_active {
             row.badges.insert(0, "CLI".into());
             let tightest = row.limits.iter().map(|bar| bar.percent).max();
             active = Some((profile.short_label.clone(), tightest));
         }
+    }
+    if let Some(index) = listed
+        .iter()
+        .position(|profile| pointer.as_deref() == Some(profile.config_dir))
+    {
+        ask_next_cli_on_removal(listed, index);
     }
     if !on {
         return CliMenu {

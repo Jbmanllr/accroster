@@ -5,7 +5,7 @@
 //! a read is started on one call and collected on a later [`LimitMonitor::tick`]
 //! once Claude Code has exited.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -172,6 +172,8 @@ pub(crate) struct LimitMonitor {
     locked: bool,
     /// The Mac has no network path.
     offline: bool,
+    /// The Profiles watched at the last tick.
+    last_watched: HashSet<String>,
 }
 
 impl LimitMonitor {
@@ -204,22 +206,32 @@ impl LimitMonitor {
         monitor
     }
 
-    /// Collects a finished read, then starts the next one that is due.
-    pub(crate) fn tick(&mut self, ctx: &Context, watched: &[Watched]) -> Vec<Completed> {
-        let mut completed = Vec::new();
-        if let Some(done) = self.collect(ctx) {
-            completed.push(done);
-        }
-        if self.running.is_none()
-            && !self.paused()
-            && let Some(next) = self.next_due(ctx.env.clock.now(), watched)
-        {
-            let next = next.clone();
-            if let Some(done) = self.start(ctx, next, UsageRead::GetUsage) {
-                completed.push(done);
+    /// Collects the read in flight once it has finished (or timed out).
+    pub(crate) fn collect_finished(
+        &mut self,
+        ctx: &Context,
+        watched: &[Watched],
+    ) -> Option<Completed> {
+        // A Profile watched again (signed in again after its Login expired)
+        // is read as soon as allowed.
+        let now_watched: HashSet<String> = watched.iter().map(|w| w.id.clone()).collect();
+        for id in now_watched.difference(&self.last_watched) {
+            if let Some(watch) = self.watches.get_mut(id) {
+                watch.refresh_requested = true;
             }
         }
-        completed
+        self.last_watched = now_watched;
+        self.collect(ctx)
+    }
+
+    /// Starts the next read that is due, unless one is in flight or polling
+    /// is paused. `Some` when it couldn't even start (unreadable).
+    pub(crate) fn start_due(&mut self, ctx: &Context, watched: &[Watched]) -> Option<Completed> {
+        if self.running.is_some() || self.paused() {
+            return None;
+        }
+        let next = self.next_due(ctx.env.clock.now(), watched)?.clone();
+        self.start(ctx, next, UsageRead::GetUsage)
     }
 
     /// The menu opened: Profiles whose reading is over a minute old are
@@ -235,6 +247,17 @@ impl LimitMonitor {
             {
                 watch.refresh_requested = true;
             }
+        }
+    }
+
+    /// Forgets a removed Profile, and its backoff.
+    pub(crate) fn forget(&mut self, ctx: &Context, id: &str) {
+        let had_backoff = self
+            .watches
+            .remove(id)
+            .is_some_and(|watch| watch.backoff.is_some());
+        if had_backoff {
+            self.save_backoffs(ctx);
         }
     }
 

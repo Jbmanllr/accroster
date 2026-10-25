@@ -1,10 +1,11 @@
 //! `settings.json`: the user's choices.
 //!
 //! Profile folders decide which Profiles exist; settings only add choices on
-//! top (later tickets add Profile order, nicknames, thresholds, …). Losing
+//! top (Profile order, nicknames; later tickets add thresholds, …). Losing
 //! this file therefore costs at most those choices, never a Profile or a
 //! login.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,13 @@ pub(crate) struct Settings {
     /// first-run offer is answered, so the offer is made once.
     #[serde(default)]
     pub launch_at_login: Option<bool>,
+    /// Profile nicknames, by Profile id.
+    #[serde(default)]
+    pub nicknames: BTreeMap<String, String>,
+    /// Profile ids, top first. Profiles missing from it follow, in the order
+    /// they were added.
+    #[serde(default)]
+    pub profile_order: Vec<String>,
     /// Nicknames and Hide choices for Discovered Profiles, by pair. Kept
     /// while the pair is off the Mac, so a returning pair stays hidden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

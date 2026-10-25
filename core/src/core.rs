@@ -297,6 +297,56 @@ impl Core {
                 Vec::new()
             }
             Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
+            Command::Rename(NicknameTarget::Profile(id)) => self
+                .profiles
+                .nickname_prompt(&id, &self.settings)
+                .into_iter()
+                .collect(),
+            Command::SetNickname {
+                target: NicknameTarget::Profile(id),
+                nickname,
+            } => {
+                self.set_nickname(id, nickname);
+                Vec::new()
+            }
+            Command::MoveProfile { id, to } => {
+                self.move_profile(&id, to);
+                Vec::new()
+            }
+            Command::SignInAgain(id) => {
+                let (profiles, ctx) = self.profiles();
+                profiles.sign_in_again(&ctx, &id);
+                Vec::new()
+            }
+            Command::AskRemoveProfile(id) => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfile(id.clone());
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfile(id) => {
+                self.remove_profile(&id);
+                Vec::new()
+            }
+            Command::AskRemoveProfileWithNextCli { id, next } => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfileWithNextCli {
+                    id: id.clone(),
+                    next,
+                };
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfileWithNextCli { id, next } => {
+                if self.point_cli_elsewhere(next.as_deref()) {
+                    self.remove_profile(&id);
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -309,9 +359,11 @@ impl Core {
                 }
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
+                let mut effects = profiles.take_effects();
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
-                desktop.poll(&ctx, &signed_in)
+                effects.extend(desktop.poll(&ctx, &signed_in));
+                effects
             }
             Event::MenuOpened => {
                 self.rescan_discovered();
@@ -335,12 +387,15 @@ impl Core {
                 Vec::new()
             }
         };
-        self.run_monitor();
+        let mut effects = effects;
+        effects.extend(self.run_monitor());
         effects
     }
 
     /// Lets the Limit monitor collect a finished read and start the next.
-    fn run_monitor(&mut self) {
+    /// Finished reads go to the Profile registry, which notices an expired
+    /// Login; returns the notifications that produced.
+    fn run_monitor(&mut self) -> Vec<Effect> {
         let watched = self.watched();
         let ctx = profiles::Context {
             env: &self.env,
@@ -348,9 +403,16 @@ impl Core {
             logger: &self.logger,
             verbose: self.verbose_logging(),
         };
-        // Finished reads, for the Profile registry to act on (Login expired,
-        // ticket #37); nothing else needs them yet.
-        let _completed = self.monitor.tick(&ctx, &watched);
+        // A finished read is handed over before the next starts, so the
+        // registry's `auth status` check never overlaps a usage read.
+        if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
+        }
+        let watched = self.watched();
+        if let Some(done) = self.monitor.start_due(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
+        }
+        self.profiles.take_effects()
     }
 
     /// The signed-in Profiles the Limit monitor reads, with which are a
@@ -386,7 +448,7 @@ impl Core {
             )
             .map(MenuItem::Warning)
             .collect();
-        let mut listed = self.profiles.listed(|id| {
+        let mut listed = self.profiles.listed(&self.settings, |id| {
             let active = watched.iter().any(|w| w.id == id && w.active);
             self.monitor.view(&ctx, id, active)
         });
@@ -415,7 +477,10 @@ impl Core {
             items.push(MenuItem::Detail(header.join("    ")));
         }
         let desktop_installed = self.env.os.desktop_app_version().is_some();
-        for (listed, profile) in listed.iter_mut().zip(&signed_in) {
+        for listed in listed.iter_mut() {
+            let Some(profile) = signed_in.iter().find(|profile| profile.id == listed.id) else {
+                continue;
+            };
             let row = &mut listed.row;
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
                 row.badges.push("Desktop".into());
@@ -584,6 +649,102 @@ impl Core {
             "verbose logging",
             &[("state", Field::Word(state))],
         );
+    }
+
+    /// Sets or (when blank) clears a Profile's nickname.
+    fn set_nickname(&mut self, id: String, nickname: Option<String>) {
+        let mut updated = self.settings.clone();
+        match nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => updated.nicknames.insert(id.clone(), name.to_owned()),
+            None => updated.nicknames.remove(&id),
+        };
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "nickname changed",
+                &[("profile", Field::Profile(&id))],
+            );
+        }
+    }
+
+    /// Remove… confirmed: signs the Profile out and deletes its folder, then
+    /// forgets its nickname and place in the order.
+    fn remove_profile(&mut self, id: &str) {
+        let (profiles, ctx) = self.profiles();
+        if profiles.remove(&ctx, id) {
+            let ctx = profiles::Context {
+                env: &self.env,
+                paths: &self.paths,
+                logger: &self.logger,
+                verbose: self.verbose_logging(),
+            };
+            self.monitor.forget(&ctx, id);
+            self.forget_profile_settings(id);
+        }
+    }
+
+    /// Points new CLI runs at Profile `next`, or at Default (`~/.claude`,
+    /// no pointer) for `None`, before the CLI's Active Profile is removed.
+    /// Returns whether that worked; the removal waits for it.
+    fn point_cli_elsewhere(&mut self, next: Option<&str>) -> bool {
+        let result = match next {
+            Some(next) => match self.profiles.config_dir(next) {
+                Some(config_dir) => cli_switcher::set_pointer(&self.paths, config_dir),
+                None => return false,
+            },
+            None => cli_switcher::clear_pointer(&self.paths),
+        };
+        match result {
+            Ok(()) => {
+                self.log(Level::Info, "cli profile moved before removal", &[]);
+                true
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not moved",
+                    &[("error", Field::Text(&error))],
+                );
+                false
+            }
+        }
+    }
+
+    /// Drops a removed Profile's nickname and place in the order.
+    fn forget_profile_settings(&mut self, id: &str) {
+        let mut updated = self.settings.clone();
+        updated.nicknames.remove(id);
+        updated.profile_order.retain(|known| known != id);
+        if updated != self.settings {
+            self.save_settings(updated);
+        }
+    }
+
+    /// Moves a Profile to position `to` (clamped) and saves the whole order.
+    fn move_profile(&mut self, id: &str, to: usize) {
+        let mut order = self.profiles.ordered_ids(&self.settings.profile_order);
+        let Some(from) = order.iter().position(|known| known == id) else {
+            return;
+        };
+        let moved = order.remove(from);
+        order.insert(to.min(order.len()), moved);
+        let mut updated = self.settings.clone();
+        updated.profile_order = order;
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "profile moved",
+                &[
+                    ("profile", Field::Profile(id)),
+                    ("to", Field::Number(to as i64)),
+                ],
+            );
+        }
     }
 
     /// Writes `settings.json` and keeps `updated` as the current settings.

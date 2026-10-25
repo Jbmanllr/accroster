@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use accroster_core::{Core, Event, LimitBar, MenuItem, ProfileRow};
+use accroster_core::{Core, Effect, Event, LimitBar, MenuItem, ProfileRow};
 use accroster_fake_mac::{FakeMac, FixtureLogin, RecordedCall, Reply, StubCall};
 use serde_json::{Value, json};
 
@@ -76,15 +76,17 @@ pub fn rows(core: &Core) -> Vec<ProfileRow> {
 }
 
 /// Sends ticks until the waiting line is gone (the sign-in process exited and
-/// the core noticed) and the new Profile's first usage read has landed,
-/// failing after a few seconds of real time.
-pub fn wait_for_sign_in(core: &mut Core) {
+/// the core noticed) and any usage read it started has landed, failing
+/// after a few seconds of real time.
+pub fn wait_for_sign_in(core: &mut Core) -> Vec<Effect> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut effects = Vec::new();
     while busy(core) {
         assert!(Instant::now() < deadline, "the sign-in never finished");
         std::thread::sleep(Duration::from_millis(20));
-        core.event(Event::Tick);
+        effects.extend(core.event(Event::Tick));
     }
+    effects
 }
 
 /// Whether the core is still waiting on a sign-in or a usage read: it then
@@ -116,9 +118,9 @@ pub fn usage_reads(mac: &FakeMac) -> usize {
 }
 
 /// Clicks Add Profile… and waits for the sign-in to end.
-pub fn add_profile(core: &mut Core) {
+pub fn add_profile(core: &mut Core) -> Vec<Effect> {
     click(core, "Add Profile…");
-    wait_for_sign_in(core);
+    wait_for_sign_in(core)
 }
 
 /// The first sign-in call, once the stub has recorded it.
@@ -223,6 +225,34 @@ pub fn make_cli_active(mac: &FakeMac) {
         format!("{APP_FOLDER}/bin/cli-active-profile"),
         folder.to_str().expect("UTF-8 path"),
     );
+}
+
+/// Clicks the item titled `title` in the hover submenu of the row at `row`,
+/// returning the effects the core asked for.
+pub fn click_in_row(core: &mut Core, row: usize, title: &str) -> Vec<Effect> {
+    let rows = rows(core);
+    let command = rows
+        .get(row)
+        .unwrap_or_else(|| panic!("no row {row}: {rows:?}"))
+        .submenu
+        .iter()
+        .find_map(|item| match item {
+            MenuItem::Action { title: t, command } if t == title => Some(command.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("row {row} has {title}: {:?}", rows[row].submenu));
+    core.command(command)
+}
+
+/// The titles of the clickable items in a row's hover submenu.
+pub fn row_actions(row: &ProfileRow) -> Vec<String> {
+    row.submenu
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Action { title, .. } => Some(title.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The disabled detail lines of a Profile's hover submenu.
