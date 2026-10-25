@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Command, Core, Effect, NicknameTarget};
+use accroster_core::{Command, Core, Effect, Event, NicknameTarget};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use serde_json::json;
@@ -144,6 +144,7 @@ fn remove_signs_out_then_deletes_the_folder_but_never_shared_transcripts() {
         "nothing happens before the confirmation"
     );
     core.command(confirm);
+    settle(&mut core);
 
     assert!(mac.list(PROFILES).is_empty(), "the folder is gone");
     assert!(rows(&core).is_empty());
@@ -181,6 +182,7 @@ fn a_failed_sign_out_keeps_the_profile_and_its_folder() {
 
     let (_, confirm) = removal_prompt(&mut core, 0);
     core.command(confirm);
+    settle(&mut core);
 
     assert_eq!(
         mac.list(PROFILES).len(),
@@ -194,6 +196,35 @@ fn a_failed_sign_out_keeps_the_profile_and_its_folder() {
     );
     drop(core);
     assert_eq!(titles(&mac.launch()), [WORK]);
+}
+
+#[test]
+fn a_sign_out_that_never_ends_doesnt_hold_up_the_menu_and_keeps_the_profile() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    mac.claude.reply(StubCall::AuthLogout, Reply::hanging());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    let (_, confirm) = removal_prompt(&mut core, 0);
+
+    let (core, _) = command_promptly(core, confirm);
+    let logout = wait_for_calls(&mac, StubCall::AuthLogout, 1).remove(0);
+    let (mut core, _) = event_promptly(core, Event::Tick);
+    let rows_now = rows(&core);
+    assert_eq!(rows_now[0].note.as_deref(), Some("Signing out…"));
+    assert!(
+        !row_actions(&rows_now[0]).contains(&"Remove…".to_owned()),
+        "{rows_now:?}"
+    );
+
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(1));
+
+    assert!(!logout.still_running(), "given up on");
+    assert_eq!(mac.list(PROFILES).len(), 1, "kept without a sign-out");
+    assert_eq!(titles(&core), [WORK]);
+    assert_eq!(
+        warnings(&core),
+        ["Couldn't sign out me@work.example · Work Inc · nothing was removed"]
+    );
 }
 
 /// A `get_usage` answer for a Login whose token Claude Code blanked.
@@ -281,6 +312,63 @@ fn logged_out_while_the_account_remains_means_login_expired() {
 
     assert_expired(&core);
     assert_eq!(notifications(&effects), [EXPIRED_NOTICE]);
+}
+
+fn auth_status_calls(mac: &FakeMac) -> usize {
+    mac.claude
+        .calls()
+        .iter()
+        .filter(|call| call.kind == StubCall::AuthStatus)
+        .count()
+}
+
+#[test]
+fn failing_reads_ask_auth_status_once_per_run_of_failures() {
+    let mac = mac_signing_in_work_reading(Reply::fail(1, "boom"));
+    mac.claude
+        .reply(StubCall::SlashUsage, Reply::fail(1, "boom"));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    let after_first_failure = auth_status_calls(&mac);
+    assert_eq!(after_first_failure, 2, "the sign-in's, then the failure's");
+
+    for _ in 0..3 {
+        pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    }
+    assert!(usage_reads(&mac) >= 4, "polling went on");
+    assert_eq!(auth_status_calls(&mac), 2, "not on every failing poll");
+    assert_eq!(rows(&core)[0].note.as_deref(), Some("Couldn't read limits"));
+
+    // A good read ends the run; the next failure asks once more.
+    mac.claude
+        .reply(StubCall::GetUsage, usage_reply(limits_body()))
+        .reply(StubCall::GetUsage, Reply::fail(1, "boom"));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    assert_eq!(auth_status_calls(&mac), 3);
+}
+
+#[test]
+fn unreadable_answers_and_reads_that_never_end_never_ask_auth_status() {
+    let mac = mac_signing_in_work_reading(Reply::ok("{\"type\":\"something new\"}\n"));
+    mac.claude.reply(
+        StubCall::SlashUsage,
+        Reply::ok("Usage looks different now\n"),
+    );
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    assert_eq!(rows(&core)[0].note.as_deref(), Some("Couldn't read limits"));
+    assert_eq!(auth_status_calls(&mac), 1, "only the sign-in's");
+
+    mac.claude.reply(StubCall::GetUsage, Reply::hanging());
+    let reads = usage_reads(&mac);
+    mac.clock.advance(jiff::SignedDuration::from_mins(15));
+    core.event(Event::Tick);
+    wait_for_calls(&mac, StubCall::GetUsage, reads + 1);
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(2));
+    assert_eq!(auth_status_calls(&mac), 1, "a timed-out read asks nothing");
 }
 
 #[test]

@@ -763,6 +763,7 @@ fn removing_a_profile_forgets_its_backoff() {
         })
         .expect("a removal confirmation");
     core.command(confirm);
+    settle(&mut core);
 
     assert!(rows(&core).is_empty());
     assert_eq!(

@@ -142,6 +142,7 @@ fn a_paused_feature_resumes_only_on_the_click_after_the_checks_pass() {
     assert_eq!(resume, Command::ResumeFeature(SafetyFeature::CliSwitching));
 
     core.command(resume);
+    settle(&mut core);
 
     assert!(!is_paused(&core, SafetyFeature::CliSwitching));
     assert!(warnings(&core).is_empty());
@@ -314,7 +315,8 @@ fn a_claude_code_update_that_ignores_profile_folders_pauses_cli_switching() {
         .reply(StubCall::AuthStatus, auth_status(&FixtureLogin::perso()));
     let pointer = mac.read_file(POINTER).unwrap();
 
-    let effects = core.event(Event::MenuOpened);
+    let mut effects = core.event(Event::MenuOpened);
+    effects.extend(settle(&mut core));
 
     assert_eq!(
         warnings(&core),
@@ -343,6 +345,7 @@ fn auth_status_disagreeing_with_one_folder_pauses_cli_switching() {
     honest_auth_status(&mac);
 
     core.event(Event::MenuOpened);
+    settle(&mut core);
 
     assert_eq!(
         warnings(&core),
@@ -373,6 +376,7 @@ fn honest_answers_after_an_update_pause_nothing_and_auth_status_stays_rare() {
     install_claude_code(&mac, "2.1.400");
     core.event(Event::MenuOpened);
     core.event(Event::MenuOpened);
+    settle(&mut core);
 
     assert_eq!(auth_status_calls(&mac), before + 2, "once per Profile");
     assert!(!is_paused(&core, SafetyFeature::CliSwitching));
@@ -391,13 +395,43 @@ fn a_version_change_is_also_noticed_on_a_tick() {
         .reply(StubCall::AuthStatus, auth_status(&FixtureLogin::perso()));
     mac.os.set_desktop_app_version(Some("3.7000.0"));
 
-    let effects = core.event(Event::Tick);
+    let mut effects = core.event(Event::Tick);
+    effects.extend(settle(&mut core));
 
     assert_eq!(notifications(&effects).len(), 1);
     assert!(is_paused(&core, SafetyFeature::CliSwitching));
     assert_eq!(
         core.view().diagnostics.versions.desktop.as_deref(),
         Some("3.7000.0")
+    );
+}
+
+#[test]
+fn an_auth_status_that_never_ends_doesnt_hold_up_the_menu_and_is_reported() {
+    let (mac, core) = cli_on_with_two_profiles();
+    install_claude_code(&mac, "2.1.400");
+    mac.claude.reply(StubCall::AuthStatus, Reply::hanging());
+    let before = auth_status_calls(&mac);
+
+    let (core, _) = event_promptly(core, Event::MenuOpened);
+    let hanging = wait_for_calls(&mac, StubCall::AuthStatus, before + 1)
+        .pop()
+        .unwrap();
+    let (mut core, _) = event_promptly(core, Event::Tick);
+
+    // One Profile at a time: each is given up on after 30 s.
+    mac.clock.advance(jiff::SignedDuration::from_secs(30));
+    core.event(Event::Tick);
+    wait_for_calls(&mac, StubCall::AuthStatus, before + 2);
+    pass(&mac, &mut core, jiff::SignedDuration::from_secs(30));
+
+    assert!(!hanging.still_running(), "given up on");
+    assert!(!is_paused(&core, SafetyFeature::CliSwitching));
+    let check = diagnostics_check(&core, "Claude Code honours Profile folders");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert_eq!(
+        check.detail.as_deref(),
+        Some("auth status didn't answer in 2 Profiles")
     );
 }
 
@@ -409,6 +443,7 @@ fn unreadable_auth_status_answers_pause_nothing() {
         .reply(StubCall::AuthStatus, Reply::ok("not json\n"));
 
     core.event(Event::MenuOpened);
+    settle(&mut core);
 
     assert!(!is_paused(&core, SafetyFeature::CliSwitching));
 }
@@ -483,6 +518,7 @@ fn a_replaced_projects_link_pauses_transcript_sharing_and_nothing_is_overwritten
     assert!(is_paused(&core, SafetyFeature::TranscriptSharing));
     let resume = resume_button(&core, SafetyFeature::TranscriptSharing).expect("Resume offered");
     core.command(resume);
+    settle(&mut core);
 
     assert!(!is_paused(&core, SafetyFeature::TranscriptSharing));
     assert!(

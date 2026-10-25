@@ -610,6 +610,7 @@ fn confirm(core: &mut Core, command: Command) {
         panic!("the removal is confirmed first");
     };
     core.command(confirm);
+    settle(core);
 }
 
 #[test]

@@ -347,7 +347,8 @@ fn open_in_claude_as_runs_claude_desktop_resume_in_the_cli_profiles_folder() {
     );
     let before = claude_files(&mac);
 
-    let effects = press(&mut core, S1, "Open in Claude as Perso");
+    let mut effects = press(&mut core, S1, "Open in Claude as Perso");
+    effects.extend(settle(&mut core));
 
     assert!(effects.is_empty(), "{effects:?}");
     let call = mac
@@ -380,17 +381,42 @@ fn a_failed_hand_over_is_reported() {
     mac.claude
         .reply(StubCall::Other, Reply::fail(1, "Not signed in\n"));
 
-    let effects = press(&mut core, S1, "Open in Claude as Perso");
+    let mut effects = press(&mut core, S1, "Open in Claude as Perso");
+    effects.extend(settle(&mut core));
 
-    assert_eq!(
-        effects,
-        [Effect::Notify {
-            title: "Couldn't open the Session in Claude".into(),
-            body:
-                "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
-                    .into(),
-        }]
-    );
+    assert_eq!(effects, [hand_over_failed()]);
+}
+
+fn hand_over_failed() -> Effect {
+    Effect::Notify {
+        title: "Couldn't open the Session in Claude".into(),
+        body: "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
+            .into(),
+    }
+}
+
+#[test]
+fn a_hand_over_that_never_ends_doesnt_hold_up_the_menu_and_is_reported_after_a_minute() {
+    let (mac, mut core) = mac_with_two_profiles();
+    desktop_signed_in_as(&mac, &FixtureLogin::perso());
+    entry(&mac, &FixtureLogin::perso(), "other", S2, false);
+    transcript(&mac, S1, "Fix the login bug", "cli");
+    transcript(&mac, S2, "Other work", "claude-desktop");
+    mac.claude.reply(StubCall::Other, Reply::hanging());
+    let command = choice(&select(&mut core, S1).open, "Open in Claude as Perso")
+        .command
+        .clone();
+
+    let (core, effects) = command_promptly(core, command);
+    assert!(effects.is_empty(), "{effects:?}");
+    let call = wait_for_calls(&mac, StubCall::Other, 1).remove(0);
+    let (mut core, effects) = event_promptly(core, Event::Tick);
+    assert!(effects.is_empty(), "nothing to say yet: {effects:?}");
+
+    let effects = pass(&mac, &mut core, jiff::SignedDuration::from_mins(1));
+
+    assert_eq!(effects, [hand_over_failed()]);
+    assert!(!call.still_running(), "given up on");
 }
 
 #[test]

@@ -23,8 +23,8 @@ use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, LimitsView, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening::{self, Clients, DefaultOpen, DesktopClient, InClaude, NamedProfile};
-use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
-use crate::runner::Runner;
+use crate::profiles::{self, CrossCheckAnswer, Listed, ProfileRegistry, SignInTarget};
+use crate::runner::{Ended, JobKind, Jobs, Runner};
 use crate::safety::{self, CheckId, Finding, Safety};
 use crate::sessions::{SessionFacts, SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
@@ -106,6 +106,13 @@ pub struct Core {
     sync_note: Option<String>,
     /// The sidebars' watch while Sidebar sync is on.
     sidebar_watch: sidebar_sync::Watch,
+    /// `claude --desktop --resume` runs, by Session id.
+    openings: Jobs<String>,
+    /// A Resume whose checks wait for the `auth status` cross-check.
+    resume_waiting: Option<SafetyFeature>,
+    /// An uninstall waiting for its sign-outs, with what is left for the
+    /// user to do so far.
+    uninstalling: Option<Vec<String>>,
     /// Why the last uninstall stopped, for Settings (offers Retry).
     uninstall_note: Option<String>,
     /// The app's folder is gone: nothing is read, written or started again.
@@ -121,8 +128,47 @@ struct ProfileLinks {
     transcripts_shared: bool,
 }
 
-/// An account as `(email, Organization uuid)`.
-type Account = (Option<String>, Option<String>);
+/// What the registry, the monitor and the bridge need from the core, as
+/// [`Core::context`] gives it, borrowing only the core's `env`, `paths`,
+/// `logger`, `settings` and `safety`: the core's other parts stay free to
+/// change while it is in use.
+macro_rules! context {
+    ($core:expr) => {
+        context_of(
+            &$core.env,
+            &$core.paths,
+            &$core.logger,
+            &$core.settings,
+            &$core.safety,
+        )
+    };
+}
+
+fn context_of<'a>(
+    env: &'a Environment,
+    paths: &'a AppPaths,
+    logger: &'a Logger,
+    settings: &Settings,
+    safety: &Safety,
+) -> profiles::Context<'a> {
+    profiles::Context {
+        env,
+        paths,
+        logger,
+        verbose: verbose_logging(settings, env),
+        share_transcripts: !safety.is_paused(SafetyFeature::TranscriptSharing),
+    }
+}
+
+/// Whether Verbose logging is on now.
+fn verbose_logging(settings: &Settings, env: &Environment) -> bool {
+    settings
+        .verbose_logging_until
+        .is_some_and(|until| until > env.clock.now())
+}
+
+/// How often the core wants a tick while a short Claude Code run is out.
+const RUN_TICK: Duration = Duration::from_millis(250);
 
 /// When a self-check runs Claude Code's `auth status` in every Profile.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,6 +211,9 @@ impl Core {
             sessions: SessionIndex::default(),
             sync_note: None,
             sidebar_watch: sidebar_sync::Watch::default(),
+            openings: Jobs::default(),
+            resume_waiting: None,
+            uninstalling: None,
             uninstall_note: None,
             uninstalled: false,
         };
@@ -249,6 +298,10 @@ impl Core {
             // The next batch of the Session index, as soon as input allows.
             return Duration::ZERO;
         }
+        if self.profiles.busy() || !self.openings.is_empty() {
+            // Its end shows at once.
+            return RUN_TICK;
+        }
         let idle = if self.profiles.signing_in() || self.desktop.waiting() {
             // An Automatic sync waits for the switch to end (see `Tick`).
             Duration::from_secs(1)
@@ -290,7 +343,44 @@ impl Core {
             &[("name", Field::Word(command.name()))],
         );
         let mut effects = self.handle(command);
+        // A run the command started may have ended at once (it couldn't
+        // start), and an uninstall with nothing to sign out ends now.
+        effects.extend(self.act_on_runs());
         effects.extend(self.take_effects());
+        effects
+    }
+
+    /// Checks on the sign-in, then [`Core::act_on_runs`].
+    fn poll_runs(&mut self) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
+        let (profiles, ctx) = self.profiles();
+        profiles.poll_sign_in(&ctx);
+        self.act_on_runs()
+    }
+
+    /// Collects the short Claude Code runs that ended (`auth status`, `auth
+    /// logout`, `--desktop --resume`) and acts on what they say.
+    fn act_on_runs(&mut self) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
+        let (profiles, ctx) = self.profiles();
+        profiles.run_jobs(&ctx);
+        let mut effects = profiles.take_effects();
+        if self.profiles.take_auth_disagreement() {
+            let finding = checks::config_dir_disagreement(&self.versions, "in a new Profile");
+            self.safety.record(CheckId::ConfigDirHonoured, finding);
+        }
+        for id in self.profiles.take_removed() {
+            self.forget_removed(&id);
+        }
+        if let Some(answers) = self.profiles.take_cross_check() {
+            self.cross_checked(&answers);
+        }
+        effects.extend(self.poll_openings());
+        effects.extend(self.continue_uninstall());
         effects
     }
 
@@ -547,12 +637,9 @@ impl Core {
                     self.set_verbose_logging_until(None);
                 }
                 let was_signing_in = self.profiles.signing_in();
-                let (profiles, ctx) = self.profiles();
-                profiles.poll(&ctx);
-                let mut effects = profiles.take_effects();
-                if self.profiles.take_auth_disagreement() {
-                    let finding = self.config_dir_disagreement("in a new Profile");
-                    self.safety.record(CheckId::ConfigDirHonoured, finding);
+                let mut effects = self.poll_runs();
+                if self.uninstalled {
+                    return effects;
                 }
                 if was_signing_in && !self.profiles.signing_in() {
                     self.check_links();
@@ -631,21 +718,15 @@ impl Core {
     /// Login; returns the notifications that produced.
     fn run_monitor(&mut self) -> Vec<Effect> {
         let watched = self.watched();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        // A finished read is handed over before the next starts, so the
-        // registry's `auth status` check never overlaps a usage read.
+        let ctx = context!(self);
+        // A finished read is handed over before the next starts: a Profile
+        // whose `auth status` the registry queues isn't watched meanwhile.
         if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
-            self.profiles.record_reading(&ctx, &done.id, done.reply);
+            self.profiles.record_reading(&ctx, &done);
         }
         let watched = self.watched();
         if let Some(done) = self.monitor.start_due(&ctx, &watched) {
-            self.profiles.record_reading(&ctx, &done.id, done.reply);
+            self.profiles.record_reading(&ctx, &done);
         }
         let mut effects = self.profiles.take_effects();
         effects.extend(self.notify_limits());
@@ -655,13 +736,7 @@ impl Core {
     /// The limit notifications due now (thresholds crossed, warned limits
     /// that reset).
     fn notify_limits(&mut self) -> Vec<Effect> {
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
+        let ctx = context!(self);
         let watched = self.watched();
         let listed = self.profiles.listed(&self.settings, |id| {
             let active = watched.iter().any(|w| w.id == id && w.active);
@@ -702,9 +777,12 @@ impl Core {
                     .profile(&signed_in)
                     .map(|profile| profile.id.clone())
             });
-        self.profiles.watched(|id, config_dir| {
+        let mut watched = self.profiles.watched(|id, config_dir| {
             cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
-        })
+        });
+        // Two Claude Code runs never share a folder.
+        watched.retain(|w| !self.openings.queued().any(|(dir, _)| dir == w.config_dir));
+        watched
     }
 
     /// Everything the UI shows right now.
@@ -900,9 +978,15 @@ impl Core {
                     thresholds: self.settings.thresholds.values().to_vec(),
                     reset_notification: self.settings.reset_notification,
                 },
-                uninstall: UninstallView {
-                    note: self.uninstall_note.clone(),
-                    retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                uninstall: match &self.uninstalling {
+                    Some(_) => UninstallView {
+                        note: Some("Uninstalling · signing every Profile out…".into()),
+                        retry: None,
+                    },
+                    None => UninstallView {
+                        note: self.uninstall_note.clone(),
+                        retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                    },
                 },
             },
             about: AboutView {
@@ -1098,34 +1182,48 @@ impl Core {
         }
     }
 
-    /// `claude --desktop --resume <id>` in a Profile folder.
+    /// Starts `claude --desktop --resume <id>` in a Profile folder; its end
+    /// is collected by [`Core::poll_openings`].
     fn resume_in_claude(&mut self, facts: &SessionFacts) -> Vec<Effect> {
         let Some(folder) = self.claude_code_folder() else {
             return Vec::new();
         };
-        let runner = Runner::new(&self.env, &self.paths);
-        let error = match runner.open_in_desktop(&folder, &facts.id, facts.cwd.as_deref()) {
-            Ok(true) => {
-                self.log_opened(&facts.id, "claude_resume");
-                return Vec::new();
-            }
-            Ok(false) => "claude exited with an error".to_owned(),
-            Err(error) => error.to_string(),
+        let kind = JobKind::OpenInDesktop {
+            session_id: facts.id.clone(),
+            session_folder: facts.cwd.clone(),
         };
-        self.log(
-            Level::Warn,
-            "session not opened in claude",
-            &[
-                ("session", Field::SessionId(&facts.id)),
-                ("error", Field::Text(&error)),
-            ],
-        );
-        vec![Effect::Notify {
-            title: "Couldn't open the Session in Claude".into(),
-            body:
-                "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
+        self.openings.push(&folder, kind, facts.id.clone());
+        Vec::new()
+    }
+
+    /// Collects the `--desktop --resume` runs that ended; a failed or
+    /// timed-out hand-over is notified.
+    fn poll_openings(&mut self) -> Vec<Effect> {
+        let ended = self.openings.poll(&Runner::new(&self.env, &self.paths));
+        let mut effects = Vec::new();
+        for Ended {
+            tag: id, finished, ..
+        } in ended
+        {
+            if finished.succeeded() {
+                self.log_opened(&id, "claude_resume");
+                continue;
+            }
+            self.log(
+                Level::Warn,
+                "session not opened in claude",
+                &[
+                    ("session", Field::SessionId(&id)),
+                    ("error", Field::Word(finished.word())),
+                ],
+            );
+            effects.push(Effect::Notify {
+                title: "Couldn't open the Session in Claude".into(),
+                body: "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
                     .into(),
-        }]
+            });
+        }
+        effects
     }
 
     /// "Switch Claude to <Profile>, then open…": a Guided switch that opens
@@ -1231,7 +1329,8 @@ impl Core {
 
     /// The full self-check: settings `env`, accounts, links, Sidebar entries,
     /// live-process files and Transcript records, plus `auth status` per
-    /// `auth`; then pauses whatever a failed check blocks.
+    /// `auth` (recorded once its answers are in); then pauses whatever a
+    /// failed check blocks.
     fn self_check(&mut self, auth: AuthCheck) {
         let versions = desktop::versions(&self.env);
         let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
@@ -1348,87 +1447,46 @@ impl Core {
         self.safety.record(CheckId::OtherLinks, others);
     }
 
-    /// Runs `claude auth status --json` in every signed-in Profile and
-    /// compares it with the folder's `oauthAccount`. Unreadable answers say
-    /// nothing either way.
-    fn check_config_dir_honoured(&mut self) {
-        let runner = Runner::new(&self.env, &self.paths);
-        // Per signed-in Profile: the (email, Organization) its folder holds,
-        // and what a readable, logged-in `auth status` said, if anything.
-        let answers: Vec<(Account, Option<Account>)> = self
-            .profiles
-            .accounts()
-            .into_iter()
-            .map(|account| {
-                let said = runner
-                    .auth_status(account.config_dir)
-                    .filter(|status| status.logged_in)
-                    .map(|status| (status.email, status.org_id));
-                let held = (
-                    Some(account.email.to_owned()),
-                    Some(account.organization_uuid.to_owned()),
-                );
-                (held, said)
-            })
-            .collect();
-        let said: Vec<&Account> = answers
-            .iter()
-            .filter_map(|(_, said)| said.as_ref())
-            .collect();
-        if said.is_empty() {
-            return;
-        }
-        let one_identity = answers.len() > 1
-            && said.len() == answers.len()
-            && said.iter().all(|account| *account == said[0]);
-        let disagreeing = answers
-            .iter()
-            .filter(|(held, said)| said.as_ref().is_some_and(|said| said != held))
-            .count();
-        let finding = if one_identity {
-            let reason = format!(
-                "{} ignores Profile folders",
-                safety::claude_code_name(&self.versions)
-            );
-            Finding::fail("every Profile reports one account")
-                .blocking(SafetyFeature::CliSwitching, reason)
-        } else if disagreeing > 0 {
-            let whose = if disagreeing > 1 {
-                "Profiles"
-            } else {
-                "Profile"
-            };
-            self.config_dir_disagreement(&format!("in {disagreeing} {whose}"))
-        } else {
-            Finding::pass()
-        };
-        self.safety.record(CheckId::ConfigDirHonoured, finding);
+    /// Queues `claude auth status --json` in every signed-in Profile, to
+    /// compare with each folder's `oauthAccount` once the answers are in
+    /// ([`Core::cross_checked`]). Returns whether anything was queued.
+    fn check_config_dir_honoured(&mut self) -> bool {
+        let (profiles, ctx) = self.profiles();
+        profiles.start_cross_check(&ctx)
     }
 
-    /// `auth status` named another account than `oauthAccount`.
-    fn config_dir_disagreement(&self, where_: &str) -> Finding {
-        Finding::fail(format!("auth status names another account {where_}")).blocking(
-            SafetyFeature::CliSwitching,
-            format!(
-                "{} didn't use a Profile folder's login",
-                safety::claude_code_name(&self.versions)
-            ),
-        )
+    /// Every cross-check answer is in: records what they say.
+    fn cross_checked(&mut self, answers: &[CrossCheckAnswer]) {
+        if let Some(finding) = checks::config_dir_honoured(&self.versions, answers) {
+            self.safety.record(CheckId::ConfigDirHonoured, finding);
+        }
+        self.settle();
+        if let Some(feature) = self.resume_waiting.take() {
+            self.finish_resume(feature);
+        }
     }
 
     /// "Resume <feature>": runs the feature's checks again and ends its
-    /// pause if none fails.
+    /// pause if none fails. CLI switching's include the `auth status`
+    /// cross-check, so it resumes once that is in.
     fn resume(&mut self, feature: SafetyFeature) {
         match feature {
             SafetyFeature::CliSwitching => {
                 self.versions = desktop::versions(&self.env);
                 self.safety.check_settings_env(&self.env, false);
                 self.check_accounts();
-                self.check_config_dir_honoured();
+                if self.check_config_dir_honoured() {
+                    self.resume_waiting = Some(feature);
+                    return;
+                }
             }
             SafetyFeature::TranscriptSharing => self.check_links(),
             SafetyFeature::SidebarSync => self.check_sidebar_entries(),
         }
+        self.finish_resume(feature);
+    }
+
+    fn finish_resume(&mut self, feature: SafetyFeature) {
         self.settle();
         if !self.safety.resume(feature) {
             self.log(
@@ -1722,9 +1780,7 @@ impl Core {
     }
 
     fn verbose_logging(&self) -> bool {
-        self.settings
-            .verbose_logging_until
-            .is_some_and(|until| until > self.env.clock.now())
+        verbose_logging(&self.settings, &self.env)
     }
 
     fn set_verbose_logging_until(&mut self, until: Option<jiff::Timestamp>) {
@@ -1761,28 +1817,30 @@ impl Core {
         }
     }
 
-    /// Remove… confirmed: signs the Profile out and deletes its folder, then
-    /// forgets its nickname and place in the order.
+    /// Remove… confirmed: starts signing the Profile out; once that worked,
+    /// its folder is deleted ([`Core::forget_removed`] follows).
     fn remove_profile(&mut self, id: &str) {
         let (profiles, ctx) = self.profiles();
-        if profiles.remove(&ctx, id) {
-            let ctx = profiles::Context {
-                env: &self.env,
-                paths: &self.paths,
-                logger: &self.logger,
-                verbose: self.verbose_logging(),
-                share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-            };
-            self.monitor.forget(&ctx, id);
-            self.notifier.forget(&ctx, id);
-            self.forget_profile_settings(id);
-        }
+        profiles.remove(&ctx, id);
+    }
+
+    /// A removed Profile: forgets its readings, fired notifications,
+    /// nickname, mute and place in the order.
+    fn forget_removed(&mut self, id: &str) {
+        let ctx = context!(self);
+        self.monitor.forget(&ctx, id);
+        self.notifier.forget(&ctx, id);
+        self.forget_profile_settings(id);
     }
 
     /// Runs the uninstall's steps in order (see [`uninstaller`]), each
     /// skipped when already done. Stops, with a note and Retry in Settings,
-    /// where going on could break `claude` or orphan a login.
+    /// where going on could break `claude` or orphan a login. Steps 3 to 5
+    /// wait for step 2's sign-outs ([`Core::continue_uninstall`]).
     fn uninstall(&mut self) -> Vec<Effect> {
+        if self.uninstalling.is_some() {
+            return Vec::new();
+        }
         self.log(Level::Info, "uninstall started", &[]);
         self.uninstall_note = None;
         let mut left_to_user = Vec::new();
@@ -1815,13 +1873,28 @@ impl Core {
         for id in &ids {
             self.remove_profile(id);
         }
+        self.profiles.take_unlisted_kept();
+        let (profiles, ctx) = self.profiles();
+        profiles.remove_unlisted(&ctx);
+        self.uninstalling = Some(left_to_user);
+        self.continue_uninstall()
+    }
+
+    /// Steps 3 to 5 of an uninstall, once every sign-out of step 2 ended.
+    fn continue_uninstall(&mut self) -> Vec<Effect> {
+        if self.profiles.busy() {
+            return Vec::new();
+        }
+        let Some(mut left_to_user) = self.uninstalling.take() else {
+            return Vec::new();
+        };
         let mut kept: Vec<String> = self
             .profiles
             .folders()
             .into_iter()
             .filter_map(|(id, _)| self.profiles.name(id))
             .collect();
-        let unlisted = self.profiles.remove_unlisted(&self.context());
+        let unlisted = self.profiles.take_unlisted_kept();
         if unlisted > 0 {
             kept.push(format!("{unlisted} unlisted sign-in folder(s)"));
         }
@@ -2102,39 +2175,17 @@ impl Core {
     }
 
     fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
-        let verbose = self.verbose_logging();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose,
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        (&mut self.desktop, ctx)
+        (&mut self.desktop, context!(self))
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
     fn profiles(&mut self) -> (&mut ProfileRegistry, profiles::Context<'_>) {
-        let verbose = self.verbose_logging();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose,
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        (&mut self.profiles, ctx)
+        (&mut self.profiles, context!(self))
     }
 
     /// What the registry and the monitor need from the rest of the core.
     fn context(&self) -> profiles::Context<'_> {
-        profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        }
+        context!(self)
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
