@@ -80,6 +80,13 @@ pub enum Command {
     OpenAllSessions,
     /// The All Sessions search field changed. Empty shows every Session.
     SearchSessions(String),
+    /// An item in the All Sessions sidebar was picked.
+    FilterSessions(SessionFilter),
+    /// A row in the All Sessions list was selected (by id), or the
+    /// selection was cleared. The detail pane shows the selected Session.
+    SelectSession(Option<String>),
+    /// The All Sessions window closed: stop watching Claude's folders.
+    CloseAllSessions,
     /// Moves a Profile (by id) to position `to` in the Profile order.
     MoveProfile { id: String, to: usize },
     /// "Sign in again…" on an expired or signed-out Profile (by id): Claude
@@ -140,6 +147,9 @@ impl Command {
             Command::SetNickname { .. } => "set_nickname",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
+            Command::FilterSessions(_) => "filter_sessions",
+            Command::SelectSession(_) => "select_session",
+            Command::CloseAllSessions => "close_all_sessions",
             Command::MoveProfile { .. } => "move_profile",
             Command::SignInAgain(_) => "sign_in_again",
             Command::AskRemoveProfile(_) => "ask_remove_profile",
@@ -158,6 +168,9 @@ pub enum Event {
     Tick,
     /// The status item's menu is opening.
     MenuOpened,
+    /// Files changed under the folders of [`Effect::WatchSessionFiles`]
+    /// (already debounced, about a second): the paths FSEvents reported.
+    SessionFilesChanged(Vec<PathBuf>),
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -196,6 +209,12 @@ pub enum Effect {
     /// Bring the All Sessions window forward, rendering
     /// [`View::all_sessions`].
     ShowAllSessions,
+    /// Watch these folders (recursively, debounced about a second) and send
+    /// [`Event::SessionFilesChanged`] for what changes, until
+    /// [`Effect::StopWatchingSessionFiles`]. Replaces any earlier watch.
+    WatchSessionFiles(Vec<PathBuf>),
+    /// Stop the watch [`Effect::WatchSessionFiles`] started.
+    StopWatchingSessionFiles,
     /// Ask before an irreversible action: an alert with `title` and
     /// `message`, a destructive confirm button and Cancel. Confirming sends
     /// `confirm`; Cancel sends nothing.
@@ -385,6 +404,77 @@ pub struct AllSessionsView {
     pub search: String,
     /// Whether the list is still filling in (the index is being built).
     pub loading: bool,
+    /// The sidebar, top to bottom: All Sessions and Running, Projects,
+    /// Sidebars (one per Profile, then CLI only).
+    pub sidebar: Vec<SidebarGroup>,
+    /// The sidebar item picked; [`AllSessionsView::rows`] are its Sessions.
+    pub filter: SessionFilter,
+    /// The selected Session, when it is in [`AllSessionsView::rows`].
+    pub detail: Option<SessionDetail>,
+}
+
+/// Which Sessions the All Sessions list shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionFilter {
+    /// Every Session, except those archived in every Profile that has them.
+    #[default]
+    All,
+    /// Sessions with a running dot.
+    Running,
+    /// Sessions whose working folder is this absolute path.
+    Project(String),
+    /// Sessions with an entry in this Profile's Sidebar (archived or not).
+    Sidebar(DiscoveredPair),
+    /// Sessions with no Sidebar entry in any Profile.
+    CliOnly,
+}
+
+/// A heading (none for the first group) and its items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarGroup {
+    pub title: Option<String>,
+    pub items: Vec<SidebarItem>,
+}
+
+/// One pickable sidebar item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarItem {
+    /// For example "All Sessions", "app", "Perso", "Work (not signed in)".
+    pub title: String,
+    /// What picking it sends in [`Command::FilterSessions`].
+    pub filter: SessionFilter,
+}
+
+/// The All Sessions detail pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDetail {
+    pub id: String,
+    pub title: String,
+    /// The working folder, `~` for the home folder.
+    pub folder: Option<String>,
+    pub branch: Option<String>,
+    /// For example "Last used in the CLI, 5 min ago".
+    pub last_used: String,
+    /// Real prompts in the Transcript; `None` once it is deleted.
+    pub turns: Option<u64>,
+    pub first_prompt: Option<String>,
+    pub dot: Option<RunningDot>,
+    /// One line per Profile, in sidebar order.
+    pub sidebars: Vec<SidebarPresence>,
+    /// Why nothing can be opened, when the Transcript was deleted.
+    pub deleted: Option<String>,
+}
+
+/// Whether one Profile's Sidebar has an entry for the Session (✓ or –).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarPresence {
+    /// The Profile, as its sidebar item names it.
+    pub profile: String,
+    pub has_entry: bool,
+    /// The entry is archived in this Profile.
+    pub archived: bool,
+    /// This is the desktop app's Active Profile ("desktop now").
+    pub desktop_now: bool,
 }
 
 /// One Session in the All Sessions list, drawn on two lines.
@@ -399,6 +489,9 @@ pub struct SessionRow {
     pub subtitle: String,
     /// A running dot before the title, when the Session runs.
     pub dot: Option<RunningDot>,
+    /// The Transcript is gone and only Sidebar entries remain: drawn greyed,
+    /// with nothing to open.
+    pub deleted: bool,
 }
 
 /// Where a running Session runs.
