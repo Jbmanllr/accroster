@@ -57,6 +57,11 @@ pub enum Command {
         target: NicknameTarget,
         nickname: Option<String>,
     },
+    /// All Sessions… in the menu: show the All Sessions window and bring its
+    /// list up to date.
+    OpenAllSessions,
+    /// The All Sessions search field changed. Empty shows every Session.
+    SearchSessions(String),
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -90,6 +95,8 @@ impl Command {
             Command::UnhideDiscovered(_) => "unhide_discovered",
             Command::Rename(_) => "rename",
             Command::SetNickname { .. } => "set_nickname",
+            Command::OpenAllSessions => "open_all_sessions",
+            Command::SearchSessions(_) => "search_sessions",
         }
     }
 }
@@ -129,6 +136,9 @@ pub enum Effect {
         current: Option<String>,
         target: NicknameTarget,
     },
+    /// Bring the All Sessions window forward, rendering
+    /// [`View::all_sessions`].
+    ShowAllSessions,
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -138,6 +148,7 @@ pub struct View {
     pub menu: MenuView,
     pub settings: SettingsView,
     pub about: AboutView,
+    pub all_sessions: AllSessionsView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
 }
@@ -260,6 +271,42 @@ pub struct HiddenDiscovered {
     pub title: String,
     /// Sent by its Restore item: [`Command::UnhideDiscovered`].
     pub restore: Command,
+}
+
+/// The All Sessions window: every Session on the Mac, across Profiles and
+/// the CLI, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllSessionsView {
+    /// The Sessions matching [`AllSessionsView::search`], newest first.
+    pub rows: Vec<SessionRow>,
+    /// The search field's text.
+    pub search: String,
+    /// Whether the list is still filling in (the index is being built).
+    pub loading: bool,
+}
+
+/// One Session in the All Sessions list, drawn on two lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// The Session's Transcript id.
+    pub id: String,
+    /// First line: the title, else the first prompt in quotes.
+    pub title: String,
+    /// Second line: `project · last activity` (for example
+    /// `app · 5 min ago`).
+    pub subtitle: String,
+    /// A running dot before the title, when the Session runs.
+    pub dot: Option<RunningDot>,
+}
+
+/// Where a running Session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningDot {
+    /// Green: a Claude Code process outside the desktop app (Terminal, an
+    /// IDE, …), in any status.
+    Terminal,
+    /// Orange: a desktop app turn that is busy or waiting.
+    Desktop,
 }
 
 /// The About panel.

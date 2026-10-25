@@ -38,7 +38,7 @@ fn titles(core: &accroster_core::Core) -> Vec<String> {
 }
 
 #[test]
-fn the_menu_offers_add_profile_settings_about_and_quit() {
+fn the_menu_offers_all_sessions_add_profile_settings_about_and_quit() {
     let mac = FakeMac::new();
     mac.with_claude_home(&FixtureLogin::perso());
     mac.write_zshrc("export PATH=\"$HOME/.local/bin:$PATH\"\n");
@@ -48,7 +48,13 @@ fn the_menu_offers_add_profile_settings_about_and_quit() {
 
     assert_eq!(
         titles(&core),
-        ["Add Profile…", "Settings…", "About", "Quit"]
+        [
+            "All Sessions…",
+            "Add Profile…",
+            "Settings…",
+            "About",
+            "Quit"
+        ]
     );
     assert_eq!(click(&mut core, "Settings…"), [Effect::ShowSettings]);
     assert_eq!(click(&mut core, "About"), [Effect::ShowAbout]);
