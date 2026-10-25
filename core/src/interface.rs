@@ -118,6 +118,23 @@ pub enum Command {
     /// "Resume <feature>" in Diagnostics, offered once the checks pass again.
     /// The only way a Safety pause ends.
     ResumeFeature(SafetyFeature),
+    /// The Sidebar sync mode in Settings.
+    SetSidebarSync(SidebarSyncMode),
+    /// "Sync now" in Settings: copy every Session's Sidebar entry into every
+    /// other Profile's sidebar.
+    SyncSidebarNow,
+}
+
+/// How Sidebar sync runs (ADR 0003). Saved in `settings.json` as
+/// `"off"` / `"manual"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarSyncMode {
+    /// Sync never writes (the default).
+    #[default]
+    Off,
+    /// Sync runs on "Sync now".
+    Manual,
 }
 
 /// A feature that writes Claude's files and can get a Safety pause
@@ -129,6 +146,8 @@ pub enum SafetyFeature {
     /// The Profile links that share Transcripts and resume data
     /// (`projects`, `file-history`, `session-env`).
     TranscriptSharing,
+    /// Copying Sidebar entries between Profiles.
+    SidebarSync,
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -174,6 +193,8 @@ impl Command {
             Command::OpenDiagnostics => "open_diagnostics",
             Command::CopyDiagnosticsReport => "copy_diagnostics_report",
             Command::ResumeFeature(_) => "resume_feature",
+            Command::SetSidebarSync(_) => "set_sidebar_sync",
+            Command::SyncSidebarNow => "sync_sidebar_now",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
             Command::FilterSessions(_) => "filter_sessions",
@@ -482,6 +503,7 @@ pub struct SettingsView {
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
+    pub sidebar_sync: SidebarSyncView,
     pub notifications: NotificationsView,
 }
 
@@ -494,6 +516,16 @@ pub struct NotificationsView {
     /// Whether a limit that warned notifies again when it resets
     /// ([`Command::SetResetNotification`]). Off by default.
     pub reset_notification: bool,
+}
+
+/// Sidebar sync in Settings: the mode and "Sync now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSyncView {
+    pub mode: SidebarSyncMode,
+    /// "Sync now", present in Manual mode: [`Command::SyncSidebarNow`].
+    pub sync_now: Option<Command>,
+    /// What the last sync did, or why it didn't run.
+    pub note: Option<String>,
 }
 
 /// One entry of Settings > Hidden (n)….

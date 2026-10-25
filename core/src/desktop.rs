@@ -174,6 +174,20 @@ fn is_uuid(text: &str) -> bool {
     text.len() == 36 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// `main.log`'s length now, if it exists.
+pub(crate) fn main_log_length(paths: &DesktopPaths) -> Option<u64> {
+    fs::metadata(paths.main_log()).ok().map(|meta| meta.len())
+}
+
+/// Whether Claude signed in to an account since `main.log` was `length`
+/// long (a shorter log was rotated: it counts as a sign-in, to be safe).
+pub(crate) fn signed_in_since(paths: &DesktopPaths, length: u64) -> bool {
+    match main_log_length(paths) {
+        Some(now) if now < length => true,
+        _ => log_signed_in_since(&paths.main_log(), length),
+    }
+}
+
 // ----- Versions --------------------------------------------------------------------
 
 /// The installed Claude versions, from links, folder names and the app's
@@ -611,7 +625,7 @@ impl DesktopBridge {
     /// Brings Claude forward with the instruction and starts watching for
     /// the result. Claude is never quit: the user signs out and in.
     fn guide(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
-        // Sidebar sync into the target (spec step 2) joins here once it exists.
+        // Spec step 2, Sidebar sync into the target, joins here (#48): `sidebar_sync::run`.
         let paths = DesktopPaths::new(&ctx.env.home);
         let previous = desktop_account(&paths).and_then(|account| {
             account

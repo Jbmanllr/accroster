@@ -665,6 +665,7 @@ struct FakeOsState {
     managed_settings: Option<Vec<u8>>,
     /// Live pids running the desktop app's bundled Claude Code.
     desktop_children: BTreeSet<u32>,
+    desktop_app_running: bool,
 }
 
 /// OS facts the test sets by hand. Clones share the facts.
@@ -695,6 +696,11 @@ impl FakeOs {
     pub fn start_desktop_child(&self, pid: u32, started_at: Timestamp) {
         self.start_process(pid, 1, started_at);
         self.0.lock().unwrap().desktop_children.insert(pid);
+    }
+
+    /// Starts (`true`) or quits (`false`) the desktop app. It starts quit.
+    pub fn set_desktop_app_running(&self, running: bool) {
+        self.0.lock().unwrap().desktop_app_running = running;
     }
 
     /// Installs (or with `None`, removes) the desktop app.
@@ -731,6 +737,10 @@ impl OsFacts for FakeOs {
             .iter()
             .copied()
             .collect()
+    }
+
+    fn desktop_app_running(&self) -> bool {
+        self.0.lock().unwrap().desktop_app_running
     }
 }
 

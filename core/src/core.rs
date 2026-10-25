@@ -14,9 +14,10 @@ use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect, Event,
-    FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, View,
+    AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
+    Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
+    NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, SidebarSyncMode,
+    SidebarSyncView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
@@ -26,6 +27,7 @@ use crate::runner::Runner;
 use crate::safety::{self, CheckId, Finding, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
+use crate::sidebar_sync::{self, Run};
 use crate::storage::{self, AppPaths};
 
 /// The tagline, shown in About and the README.
@@ -95,6 +97,8 @@ pub struct Core {
     versions: ClaudeVersions,
     /// Each Profile's links as of the last check, by Profile id.
     links: Vec<ProfileLinks>,
+    /// What the last "Sync now" did, for Settings.
+    sync_note: Option<String>,
 }
 
 /// What the last link check found in one Profile folder.
@@ -148,6 +152,7 @@ impl Core {
             versions: ClaudeVersions::default(),
             links: Vec::new(),
             sessions: SessionIndex::default(),
+            sync_note: None,
         };
         core.log(
             Level::Info,
@@ -429,6 +434,14 @@ impl Core {
             }
             Command::SearchSessions(text) => {
                 self.sessions.set_search(text);
+                Vec::new()
+            }
+            Command::SetSidebarSync(mode) => {
+                self.set_sidebar_sync(mode);
+                Vec::new()
+            }
+            Command::SyncSidebarNow => {
+                self.sync_sidebar();
                 Vec::new()
             }
             Command::FilterSessions(filter) => {
@@ -789,6 +802,12 @@ impl Core {
                     line: cli_switcher::path_line(&self.paths),
                     note: self.cli_note.clone(),
                 },
+                sidebar_sync: SidebarSyncView {
+                    mode: self.settings.sidebar_sync,
+                    sync_now: (self.settings.sidebar_sync == SidebarSyncMode::Manual)
+                        .then_some(Command::SyncSidebarNow),
+                    note: self.sync_note.clone(),
+                },
                 hidden_discovered: shown
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
@@ -899,8 +918,7 @@ impl Core {
             self.check_config_dir_honoured();
         }
         let home = self.env.home.clone();
-        self.safety
-            .record(CheckId::SidebarEntries, checks::sidebar_entries(&home));
+        self.check_sidebar_entries();
         let mut session_dirs = vec![home.join(".claude")];
         session_dirs.extend(
             self.profiles
@@ -1084,6 +1102,7 @@ impl Core {
                 self.check_config_dir_honoured();
             }
             SafetyFeature::TranscriptSharing => self.check_links(),
+            SafetyFeature::SidebarSync => self.check_sidebar_entries(),
         }
         self.settle();
         if !self.safety.resume(feature) {
@@ -1104,6 +1123,124 @@ impl Core {
             profiles.heal_links(&ctx);
             self.check_links();
         }
+        if feature == SafetyFeature::SidebarSync {
+            // The user accepts the sidebars as they are now.
+            sidebar_sync::accept_current(&self.env, &self.paths);
+            self.sync_note = None;
+        }
+    }
+
+    /// The Sidebar entries check. A failure pauses Sidebar sync only while
+    /// sync is on: with it off, nothing would be written anyway.
+    fn check_sidebar_entries(&mut self) {
+        let mut finding = checks::sidebar_entries(&self.env.home);
+        if finding.status == CheckStatus::Fail && self.settings.sidebar_sync != SidebarSyncMode::Off
+        {
+            let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
+            finding = finding.blocking(SafetyFeature::SidebarSync, reason);
+        }
+        self.safety.record(CheckId::SidebarEntries, finding);
+    }
+
+    /// The Sidebar sync mode in Settings. Turning sync on checks the Sidebar
+    /// entries first, so a changed format pauses it before any write.
+    fn set_sidebar_sync(&mut self, mode: SidebarSyncMode) {
+        let mut updated = self.settings.clone();
+        updated.sidebar_sync = mode;
+        if !self.save_settings(updated) {
+            return;
+        }
+        self.sync_note = None;
+        self.log(
+            Level::Info,
+            "sidebar sync mode",
+            &[(
+                "mode",
+                Field::Word(match mode {
+                    SidebarSyncMode::Off => "off",
+                    SidebarSyncMode::Manual => "manual",
+                }),
+            )],
+        );
+        self.check_sidebar_entries();
+        self.settle();
+    }
+
+    /// "Sync now": checks the Sidebar entries again, then copies every entry
+    /// into every other Profile's sidebar (ADR 0003).
+    fn sync_sidebar(&mut self) {
+        if self.settings.sidebar_sync == SidebarSyncMode::Off {
+            return;
+        }
+        self.check_sidebar_entries();
+        self.settle();
+        if self.safety.is_paused(SafetyFeature::SidebarSync) {
+            self.sync_note =
+                Some("Sidebar sync is paused · see Diagnostics for why and to resume it".into());
+            self.log(Level::Info, "sidebar sync not run: paused", &[]);
+            return;
+        }
+        match sidebar_sync::run(&self.env, &self.paths) {
+            Run::Synced(report) => {
+                self.safety
+                    .record(CheckId::MultiAccountMode, Finding::pass());
+                self.log(
+                    Level::Info,
+                    "sidebar synced",
+                    &[
+                        ("entries", Field::Number(report.written as i64)),
+                        ("folders", Field::Number(report.folders as i64)),
+                        ("not_backed_up", Field::Number(report.not_backed_up as i64)),
+                    ],
+                );
+                self.sync_note = Some(sync_note(&report));
+            }
+            Run::DesktopAccountUnknown => {
+                self.log(
+                    Level::Info,
+                    "sidebar sync not run: desktop account unknown",
+                    &[],
+                );
+                self.sync_note =
+                    Some("Couldn't tell which Profile Claude is using · nothing was synced".into());
+            }
+            Run::UnknownFields(fields) => {
+                let detail = format!(
+                    "unknown fields: {}",
+                    fields.into_iter().collect::<Vec<_>>().join(", ")
+                );
+                let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
+                self.safety.record(
+                    CheckId::SidebarEntries,
+                    Finding::fail(detail).blocking(SafetyFeature::SidebarSync, reason),
+                );
+                self.paused_sync_note();
+            }
+            Run::FoldersChanged(count) => {
+                let whose = if count > 1 { "sidebars" } else { "sidebar" };
+                let detail =
+                    format!("{count} {whose} Claude wasn't using changed since the last sync");
+                self.safety.record(
+                    CheckId::MultiAccountMode,
+                    Finding::fail(detail.clone()).blocking(
+                        SafetyFeature::SidebarSync,
+                        "Claude wrote to a Profile it isn't using",
+                    ),
+                );
+                self.paused_sync_note();
+                // The pause stays until Resume, which accepts the sidebars as
+                // they are; the finding itself no longer blocks.
+                self.safety
+                    .record(CheckId::MultiAccountMode, Finding::fail(detail));
+            }
+        }
+    }
+
+    fn paused_sync_note(&mut self) {
+        self.settle();
+        self.log(Level::Warn, "sidebar sync stopped before writing", &[]);
+        self.sync_note =
+            Some("Sidebar sync is paused · nothing was written · see Diagnostics".into());
     }
 
     /// Reads the next batch of the Session index while a build runs.
@@ -1533,6 +1670,46 @@ impl Core {
     }
 }
 
+/// "Claude 3.6556.2", or "Claude" when the desktop app's version is unknown.
+fn desktop_name(versions: &ClaudeVersions) -> String {
+    match &versions.desktop {
+        Some(version) => format!("Claude {version}"),
+        None => "Claude".to_owned(),
+    }
+}
+
+/// Settings' line after a sync.
+fn sync_note(report: &sidebar_sync::Report) -> String {
+    let mut note = if report.written == 0 {
+        "Every sidebar was already in sync".to_owned()
+    } else {
+        let entries = if report.written == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        let profiles = if report.folders == 1 {
+            "Profile"
+        } else {
+            "Profiles"
+        };
+        format!(
+            "Updated {} Sidebar {entries} in {} {profiles}",
+            report.written, report.folders
+        )
+    };
+    if report.left_desktop_account {
+        note.push_str(" · the Profile Claude is using syncs once Claude is quit");
+    }
+    if report.not_backed_up > 0 {
+        note.push_str(&format!(
+            " · {} couldn't be backed up and were left as they were",
+            report.not_backed_up
+        ));
+    }
+    note
+}
+
 /// A row's tightest limit: its highest bar, unknown limit kinds included.
 fn tightest(row: &ProfileRow) -> Option<u32> {
     row.limits.iter().map(|bar| bar.percent).max()
@@ -1557,6 +1734,7 @@ fn feature_word(feature: SafetyFeature) -> &'static str {
     match feature {
         SafetyFeature::CliSwitching => "cli_switching",
         SafetyFeature::TranscriptSharing => "transcript_sharing",
+        SafetyFeature::SidebarSync => "sidebar_sync",
     }
 }
 
