@@ -5,12 +5,38 @@
 use std::path::{Path, PathBuf};
 
 use super::Core;
-use crate::cli_switcher::{self, TurnedOff};
+use crate::cli_switcher::{self, Hold, TurnedOff};
 use crate::interface::SafetyFeature;
 use crate::logging::{Field, Level};
 use crate::monitor::LimitsView;
 
+/// The Settings note while the self-check's `auth status` answers come in.
+const CHECKING_NOTE: &str =
+    "Checking Claude Code in each Profile · CLI switching waits until that's done";
+
 impl Core {
+    /// What stops the CLI's Active Profile from changing now: a Safety
+    /// pause, or a self-check whose `auth status` answers aren't all in (at
+    /// launch they can take up to 30 s per Profile), since an answer can
+    /// still pause CLI switching.
+    pub(super) fn cli_hold(&self) -> Hold {
+        if self.safety.is_paused(SafetyFeature::CliSwitching) {
+            Hold::Paused
+        } else if self.profiles.cross_checking() {
+            Hold::Checking
+        } else {
+            Hold::Free
+        }
+    }
+
+    /// The CLI switching note in Settings.
+    pub(super) fn cli_switching_note(&self) -> Option<String> {
+        match self.cli_hold() {
+            Hold::Checking => Some(CHECKING_NOTE.into()),
+            _ => self.cli_note.clone(),
+        }
+    }
+
     /// The CLI's pointer while CLI switching is on.
     pub(super) fn cli_pointer(&self) -> Option<PathBuf> {
         cli_switcher::is_on(&self.paths)
@@ -66,10 +92,16 @@ impl Core {
     /// the shim; off removes them and the pointer, or lists the lines of an
     /// edited block for the user to remove.
     pub(super) fn set_cli_switching(&mut self, on: bool) {
-        if on && self.safety.is_paused(SafetyFeature::CliSwitching) {
-            self.cli_note =
-                Some("CLI switching is paused · see Diagnostics for why and to resume it".into());
-            return;
+        match self.cli_hold() {
+            Hold::Paused if on => {
+                self.cli_note = Some(
+                    "CLI switching is paused · see Diagnostics for why and to resume it".into(),
+                );
+                return;
+            }
+            // The Settings note says why while the check runs.
+            Hold::Checking if on => return,
+            _ => {}
         }
         let now = self.env.clock.now();
         let result = if on {
@@ -126,9 +158,16 @@ impl Core {
         if self.safety.check_settings_env(&self.env, true) {
             self.settle();
         }
-        if self.safety.is_paused(SafetyFeature::CliSwitching) {
-            self.log(Level::Info, "cli profile not chosen: paused", &[]);
-            return;
+        match self.cli_hold() {
+            Hold::Free => {}
+            Hold::Paused => {
+                self.log(Level::Info, "cli profile not chosen: paused", &[]);
+                return;
+            }
+            Hold::Checking => {
+                self.log(Level::Info, "cli profile not chosen: checking", &[]);
+                return;
+            }
         }
         let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
             return;

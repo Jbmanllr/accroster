@@ -502,6 +502,11 @@ impl ProfileRegistry {
         true
     }
 
+    /// Whether a cross-check's answers are still coming in.
+    pub(crate) fn cross_checking(&self) -> bool {
+        self.cross_check.is_some()
+    }
+
     /// The cross-check's answers, once every one is in.
     pub(crate) fn take_cross_check(&mut self) -> Option<Vec<CrossCheckAnswer>> {
         if self.cross_check.as_ref()?.waiting > 0 {

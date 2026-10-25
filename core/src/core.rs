@@ -806,11 +806,7 @@ impl Core {
             self.annotate_links(profile.id, &mut profile.row);
         }
         let profile_settings = self.profile_settings(&listed);
-        let cli = cli_switcher::present(
-            &self.paths,
-            &mut listed,
-            self.safety.is_paused(SafetyFeature::CliSwitching),
-        );
+        let cli = cli_switcher::present(&self.paths, &mut listed, self.cli_hold());
         let pointer = cli_switcher::pointer(&self.paths);
         // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
         let menu_bar_dimmed = listed
@@ -955,7 +951,7 @@ impl Core {
                 cli_switching: CliSwitchingView {
                     on: cli_switcher::is_on(&self.paths),
                     line: cli_switcher::path_line(&self.paths),
-                    note: self.cli_note.clone(),
+                    note: self.cli_switching_note(),
                 },
                 sidebar_sync: SidebarSyncView {
                     mode: self.settings.sidebar_sync,
