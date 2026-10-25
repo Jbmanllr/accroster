@@ -28,27 +28,8 @@ fi
 
 cargo build --release --manifest-path "$repo/Cargo.toml" -p accroster
 
-version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"
 app="$repo/target/release/AccRoster.app"
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$repo/target/release/accroster" "$app/Contents/MacOS/accroster"
-sed "s/@VERSION@/$version/g" "$repo/bundle/Info.plist" > "$app/Contents/Info.plist"
-
-# App icon from the SVG, when rsvg-convert is installed (brew install librsvg).
-if command -v rsvg-convert > /dev/null 2>&1; then
-  iconset="$(mktemp -d)/AccRoster.iconset"
-  mkdir -p "$iconset"
-  for size in 16 32 128 256 512; do
-    rsvg-convert -w "$size" -h "$size" "$repo/assets/icon/accroster.svg" -o "$iconset/icon_${size}x${size}.png"
-    double=$((size * 2))
-    rsvg-convert -w "$double" -h "$double" "$repo/assets/icon/accroster.svg" -o "$iconset/icon_${size}x${size}@2x.png"
-  done
-  iconutil -c icns "$iconset" -o "$app/Contents/Resources/AccRoster.icns"
-  rm -rf "$(dirname "$iconset")"
-else
-  echo "rsvg-convert not found: building without an app icon." >&2
-fi
+"$repo/scripts/assemble-app.sh" "$repo/target/release/accroster" "$app"
 
 if [ "$ad_hoc" = true ]; then
   echo "Signing ad hoc: Keychain approvals won't survive the next rebuild." >&2

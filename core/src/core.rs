@@ -1401,8 +1401,8 @@ fn launch_at_login_view(status: LoginItemStatus) -> LaunchAtLoginView {
             on: false,
             enabled: false,
             note: Some(
-                "macOS can't offer this for this copy of AccRoster: it needs a signed copy, \
-                 run from its app bundle."
+                "Launch at login needs a copy of AccRoster signed with an Apple Developer ID, \
+                 like the downloadable releases. This copy can't offer it."
                     .into(),
             ),
         },
