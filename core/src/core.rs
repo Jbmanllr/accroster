@@ -2,17 +2,20 @@
 
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::SignedDuration;
 
 use crate::backups;
+use crate::cli_switcher::{self, TurnedOff};
+use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, Command, DiscoveredPair, Effect, Event, FirstRunView, HiddenDiscovered,
-    LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget, SettingsView, View,
+    AboutView, CliSwitchingView, Command, DiscoveredPair, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::profiles::{self, ProfileRegistry, SignInTarget};
@@ -71,6 +74,9 @@ pub struct Core {
     /// Menu warning lines for this run.
     warnings: Vec<String>,
     profiles: ProfileRegistry,
+    /// What the last CLI switching change left for the user to do.
+    cli_note: Option<String>,
+    desktop: DesktopBridge,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
     /// The All Sessions list and the Session index behind it.
@@ -96,6 +102,8 @@ impl Core {
             settings: loaded.settings,
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
+            cli_note: None,
+            desktop: DesktopBridge::default(),
             discovered: Vec::new(),
             sessions: SessionIndex::default(),
         };
@@ -143,6 +151,18 @@ impl Core {
         }
         let (profiles, ctx) = core.profiles();
         *profiles = ProfileRegistry::load(&ctx);
+        match cli_switcher::heal_shim(&core.paths) {
+            Ok(false) => {}
+            Ok(true) => core.log(Level::Info, "cli shim rewritten", &[]),
+            Err(error) => {
+                let error = error.to_string();
+                core.log(
+                    Level::Warn,
+                    "cli shim not rewritten",
+                    &[("error", Field::Text(&error))],
+                );
+            }
+        }
         core.rescan_discovered();
         Ok(core)
     }
@@ -154,7 +174,7 @@ impl Core {
         if self.sessions.building() {
             // The next batch of the Session index, as soon as input allows.
             Duration::ZERO
-        } else if self.profiles.signing_in() {
+        } else if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
@@ -233,7 +253,100 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::SetCliSwitching(on) => {
+                self.set_cli_switching(on);
+                Vec::new()
+            }
+            Command::UseForNewCliRuns(id) => {
+                self.use_for_new_cli_runs(&id);
+                Vec::new()
+            }
+            Command::CopyShellOverride(id) => self
+                .profiles
+                .config_dir(&id)
+                .map(|config_dir| {
+                    vec![Effect::CopyToClipboard(cli_switcher::shell_override(
+                        config_dir,
+                    ))]
+                })
+                .unwrap_or_default(),
+            Command::SwitchDesktopApp(id) => {
+                let target = self
+                    .profiles
+                    .signed_in()
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map(Target::of);
+                let Some(target) = target else {
+                    return Vec::new();
+                };
+                let (desktop, ctx) = self.desktop();
+                desktop.start(&ctx, target)
+            }
+            Command::ConfirmDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.confirm(&ctx)
+            }
+            Command::NotifyWhenDesktopIdle => {
+                self.desktop.notify_when_idle();
+                Vec::new()
+            }
+            Command::CancelDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.cancel(&ctx);
+                Vec::new()
+            }
             Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
+            Command::Rename(NicknameTarget::Profile(id)) => self
+                .profiles
+                .nickname_prompt(&id, &self.settings)
+                .into_iter()
+                .collect(),
+            Command::SetNickname {
+                target: NicknameTarget::Profile(id),
+                nickname,
+            } => {
+                self.set_nickname(id, nickname);
+                Vec::new()
+            }
+            Command::MoveProfile { id, to } => {
+                self.move_profile(&id, to);
+                Vec::new()
+            }
+            Command::SignInAgain(id) => {
+                let (profiles, ctx) = self.profiles();
+                profiles.sign_in_again(&ctx, &id);
+                Vec::new()
+            }
+            Command::AskRemoveProfile(id) => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfile(id.clone());
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfile(id) => {
+                self.remove_profile(&id);
+                Vec::new()
+            }
+            Command::AskRemoveProfileWithNextCli { id, next } => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfileWithNextCli {
+                    id: id.clone(),
+                    next,
+                };
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfileWithNextCli { id, next } => {
+                if self.point_cli_elsewhere(next.as_deref()) {
+                    self.remove_profile(&id);
+                }
+                Vec::new()
+            }
             Command::OpenAllSessions => {
                 self.sessions.open(&self.env, &self.paths);
                 vec![Effect::ShowAllSessions]
@@ -254,8 +367,12 @@ impl Core {
                 }
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
+                let mut effects = profiles.take_effects();
+                let signed_in = self.profiles.signed_in();
+                let (desktop, ctx) = self.desktop();
+                effects.extend(desktop.poll(&ctx, &signed_in));
                 self.index_sessions();
-                Vec::new()
+                effects
             }
             Event::MenuOpened => {
                 self.rescan_discovered();
@@ -274,10 +391,43 @@ impl Core {
             .chain(self.profiles.notice())
             .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
+        let mut listed = self
+            .profiles
+            .listed(self.env.clock.as_ref(), &self.settings);
+        let cli = cli_switcher::present(&self.paths, &mut listed);
+        items.extend(self.desktop.menu_items());
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let rows = self.profiles.rows(self.env.clock.as_ref());
+        let signed_in = self.profiles.signed_in();
+        let desktop_account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+        let desktop_profile = desktop_account
+            .as_ref()
+            .and_then(|account| account.profile(&signed_in));
+        // The CLI part comes first.
+        let mut header: Vec<String> = cli.header.into_iter().collect();
+        if desktop_account.is_some() {
+            let name = desktop_profile.map_or("another account", |profile| &profile.name);
+            header.push(format!("Desktop: {name}"));
+        }
+        if !header.is_empty() {
+            items.push(MenuItem::Detail(header.join("    ")));
+        }
+        let desktop_installed = self.env.os.desktop_app_version().is_some();
+        for listed in listed.iter_mut() {
+            let Some(profile) = signed_in.iter().find(|profile| profile.id == listed.id) else {
+                continue;
+            };
+            let row = &mut listed.row;
+            if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
+                row.badges.push("Desktop".into());
+            } else if desktop_installed {
+                row.submenu.push(MenuItem::Action {
+                    title: "Switch desktop app to this Profile…".into(),
+                    command: Command::SwitchDesktopApp(profile.id.clone()),
+                });
+            }
+        }
         let shown = self.shown_discovered();
         let tz = self.env.clock.time_zone();
         let discovered_rows = shown
@@ -287,7 +437,11 @@ impl Core {
                 MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref()), &tz))
             });
         let before = items.len();
-        items.extend(rows.into_iter().map(MenuItem::Profile));
+        items.extend(
+            listed
+                .into_iter()
+                .map(|profile| MenuItem::Profile(profile.row)),
+        );
         items.extend(discovered_rows);
         if items.len() > before {
             items.push(MenuItem::Separator);
@@ -324,13 +478,19 @@ impl Core {
         ]);
         View {
             menu_bar: MenuBarView {
-                label: "AccRoster".into(),
+                label: cli.label.unwrap_or_else(|| "AccRoster".into()),
+                dimmed: false,
             },
             menu: MenuView { items },
             settings: SettingsView {
                 verbose_logging: self.verbose_logging(),
                 verbose_logging_note: "Turns itself off after 24 hours.".into(),
                 launch_at_login: launch_at_login_view(login_item),
+                cli_switching: CliSwitchingView {
+                    on: cli_switcher::is_on(&self.paths),
+                    line: cli_switcher::path_line(&self.paths),
+                    note: self.cli_note.clone(),
+                },
                 hidden_discovered: shown
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
@@ -354,6 +514,7 @@ impl Core {
                 .then_some(FirstRunView {
                     launch_at_login: true,
                 }),
+            versions: desktop::versions(&self.env),
         }
     }
 
@@ -455,6 +616,95 @@ impl Core {
         );
     }
 
+    /// Sets or (when blank) clears a Profile's nickname.
+    fn set_nickname(&mut self, id: String, nickname: Option<String>) {
+        let mut updated = self.settings.clone();
+        match nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => updated.nicknames.insert(id.clone(), name.to_owned()),
+            None => updated.nicknames.remove(&id),
+        };
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "nickname changed",
+                &[("profile", Field::Profile(&id))],
+            );
+        }
+    }
+
+    /// Remove… confirmed: signs the Profile out and deletes its folder, then
+    /// forgets its nickname and place in the order.
+    fn remove_profile(&mut self, id: &str) {
+        let (profiles, ctx) = self.profiles();
+        if profiles.remove(&ctx, id) {
+            self.forget_profile_settings(id);
+        }
+    }
+
+    /// Points new CLI runs at Profile `next`, or at Default (`~/.claude`,
+    /// no pointer) for `None`, before the CLI's Active Profile is removed.
+    /// Returns whether that worked; the removal waits for it.
+    fn point_cli_elsewhere(&mut self, next: Option<&str>) -> bool {
+        let result = match next {
+            Some(next) => match self.profiles.config_dir(next) {
+                Some(config_dir) => cli_switcher::set_pointer(&self.paths, config_dir),
+                None => return false,
+            },
+            None => cli_switcher::clear_pointer(&self.paths),
+        };
+        match result {
+            Ok(()) => {
+                self.log(Level::Info, "cli profile moved before removal", &[]);
+                true
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not moved",
+                    &[("error", Field::Text(&error))],
+                );
+                false
+            }
+        }
+    }
+
+    /// Drops a removed Profile's nickname and place in the order.
+    fn forget_profile_settings(&mut self, id: &str) {
+        let mut updated = self.settings.clone();
+        updated.nicknames.remove(id);
+        updated.profile_order.retain(|known| known != id);
+        if updated != self.settings {
+            self.save_settings(updated);
+        }
+    }
+
+    /// Moves a Profile to position `to` (clamped) and saves the whole order.
+    fn move_profile(&mut self, id: &str, to: usize) {
+        let mut order = self.profiles.ordered_ids(&self.settings.profile_order);
+        let Some(from) = order.iter().position(|known| known == id) else {
+            return;
+        };
+        let moved = order.remove(from);
+        order.insert(to.min(order.len()), moved);
+        let mut updated = self.settings.clone();
+        updated.profile_order = order;
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "profile moved",
+                &[
+                    ("profile", Field::Profile(id)),
+                    ("to", Field::Number(to as i64)),
+                ],
+            );
+        }
+    }
+
     /// Writes `settings.json` and keeps `updated` as the current settings.
     /// On failure, logs it, keeps the previous settings and returns `false`.
     fn save_settings(&mut self, updated: Settings) -> bool {
@@ -506,6 +756,96 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// The CLI switching switch: on appends the `.zshrc` block and installs
+    /// the shim; off removes them and the pointer, or lists the lines of an
+    /// edited block for the user to remove.
+    fn set_cli_switching(&mut self, on: bool) {
+        let now = self.env.clock.now();
+        let result = if on {
+            cli_switcher::turn_on(&self.paths, &self.env.home, now).map(|()| TurnedOff::Clean)
+        } else {
+            cli_switcher::turn_off(&self.paths, &self.env.home, now)
+        };
+        let state = if on { "on" } else { "off" };
+        match result {
+            Ok(TurnedOff::Clean) => {
+                self.cli_note = None;
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[("state", Field::Word(state))],
+                );
+            }
+            Ok(TurnedOff::EditedBlock(lines)) => {
+                self.cli_note = Some(format!(
+                    "Your AccRoster block in ~/.zshrc was edited, so it was left in place. Remove these lines yourself:\n{}",
+                    lines.join("\n")
+                ));
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("zshrc", Field::Word("edited")),
+                    ],
+                );
+            }
+            Err(error) => {
+                self.cli_note = Some(format!("Couldn't turn CLI switching {state}: {error}"));
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli switching not changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Makes Profile `id` the CLI's Active Profile by rewriting only the
+    /// pointer. Ignored while CLI switching is off.
+    fn use_for_new_cli_runs(&mut self, id: &str) {
+        if !cli_switcher::is_on(&self.paths) {
+            return;
+        }
+        let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
+            return;
+        };
+        match cli_switcher::set_pointer(&self.paths, &config_dir) {
+            Ok(()) => self.log(
+                Level::Info,
+                "cli profile chosen",
+                &[("profile", Field::Profile(id))],
+            ),
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not chosen",
+                    &[
+                        ("profile", Field::Profile(id)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// The Desktop bridge, with what it needs from the rest of the core.
+    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+        let verbose = self.verbose_logging();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose,
+        };
+        (&mut self.desktop, ctx)
     }
 
     /// The Profile registry, with what it needs from the rest of the core.

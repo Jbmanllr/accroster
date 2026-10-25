@@ -38,6 +38,24 @@ pub enum Command {
     CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
+    /// The CLI switching switch in Settings. On appends the marked block to
+    /// `~/.zshrc` and installs the `claude` shim; off removes them and the
+    /// pointer.
+    SetCliSwitching(bool),
+    /// A Profile row's click, or "Use for new CLI runs" in its submenu: make
+    /// the Profile (by id) the CLI's Active Profile for new `claude` runs.
+    UseForNewCliRuns(String),
+    /// "Copy shell override" in a Profile's submenu (by id).
+    CopyShellOverride(String),
+    /// "Switch desktop app to this Profile…" in a Profile's submenu, with
+    /// that Profile's id: the Guided switch.
+    SwitchDesktopApp(String),
+    /// "Switch anyway", when the busy guard couldn't tell.
+    ConfirmDesktopSwitch,
+    /// "Notify me when idle", when a desktop turn blocked the switch.
+    NotifyWhenDesktopIdle,
+    /// "Cancel switch".
+    CancelDesktopSwitch,
     /// "Limit resets → claude.ai" in a Profile's hover submenu: open
     /// claude.ai Settings > Usage, where the user checks resets by hand.
     OpenLimitResets,
@@ -62,6 +80,22 @@ pub enum Command {
     OpenAllSessions,
     /// The All Sessions search field changed. Empty shows every Session.
     SearchSessions(String),
+    /// Moves a Profile (by id) to position `to` in the Profile order.
+    MoveProfile { id: String, to: usize },
+    /// "Sign in again…" on an expired or signed-out Profile (by id): Claude
+    /// Code's browser sign-in in that same folder.
+    SignInAgain(String),
+    /// Remove… in a row's hover submenu: asks first
+    /// ([`Effect::ConfirmRemoval`]).
+    AskRemoveProfile(String),
+    /// The removal confirmed: sign the Profile out, then delete its folder.
+    RemoveProfile(String),
+    /// A choice under the CLI's Active Profile's "Remove…": which Profile
+    /// new CLI runs use next (`None` = Default, `~/.claude`). Asks first.
+    AskRemoveProfileWithNextCli { id: String, next: Option<String> },
+    /// That removal confirmed: point the CLI at `next` (or delete the
+    /// pointer) first, then remove the Profile.
+    RemoveProfileWithNextCli { id: String, next: Option<String> },
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -74,6 +108,8 @@ pub struct DiscoveredPair {
 /// What a nickname is given to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NicknameTarget {
+    /// A Profile, by id.
+    Profile(String),
     Discovered(DiscoveredPair),
 }
 
@@ -89,6 +125,13 @@ impl Command {
             Command::AddProfile => "add_profile",
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
+            Command::SetCliSwitching(_) => "set_cli_switching",
+            Command::UseForNewCliRuns(_) => "use_for_new_cli_runs",
+            Command::CopyShellOverride(_) => "copy_shell_override",
+            Command::SwitchDesktopApp(_) => "switch_desktop_app",
+            Command::ConfirmDesktopSwitch => "confirm_desktop_switch",
+            Command::NotifyWhenDesktopIdle => "notify_when_desktop_idle",
+            Command::CancelDesktopSwitch => "cancel_desktop_switch",
             Command::OpenLimitResets => "open_limit_resets",
             Command::SignInDiscovered(_) => "sign_in_discovered",
             Command::HideDiscovered(_) => "hide_discovered",
@@ -97,6 +140,12 @@ impl Command {
             Command::SetNickname { .. } => "set_nickname",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
+            Command::MoveProfile { .. } => "move_profile",
+            Command::SignInAgain(_) => "sign_in_again",
+            Command::AskRemoveProfile(_) => "ask_remove_profile",
+            Command::RemoveProfile(_) => "remove_profile",
+            Command::AskRemoveProfileWithNextCli { .. } => "ask_remove_profile_with_next_cli",
+            Command::RemoveProfileWithNextCli { .. } => "remove_profile_with_next_cli",
         }
     }
 }
@@ -126,6 +175,14 @@ pub enum Effect {
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
+    /// Put this text on the general pasteboard.
+    CopyToClipboard(String),
+    /// Bring the Claude desktop app (`com.anthropic.claudefordesktop`)
+    /// forward, opening it if it isn't running. Nothing ever quits or
+    /// relaunches it.
+    BringDesktopAppForward,
+    /// Post a user notification.
+    Notify { title: String, body: String },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
     /// Ask for a nickname for `name` (prefilled with `current`), then send
@@ -139,6 +196,14 @@ pub enum Effect {
     /// Bring the All Sessions window forward, rendering
     /// [`View::all_sessions`].
     ShowAllSessions,
+    /// Ask before an irreversible action: an alert with `title` and
+    /// `message`, a destructive confirm button and Cancel. Confirming sends
+    /// `confirm`; Cancel sends nothing.
+    ConfirmRemoval {
+        title: String,
+        message: String,
+        confirm: Command,
+    },
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -151,6 +216,19 @@ pub struct View {
     pub all_sessions: AllSessionsView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
+    /// The installed Claude versions, for Diagnostics.
+    pub versions: ClaudeVersions,
+}
+
+/// The installed Claude versions, read from files (nothing is spawned).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeVersions {
+    /// The Terminal's Claude Code: where `~/.local/bin/claude` links to.
+    pub claude_code: Option<String>,
+    /// The Claude Code versions bundled with the desktop app, oldest first.
+    pub desktop_claude_code: Vec<String>,
+    /// The desktop app's `CFBundleShortVersionString`.
+    pub desktop: Option<String>,
 }
 
 /// The first-run window: the one-time launch-at-login offer.
@@ -175,8 +253,11 @@ pub struct LaunchAtLoginView {
 /// The status item in the menu bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuBarView {
-    /// Short text shown in the menu bar (kept short for the notch).
+    /// Short text shown in the menu bar (kept short for the notch): the CLI's
+    /// Active Profile and its tightest limit, like `Perso 62%`.
     pub label: String,
+    /// Drawn dimmed (the figure is stale).
+    pub dimmed: bool,
 }
 
 /// The status item's menu, top to bottom.
@@ -197,9 +278,21 @@ pub enum MenuItem {
         title: String,
         command: Command,
     },
+    /// A clickable item with a check mark when `checked`; clicking sends
+    /// `command`.
+    Check {
+        title: String,
+        checked: bool,
+        command: Command,
+    },
     /// A disabled plain line (for example `email · Organization · plan` in a
     /// Profile's hover submenu).
     Detail(String),
+    /// An item opening a nested submenu of `items`.
+    Submenu {
+        title: String,
+        items: Vec<MenuItem>,
+    },
     /// A signed-in Profile's row, drawn as a custom view with limit bars.
     Profile(ProfileRow),
     /// A Discovered Profile, drawn greyed. Clicking the row sends `command`.
@@ -227,11 +320,19 @@ pub struct DiscoveredRow {
 pub struct ProfileRow {
     /// The nickname, else `email · Organization`.
     pub title: String,
+    /// Badges after the name, "CLI" first, then "Desktop": which clients use
+    /// this Profile.
+    pub badges: Vec<String>,
+    /// What clicking the row sends, if it does anything.
+    pub command: Option<Command>,
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
     /// A short line under the bars (for example "Couldn't read limits").
     pub note: Option<String>,
+    /// Draw the bars and title dimmed: the reading is not current (for
+    /// example the Login expired).
+    pub dimmed: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,
@@ -258,6 +359,7 @@ pub struct SettingsView {
     /// The explanatory line under the switch.
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
+    pub cli_switching: CliSwitchingView,
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
@@ -307,6 +409,19 @@ pub enum RunningDot {
     Terminal,
     /// Orange: a desktop app turn that is busy or waiting.
     Desktop,
+}
+
+/// The CLI switching switch in Settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliSwitchingView {
+    /// Whether CLI switching is on (the shim is installed).
+    pub on: bool,
+    /// The exact `PATH` line the `~/.zshrc` block holds, shown before the
+    /// user opts in.
+    pub line: String,
+    /// What the last change left for the user to do, if anything (for
+    /// example the lines of an edited block to remove by hand).
+    pub note: Option<String>,
 }
 
 /// The About panel.

@@ -46,7 +46,6 @@ impl VersionedFile for Source {
 
 /// Copies `file` into `backups/` and returns the copy's path. Call it right
 /// before writing `file`; if it fails, don't write.
-#[allow(dead_code)] // First caller: the CLI switcher (`.zshrc`, `.claude.json`).
 pub(crate) fn back_up(backups: &Path, file: &Path, now: Timestamp) -> io::Result<PathBuf> {
     let name = file
         .file_name()

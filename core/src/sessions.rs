@@ -26,6 +26,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::desktop::{self, DesktopAccount, DesktopPaths};
 use crate::env::Environment;
 use crate::interface::{AllSessionsView, RunningDot, SessionRow};
 use crate::storage::{self, AppPaths, VersionedFile};
@@ -275,8 +276,8 @@ pub(crate) struct SessionIndex {
     read: usize,
     entries: Vec<SidebarEntry>,
     running: HashMap<String, RunningDot>,
-    /// The desktop's Active Profile as (account, Organization).
-    desktop: Option<(String, Option<String>)>,
+    /// The desktop's account and Organization, for title precedence.
+    desktop: Option<DesktopAccount>,
     search: String,
 }
 
@@ -310,7 +311,7 @@ impl SessionIndex {
         self.read = 0;
         self.entries = sidebar_entries(&env.home);
         self.running = running(env, paths);
-        self.desktop = desktop_account(&env.home);
+        self.desktop = desktop::desktop_account(&DesktopPaths::new(&env.home));
     }
 
     /// Reads the next batch of Transcripts. Returns what was built once the
@@ -450,8 +451,9 @@ impl SessionIndex {
     }
 
     fn is_desktop(&self, entry: &SidebarEntry) -> bool {
-        self.desktop.as_ref().is_some_and(|(account, org)| {
-            *account == entry.account && org.as_deref() == Some(entry.org.as_str())
+        self.desktop.as_ref().is_some_and(|desktop| {
+            desktop.account_uuid == entry.account
+                && desktop.organization_uuid.as_deref() == Some(entry.org.as_str())
         })
     }
 }
@@ -621,7 +623,7 @@ fn running(env: &Environment, paths: &AppPaths) -> HashMap<String, RunningDot> {
         let alive = env.os.process(live.pid).is_some_and(|facts| {
             live.proc_start
                 .as_deref()
-                .and_then(|text| parse_proc_start(text, &time_zone))
+                .and_then(|text| desktop::parse_proc_start(text, &time_zone))
                 .is_some_and(|started| started.as_second() == facts.started_at.as_second())
         });
         if !alive {
@@ -641,62 +643,4 @@ fn running(env: &Environment, paths: &AppPaths) -> HashMap<String, RunningDot> {
         }
     }
     dots
-}
-
-/// `procStart` as `ps -o lstart` prints it (`Sun Oct 25 14:02:11 2026`, the
-/// day space-padded), in the Mac's local time.
-fn parse_proc_start(text: &str, time_zone: &jiff::tz::TimeZone) -> Option<Timestamp> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    let [_weekday, month, day, time, year] = parts.as_slice() else {
-        return None;
-    };
-    let month = i8::try_from(MONTHS.iter().position(|m| m == month)? + 1).ok()?;
-    let mut clock = time.split(':').map(|part| part.parse::<i8>().ok());
-    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
-    let date = jiff::civil::Date::new(year.parse().ok()?, month, day.parse().ok()?).ok()?;
-    let time = jiff::civil::Time::new(hour, minute, second, 0).ok()?;
-    let zoned = date.to_datetime(time).to_zoned(time_zone.clone()).ok()?;
-    Some(zoned.timestamp())
-}
-
-/// The desktop's Active Profile as far as its files tell: `config.json`'s
-/// `lastKnownAccountUuid` (the only key read), and the Organization folder
-/// under it holding the most recently written Sidebar entry.
-fn desktop_account(home: &Path) -> Option<(String, Option<String>)> {
-    /// Only the key needed; serde skips the rest (token caches included)
-    /// without keeping them.
-    #[derive(Deserialize)]
-    struct DesktopConfig {
-        #[serde(rename = "lastKnownAccountUuid")]
-        last_known_account_uuid: Option<String>,
-    }
-    let config: DesktopConfig = serde_json::from_slice(
-        &fs::read(home.join("Library/Application Support/Claude/config.json")).ok()?,
-    )
-    .ok()?;
-    let account = config.last_known_account_uuid?;
-    if account.is_empty() || account.contains('/') || account.starts_with('.') {
-        return None;
-    }
-    let org = real_children(&sidebar_root(home).join(&account))
-        .into_iter()
-        .filter(|(_, kind)| kind.is_dir())
-        .filter_map(|(org_dir, _)| {
-            let newest = real_children(&org_dir)
-                .into_iter()
-                .filter(|(path, _)| {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("local_") && n.ends_with(".json"))
-                })
-                .filter_map(|(path, _)| fs::metadata(path).ok()?.modified().ok())
-                .max()?;
-            Some((newest, file_name(&org_dir)))
-        })
-        .max()
-        .map(|(_, org)| org);
-    Some((account, org))
 }

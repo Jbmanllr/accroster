@@ -8,6 +8,7 @@
 mod backups;
 mod cli_switcher;
 mod core;
+mod desktop;
 mod discovered;
 pub mod driver;
 pub mod env;
@@ -33,8 +34,8 @@ pub use interface::{
 };
 pub use interface::{AllSessionsView, RunningDot, SessionRow};
 pub use interface::{
-    DiscoveredPair, DiscoveredRow, FirstRunView, HiddenDiscovered, LaunchAtLoginView,
-    NicknameTarget,
+    ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget,
 };
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};
