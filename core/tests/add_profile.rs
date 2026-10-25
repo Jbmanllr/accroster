@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Event, MenuItem};
+use accroster_core::{Command, Event, MenuItem};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use jiff::SignedDuration;
@@ -31,9 +31,16 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
     );
     assert_eq!(
         rows[0].submenu,
-        [MenuItem::Detail("me@work.example · Work Inc · Max".into())]
+        [
+            MenuItem::Detail("me@work.example · Work Inc · Max".into()),
+            MenuItem::Action {
+                title: "Limit resets → claude.ai".into(),
+                command: Command::OpenLimitResets,
+            },
+        ]
     );
     assert_eq!(rows[0].note, None);
+    assert!(rows[0].offers.is_empty(), "{:?}", rows[0].offers);
     assert!(action_titles(&core).contains(&"Add Profile…".to_string()));
     assert_eq!(mac.list(PROFILES).len(), 1);
     assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
@@ -74,7 +81,13 @@ fn the_new_profile_is_still_listed_after_a_relaunch() {
     assert_eq!(rows[0].title, "me@work.example · Work Inc");
     assert_eq!(
         rows[0].submenu,
-        [MenuItem::Detail("me@work.example · Work Inc".into())],
+        [
+            MenuItem::Detail("me@work.example · Work Inc".into()),
+            MenuItem::Action {
+                title: "Limit resets → claude.ai".into(),
+                command: Command::OpenLimitResets,
+            },
+        ],
         "no plan known until the next usage read"
     );
 }

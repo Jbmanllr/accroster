@@ -47,6 +47,38 @@ pub enum Command {
     NotifyWhenDesktopIdle,
     /// "Cancel switch".
     CancelDesktopSwitch,
+    /// "Limit resets → claude.ai" in a Profile's hover submenu: open
+    /// claude.ai Settings > Usage, where the user checks resets by hand.
+    OpenLimitResets,
+    /// A Discovered Profile's row: Add Profile… aimed at that pair (passing
+    /// its email to the sign-in when known).
+    SignInDiscovered(DiscoveredPair),
+    /// Hide in a Discovered Profile's submenu.
+    HideDiscovered(DiscoveredPair),
+    /// Restore in Settings > Hidden (n)….
+    UnhideDiscovered(DiscoveredPair),
+    /// Rename… in a submenu: asks the UI for a nickname
+    /// ([`Effect::AskNickname`]).
+    Rename(NicknameTarget),
+    /// The answer to [`Effect::AskNickname`]. `None`, empty or blank clears
+    /// the nickname.
+    SetNickname {
+        target: NicknameTarget,
+        nickname: Option<String>,
+    },
+}
+
+/// A Discovered Profile's identity: an account uuid and an Organization uuid.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiscoveredPair {
+    pub account_uuid: String,
+    pub organization_uuid: String,
+}
+
+/// What a nickname is given to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicknameTarget {
+    Discovered(DiscoveredPair),
 }
 
 impl Command {
@@ -65,6 +97,12 @@ impl Command {
             Command::ConfirmDesktopSwitch => "confirm_desktop_switch",
             Command::NotifyWhenDesktopIdle => "notify_when_desktop_idle",
             Command::CancelDesktopSwitch => "cancel_desktop_switch",
+            Command::OpenLimitResets => "open_limit_resets",
+            Command::SignInDiscovered(_) => "sign_in_discovered",
+            Command::HideDiscovered(_) => "hide_discovered",
+            Command::UnhideDiscovered(_) => "unhide_discovered",
+            Command::Rename(_) => "rename",
+            Command::SetNickname { .. } => "set_nickname",
         }
     }
 }
@@ -75,6 +113,8 @@ pub enum Event {
     /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
     /// the core reads the actual time from its [`crate::Clock`].
     Tick,
+    /// The status item's menu is opening.
+    MenuOpened,
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -87,6 +127,8 @@ pub enum Effect {
     ShowAbout,
     /// Select this path in a Finder window.
     RevealInFinder(PathBuf),
+    /// Open this URL in the default browser.
+    OpenUrl(String),
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
@@ -98,6 +140,14 @@ pub enum Effect {
     Notify { title: String, body: String },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
+    /// Ask for a nickname for `name` (prefilled with `current`), then send
+    /// [`Command::SetNickname`] with `target` and the answer. Cancel sends
+    /// nothing.
+    AskNickname {
+        name: String,
+        current: Option<String>,
+        target: NicknameTarget,
+    },
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -173,6 +223,24 @@ pub enum MenuItem {
     Detail(String),
     /// A signed-in Profile's row, drawn as a custom view with limit bars.
     Profile(ProfileRow),
+    /// A Discovered Profile, drawn greyed. Clicking the row sends `command`.
+    Discovered(DiscoveredRow),
+}
+
+/// A Discovered Profile's row in the menu: an account the Mac has evidence of
+/// that has no Profile yet. It never shows limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredRow {
+    /// `Sign in to <name>…`, where the name is the nickname, else
+    /// `email · Organization`, else "Unknown Login".
+    pub title: String,
+    /// A second line for an Unknown Login: Session count, last activity and
+    /// "Desktop's last account" when it applies.
+    pub subtitle: Option<String>,
+    /// Sent when the row is clicked: [`Command::SignInDiscovered`].
+    pub command: Command,
+    /// The hover submenu: details (uuids, first 8 characters), Rename…, Hide.
+    pub submenu: Vec<MenuItem>,
 }
 
 /// One Profile's row in the menu.
@@ -187,6 +255,9 @@ pub struct ProfileRow {
     pub limits: Vec<LimitBar>,
     /// A short line under the bars (for example "Couldn't read limits").
     pub note: Option<String>,
+    /// Banked reset and Session refill lines, when Claude Code reports them
+    /// (for example "Session refill available"). Never redeemable from here.
+    pub offers: Vec<String>,
     /// The hover submenu.
     pub submenu: Vec<MenuItem>,
 }
@@ -210,6 +281,19 @@ pub struct SettingsView {
     /// The explanatory line under the switch.
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
+    /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
+    /// Mac.
+    pub hidden_discovered: Vec<HiddenDiscovered>,
+}
+
+/// One entry of Settings > Hidden (n)….
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenDiscovered {
+    /// The nickname, else `email · Organization`, else "Unknown Login" with
+    /// the account's first 8 characters.
+    pub title: String,
+    /// Sent by its Restore item: [`Command::UnhideDiscovered`].
+    pub restore: Command,
 }
 
 /// The About panel.
