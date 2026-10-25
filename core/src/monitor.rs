@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::env::RunningProcess;
 use crate::interface::LimitBar;
+use crate::limit_offers;
 use crate::logging::{Field, Level};
 use crate::profiles::Context;
 use crate::runner::UsageRead;
@@ -78,6 +79,8 @@ pub(crate) struct LimitsView {
     pub bars: Vec<LimitBar>,
     pub dimmed: bool,
     pub note: Option<String>,
+    /// Banked reset and Session refill lines.
+    pub offers: Vec<String>,
     /// Lines for the hover submenu (as-of time, backoff).
     pub details: Vec<String>,
     /// `subscription_type` from the latest answer (`max`, `pro`, …).
@@ -111,7 +114,7 @@ impl Watch {
             .is_some_and(|limits| {
                 limits
                     .all()
-                    .filter_map(|limit| limit.resets_at)
+                    .filter_map(|(_, limit)| limit.resets_at)
                     .any(|at| last < at && at <= now)
             })
     }
@@ -319,10 +322,16 @@ impl LimitMonitor {
         let mut view = LimitsView::default();
         if let Some(reading) = &watch.reading {
             view.plan = reading.subscription_type.clone();
+            view.offers = limit_offers::lines(
+                reading.banked_reset.as_ref(),
+                reading.session_refill.as_ref(),
+                now,
+                &ctx.env.clock.time_zone(),
+            );
             if let Some(limits) = &reading.limits {
-                let mut bar = |label: &str, limit: &crate::usage::Limit| {
+                view.bars.extend(limits.all().map(|(label, limit)| {
                     let reset = limit.resets_at.is_some_and(|at| at <= now);
-                    view.bars.push(LimitBar {
+                    LimitBar {
                         label: label.to_owned(),
                         percent: if reset {
                             0
@@ -330,17 +339,8 @@ impl LimitMonitor {
                             limit.percent.clamp(0.0, 100.0).floor() as u32
                         },
                         reset,
-                    });
-                };
-                if let Some(limit) = &limits.session {
-                    bar("Session", limit);
-                }
-                if let Some(limit) = &limits.weekly {
-                    bar("Weekly", limit);
-                }
-                for (name, limit) in &limits.models {
-                    bar(name, limit);
-                }
+                    }
+                }));
             }
         }
         let time = |at: Timestamp| clock_time(ctx, at);

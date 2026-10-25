@@ -224,3 +224,14 @@ pub fn make_cli_active(mac: &FakeMac) {
         folder.to_str().expect("UTF-8 path"),
     );
 }
+
+/// The disabled detail lines of a Profile's hover submenu.
+pub fn details(row: &ProfileRow) -> Vec<String> {
+    row.submenu
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Detail(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}

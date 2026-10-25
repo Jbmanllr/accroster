@@ -35,7 +35,6 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 
 use jiff::Timestamp;
-use jiff::tz::TimeZone;
 
 /// Everything outside the core, handed to [`crate::Core::launch`].
 pub struct Environment {
@@ -126,9 +125,10 @@ pub trait RunningProcess: Send {
 /// The current time.
 pub trait Clock: Send {
     fn now(&self) -> Timestamp;
-    /// The time zone times are shown in ("as of 14:02").
-    fn time_zone(&self) -> TimeZone {
-        TimeZone::system()
+
+    /// The time zone dates and times are shown in: the Mac's own.
+    fn time_zone(&self) -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::system()
     }
 }
 

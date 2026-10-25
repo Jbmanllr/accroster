@@ -2,22 +2,24 @@
 
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::SignedDuration;
 
 use crate::backups;
-use crate::cli_switcher;
+use crate::cli_switcher::{self, TurnedOff};
+use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, Command, Effect, Event, FirstRunView, LaunchAtLoginView, MenuBarView, MenuItem,
-    MenuView, SettingsView, View,
+    AboutView, CliSwitchingView, Command, DiscoveredPair, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
-use crate::profiles::{self, ProfileRegistry};
-use crate::settings::{self, Settings};
+use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
 
 /// The tagline, shown in About and the README.
@@ -29,6 +31,9 @@ pub const DISCLAIMER: &str = "AccRoster is an independent open-source project. I
 
 /// How long Verbose logging stays on once turned on.
 const VERBOSE_LOGGING_LASTS: SignedDuration = SignedDuration::from_hours(24);
+
+/// claude.ai Settings > Usage, where Banked resets can be checked by hand.
+const LIMIT_RESETS_URL: &str = "https://claude.ai/settings/usage";
 
 /// Why the core couldn't start. The UI shows it and quits.
 #[derive(Debug)]
@@ -69,6 +74,10 @@ pub struct Core {
     warnings: Vec<String>,
     profiles: ProfileRegistry,
     monitor: LimitMonitor,
+    /// What the last CLI switching change left for the user to do.
+    cli_note: Option<String>,
+    /// Discovered pairs as of the last scan (launch, menu open).
+    discovered: Vec<Evidence>,
 }
 
 impl Core {
@@ -91,6 +100,8 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             monitor: LimitMonitor::default(),
+            cli_note: None,
+            discovered: Vec::new(),
         };
         core.log(
             Level::Info,
@@ -136,6 +147,19 @@ impl Core {
         }
         let (profiles, ctx) = core.profiles();
         *profiles = ProfileRegistry::load(&ctx);
+        match cli_switcher::heal_shim(&core.paths) {
+            Ok(false) => {}
+            Ok(true) => core.log(Level::Info, "cli shim rewritten", &[]),
+            Err(error) => {
+                let error = error.to_string();
+                core.log(
+                    Level::Warn,
+                    "cli shim not rewritten",
+                    &[("error", Field::Text(&error))],
+                );
+            }
+        }
+        core.rescan_discovered();
         core.monitor = LimitMonitor::load(&core.context());
         Ok(core)
     }
@@ -176,7 +200,48 @@ impl Core {
             Command::RevealLogs => vec![Effect::RevealInFinder(self.paths.app_log())],
             Command::AddProfile => {
                 let (profiles, ctx) = self.profiles();
-                profiles.add(&ctx);
+                profiles.add(&ctx, None);
+                Vec::new()
+            }
+            Command::SignInDiscovered(pair) => {
+                let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
+                    return Vec::new();
+                };
+                let target = SignInTarget {
+                    email: evidence.email().map(str::to_owned),
+                    name: evidence.known_name(),
+                    pair,
+                };
+                let (profiles, ctx) = self.profiles();
+                profiles.add(&ctx, Some(target));
+                Vec::new()
+            }
+            Command::HideDiscovered(pair) => {
+                self.update_choice(&pair, |choice| choice.hidden = true);
+                Vec::new()
+            }
+            Command::UnhideDiscovered(pair) => {
+                self.update_choice(&pair, |choice| choice.hidden = false);
+                Vec::new()
+            }
+            Command::Rename(NicknameTarget::Discovered(pair)) => {
+                let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
+                    return Vec::new();
+                };
+                vec![Effect::AskNickname {
+                    name: evidence.known_name(),
+                    current: self.choice(&pair).and_then(|c| c.nickname.clone()),
+                    target: NicknameTarget::Discovered(pair),
+                }]
+            }
+            Command::SetNickname {
+                target: NicknameTarget::Discovered(pair),
+                nickname,
+            } => {
+                let nickname = nickname
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty());
+                self.update_choice(&pair, |choice| choice.nickname = nickname);
                 Vec::new()
             }
             Command::CancelSignIn => {
@@ -185,6 +250,24 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::SetCliSwitching(on) => {
+                self.set_cli_switching(on);
+                Vec::new()
+            }
+            Command::UseForNewCliRuns(id) => {
+                self.use_for_new_cli_runs(&id);
+                Vec::new()
+            }
+            Command::CopyShellOverride(id) => self
+                .profiles
+                .config_dir(&id)
+                .map(|config_dir| {
+                    vec![Effect::CopyToClipboard(cli_switcher::shell_override(
+                        config_dir,
+                    ))]
+                })
+                .unwrap_or_default(),
+            Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
         }
     }
 
@@ -199,6 +282,7 @@ impl Core {
                 profiles.poll(&ctx);
             }
             Event::MenuOpened => {
+                self.rescan_discovered();
                 let watched = self.watched();
                 self.monitor.menu_opened(self.env.clock.now(), &watched);
             }
@@ -234,7 +318,7 @@ impl Core {
     /// The signed-in Profiles the Limit monitor reads, with which are a
     /// client's Active Profile (today the CLI's, from its pointer).
     fn watched(&self) -> Vec<Watched> {
-        let cli_active = cli_switcher::cli_active_config_dir(&self.paths);
+        let cli_active = cli_switcher::pointer(&self.paths);
         self.profiles
             .watched(|config_dir| cli_active.as_deref() == Some(config_dir))
     }
@@ -256,15 +340,39 @@ impl Core {
             )
             .map(MenuItem::Warning)
             .collect();
-        if !items.is_empty() {
-            items.push(MenuItem::Separator);
-        }
-        let rows = self.profiles.rows(|id| {
+        let mut listed = self.profiles.listed(|id| {
             let active = watched.iter().any(|w| w.id == id && w.active);
             self.monitor.view(&ctx, id, active)
         });
-        if !rows.is_empty() {
-            items.extend(rows.into_iter().map(MenuItem::Profile));
+        let cli = cli_switcher::present(&self.paths, &mut listed);
+        let pointer = cli_switcher::pointer(&self.paths);
+        // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
+        let menu_bar_dimmed = listed
+            .iter()
+            .any(|profile| Some(profile.config_dir) == pointer.as_deref() && profile.row.dimmed);
+        let header: Vec<String> = cli.header.into_iter().collect();
+        if !header.is_empty() {
+            items.push(MenuItem::Detail(header.join("    ")));
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        let shown = self.shown_discovered();
+        let tz = self.env.clock.time_zone();
+        let discovered_rows = shown
+            .iter()
+            .filter(|(_, choice)| !choice.is_some_and(|c| c.hidden))
+            .map(|(evidence, choice)| {
+                MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref()), &tz))
+            });
+        let before = items.len();
+        items.extend(
+            listed
+                .into_iter()
+                .map(|profile| MenuItem::Profile(profile.row)),
+        );
+        items.extend(discovered_rows);
+        if items.len() > before {
             items.push(MenuItem::Separator);
         }
         items.push(if self.profiles.signing_in() {
@@ -295,13 +403,27 @@ impl Core {
         ]);
         View {
             menu_bar: MenuBarView {
-                label: "AccRoster".into(),
+                label: cli.label.unwrap_or_else(|| "AccRoster".into()),
+                dimmed: menu_bar_dimmed,
             },
             menu: MenuView { items },
             settings: SettingsView {
                 verbose_logging: self.verbose_logging(),
                 verbose_logging_note: "Turns itself off after 24 hours.".into(),
                 launch_at_login: launch_at_login_view(login_item),
+                cli_switching: CliSwitchingView {
+                    on: cli_switcher::is_on(&self.paths),
+                    line: cli_switcher::path_line(&self.paths),
+                    note: self.cli_note.clone(),
+                },
+                hidden_discovered: shown
+                    .iter()
+                    .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
+                    .map(|(evidence, choice)| HiddenDiscovered {
+                        title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                        restore: Command::UnhideDiscovered(evidence.pair.clone()),
+                    })
+                    .collect(),
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -317,6 +439,61 @@ impl Core {
                     launch_at_login: true,
                 }),
         }
+    }
+
+    /// Re-reads the Mac's evidence of Discovered Profiles. New pairs simply
+    /// appear and emptied ones disappear.
+    fn rescan_discovered(&mut self) {
+        let found = discovered::scan(&self.env.home);
+        if found.len() != self.discovered.len() {
+            self.log(
+                Level::Debug,
+                "discovered profiles",
+                &[("count", Field::Number(found.len() as i64))],
+            );
+        }
+        self.discovered = found;
+    }
+
+    /// Discovered pairs without a signed-in Profile, with the user's choices.
+    fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
+        self.discovered
+            .iter()
+            .filter(|evidence| !self.profiles.has_signed_in(&evidence.pair))
+            .map(|evidence| (evidence, self.choice(&evidence.pair)))
+            .collect()
+    }
+
+    fn choice(&self, pair: &DiscoveredPair) -> Option<&DiscoveredChoice> {
+        self.settings.discovered_profiles.iter().find(|choice| {
+            choice.account_uuid == pair.account_uuid
+                && choice.organization_uuid == pair.organization_uuid
+        })
+    }
+
+    /// Changes the saved choice for `pair` (creating it), dropping choices
+    /// that no longer say anything.
+    fn update_choice(&mut self, pair: &DiscoveredPair, change: impl FnOnce(&mut DiscoveredChoice)) {
+        let mut updated = self.settings.clone();
+        let choices = &mut updated.discovered_profiles;
+        let index = match choices.iter().position(|choice| {
+            choice.account_uuid == pair.account_uuid
+                && choice.organization_uuid == pair.organization_uuid
+        }) {
+            Some(index) => index,
+            None => {
+                choices.push(DiscoveredChoice {
+                    account_uuid: pair.account_uuid.clone(),
+                    organization_uuid: pair.organization_uuid.clone(),
+                    nickname: None,
+                    hidden: false,
+                });
+                choices.len() - 1
+            }
+        };
+        change(&mut choices[index]);
+        choices.retain(|choice| choice.hidden || choice.nickname.is_some());
+        self.save_settings(updated);
     }
 
     fn verbose_logging(&self) -> bool {
@@ -390,6 +567,84 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// The CLI switching switch: on appends the `.zshrc` block and installs
+    /// the shim; off removes them and the pointer, or lists the lines of an
+    /// edited block for the user to remove.
+    fn set_cli_switching(&mut self, on: bool) {
+        let now = self.env.clock.now();
+        let result = if on {
+            cli_switcher::turn_on(&self.paths, &self.env.home, now).map(|()| TurnedOff::Clean)
+        } else {
+            cli_switcher::turn_off(&self.paths, &self.env.home, now)
+        };
+        let state = if on { "on" } else { "off" };
+        match result {
+            Ok(TurnedOff::Clean) => {
+                self.cli_note = None;
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[("state", Field::Word(state))],
+                );
+            }
+            Ok(TurnedOff::EditedBlock(lines)) => {
+                self.cli_note = Some(format!(
+                    "Your AccRoster block in ~/.zshrc was edited, so it was left in place. Remove these lines yourself:\n{}",
+                    lines.join("\n")
+                ));
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("zshrc", Field::Word("edited")),
+                    ],
+                );
+            }
+            Err(error) => {
+                self.cli_note = Some(format!("Couldn't turn CLI switching {state}: {error}"));
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli switching not changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Makes Profile `id` the CLI's Active Profile by rewriting only the
+    /// pointer. Ignored while CLI switching is off.
+    fn use_for_new_cli_runs(&mut self, id: &str) {
+        if !cli_switcher::is_on(&self.paths) {
+            return;
+        }
+        let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
+            return;
+        };
+        match cli_switcher::set_pointer(&self.paths, &config_dir) {
+            Ok(()) => self.log(
+                Level::Info,
+                "cli profile chosen",
+                &[("profile", Field::Profile(id))],
+            ),
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not chosen",
+                    &[
+                        ("profile", Field::Profile(id)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
     }
 
     /// The Profile registry, with what it needs from the rest of the core.

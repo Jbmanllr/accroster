@@ -240,16 +240,9 @@ fn on_wake_and_unlock_the_active_profile_is_read_first() {
     assert_eq!(folders[before + 2], team_folder);
 }
 
-/// The Profile row's hover-submenu detail lines.
-fn details(core: &accroster_core::Core) -> Vec<String> {
-    rows(core)[0]
-        .submenu
-        .iter()
-        .filter_map(|item| match item {
-            accroster_core::MenuItem::Detail(text) => Some(text.clone()),
-            _ => None,
-        })
-        .collect()
+/// The only Profile row's hover-submenu detail lines.
+fn first_details(core: &accroster_core::Core) -> Vec<String> {
+    details(&rows(core)[0])
 }
 
 #[test]
@@ -313,13 +306,13 @@ fn the_reading_time_is_claude_codes_fetch_time_for_this_login() {
     );
     let mut core = mac.launch();
     add_profile(&mut core);
-    assert!(details(&core).contains(&"Limits as of 14:02".to_string()));
+    assert!(first_details(&core).contains(&"Limits as of 14:02".to_string()));
 
     pass(&mac, &mut core, SignedDuration::from_mins(15));
     assert!(
-        details(&core).contains(&"Limits as of 13:50".to_string()),
+        first_details(&core).contains(&"Limits as of 13:50".to_string()),
         "{:?}",
-        details(&core)
+        first_details(&core)
     );
 }
 
@@ -335,9 +328,9 @@ fn another_logins_cached_fetch_time_is_ignored() {
 
     pass(&mac, &mut core, SignedDuration::from_mins(15));
     assert!(
-        details(&core).contains(&"Limits as of 14:17".to_string()),
+        first_details(&core).contains(&"Limits as of 14:17".to_string()),
         "{:?}",
-        details(&core)
+        first_details(&core)
     );
 }
 
@@ -412,7 +405,7 @@ fn failed_fetches_back_off_from_5_minutes_doubling_to_an_hour() {
         row.note.as_deref(),
         Some("Couldn't refresh · next try 14:22")
     );
-    assert!(details(&core).contains(&"Couldn't refresh · next try 14:22".to_string()));
+    assert!(first_details(&core).contains(&"Couldn't refresh · next try 14:22".to_string()));
 
     at(&mac, &mut core, "14:21");
     assert_eq!(usage_reads(&mac), 2);
@@ -497,11 +490,11 @@ fn a_fetch_that_fails_as_the_network_goes_away_does_not_count() {
     settle(&mut core);
     assert_eq!(usage_reads(&mac), 2);
     assert!(
-        !details(&core)
+        !first_details(&core)
             .iter()
             .any(|line| line.starts_with("Couldn't refresh")),
         "{:?}",
-        details(&core)
+        first_details(&core)
     );
 
     // Back online, it is retried as soon as a minute has passed, not after
@@ -534,11 +527,11 @@ fn an_unreadable_answer_keeps_the_dimmed_reading_and_does_not_back_off() {
     assert!(row.dimmed);
     assert_eq!(row.note.as_deref(), Some("Couldn't read limits"));
     assert!(
-        !details(&core)
+        !first_details(&core)
             .iter()
             .any(|line| line.starts_with("Couldn't refresh")),
         "{:?}",
-        details(&core)
+        first_details(&core)
     );
 
     // The next read comes at the usual cadence, not after a backoff.
@@ -659,4 +652,25 @@ fn one_profile_is_never_read_twice_within_a_minute() {
 
     pass(&mac, &mut core, SignedDuration::from_secs(1));
     assert_eq!(usage_reads(&mac), 3, "the requested refresh follows");
+}
+
+#[test]
+fn the_menu_bar_figure_dims_with_the_clis_active_profiles_reading() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    core.command(accroster_core::Command::SetCliSwitching(true));
+    let use_it = rows(&core)[0].command.clone().expect("a row click");
+    core.command(use_it);
+    core.event(Event::WillSleep);
+
+    pass(&mac, &mut core, SignedDuration::from_mins(6));
+    let menu_bar = core.view().menu_bar;
+    assert_eq!(menu_bar.label, "me 92%");
+    assert!(!menu_bar.dimmed);
+
+    pass(&mac, &mut core, SignedDuration::from_secs(1));
+    let menu_bar = core.view().menu_bar;
+    assert_eq!(menu_bar.label, "me 92%");
+    assert!(menu_bar.dimmed);
 }

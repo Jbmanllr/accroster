@@ -4,12 +4,12 @@
 //! Threading: AppKit lives on the main thread. The core runs on the driver's
 //! thread; each [`Update`] hops to the main queue and is applied there.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{c_int, c_void};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
-    Command, Core, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
+    Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -18,12 +18,13 @@ use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
-    NSAboutPanelOptionCredits, NSApplication, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
-    NSControlSize, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontWeightRegular,
-    NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle,
-    NSMenu, NSMenuDelegate, NSMenuItem, NSResponder, NSStackView, NSStatusBar, NSStatusItem,
-    NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
+    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
+    NSControlStateValueOn, NSEvent, NSFont, NSFontWeightRegular, NSLayoutAttribute,
+    NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSResponder, NSStackView, NSStatusBar,
+    NSStatusItem, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
+    NSView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
@@ -61,9 +62,6 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
 pub struct Ivars {
     core: OnceCell<CoreHandle>,
     status_item: Retained<NSStatusItem>,
-    /// The status item's menu. It is kept and refilled on every update, so
-    /// an open menu updates in place.
-    menu: Retained<NSMenu>,
     /// Keeps the network path monitor alive.
     network: OnceCell<NetworkMonitor>,
     /// The commands of the menu's clickable items (submenus included), by tag.
@@ -71,6 +69,15 @@ pub struct Ivars {
     settings: OnceCell<SettingsWindow>,
     /// The first-run offer, open while the view has one.
     first_run: RefCell<Option<FirstRunWindow>>,
+    /// Whether the status item's menu is open. While it is, its tag table is
+    /// left alone: rows whose content changed are swapped in place, and a
+    /// menu whose clickable items changed waits in `pending_menu`.
+    menu_open: Cell<bool>,
+    pending_menu: RefCell<Option<Vec<MenuItem>>>,
+    /// The items the status item's menu shows now.
+    shown_menu: RefCell<Vec<MenuItem>>,
+    /// Settings > Hidden (n)…: each entry's title and Restore command, by tag.
+    hidden: RefCell<Vec<(String, Command)>>,
 }
 
 struct FirstRunWindow {
@@ -80,10 +87,13 @@ struct FirstRunWindow {
 
 struct SettingsWindow {
     window: Retained<NSWindow>,
+    cli_switching: Retained<NSButton>,
+    cli_switching_note: Retained<NSTextField>,
     launch_at_login: Retained<NSButton>,
     launch_at_login_note: Retained<NSTextField>,
     verbose_logging: Retained<NSButton>,
     verbose_logging_note: Retained<NSTextField>,
+    hidden: Retained<NSButton>,
 }
 
 define_class!(
@@ -97,11 +107,27 @@ define_class!(
     unsafe impl NSObjectProtocol for Ui {}
 
     unsafe impl NSMenuDelegate for Ui {
-        /// The status item's menu is opening: the core refreshes old
-        /// readings in the background.
+        /// The status item's menu is opening: the core rescans what the menu
+        /// shows (Discovered Profiles) and refreshes old Limit readings in
+        /// the background.
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
+            self.ivars().menu_open.set(true);
             self.event(Event::MenuOpened);
+        }
+
+        /// Applies the menu that arrived while it was open, after the clicked
+        /// item's action (sent once tracking ends) has read the old tags.
+        #[unsafe(method(menuDidClose:))]
+        fn menu_did_close(&self, _menu: &NSMenu) {
+            self.ivars().menu_open.set(false);
+            DispatchQueue::main().exec_async(|| {
+                UI.with(|cell| {
+                    if let Some(ui) = cell.get() {
+                        ui.apply_pending_menu();
+                    }
+                });
+            });
         }
     }
 
@@ -161,6 +187,43 @@ define_class!(
             }
         }
 
+        #[unsafe(method(cliSwitchingClicked:))]
+        fn cli_switching_clicked(&self, sender: &NSButton) {
+            self.send(Command::SetCliSwitching(sender.state() == NSControlStateValueOn));
+        }
+
+        /// Settings > Hidden (n)…: pops up one Restore item per hidden
+        /// Discovered Profile.
+        #[unsafe(method(hiddenClicked:))]
+        fn hidden_clicked(&self, sender: &NSButton) {
+            let mtm = self.mtm();
+            let menu = NSMenu::new(mtm);
+            menu.setAutoenablesItems(false);
+            let titles: Vec<String> =
+                self.ivars().hidden.borrow().iter().map(|(title, _)| title.clone()).collect();
+            for (tag, title) in titles.iter().enumerate() {
+                let item = menu_item(mtm, &format!("Restore {title}"));
+                unsafe {
+                    item.setAction(Some(sel!(restoreHiddenClicked:)));
+                    item.setTarget(Some(self));
+                }
+                item.setTag(tag as isize);
+                menu.addItem(&item);
+            }
+            let origin = NSPoint::new(0.0, sender.bounds().size.height + 4.0);
+            menu.popUpMenuPositioningItem_atLocation_inView(None, origin, Some(sender));
+        }
+
+        #[unsafe(method(restoreHiddenClicked:))]
+        fn restore_hidden_clicked(&self, sender: &NSMenuItem) {
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().hidden.borrow().get(tag).map(|(_, c)| c.clone()));
+            if let Some(command) = command {
+                self.send(command);
+            }
+        }
+
         #[unsafe(method(revealLogsClicked:))]
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
@@ -172,23 +235,19 @@ impl Ui {
     fn new(mtm: MainThreadMarker) -> Retained<Ui> {
         let status_item =
             NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false);
-        status_item.setMenu(Some(&menu));
         let this = Ui::alloc(mtm).set_ivars(Ivars {
             core: OnceCell::new(),
             status_item,
-            menu,
             network: OnceCell::new(),
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
             first_run: RefCell::new(None),
+            menu_open: Cell::new(false),
+            pending_menu: RefCell::new(None),
+            shown_menu: RefCell::new(Vec::new()),
+            hidden: RefCell::new(Vec::new()),
         });
-        let this: Retained<Ui> = unsafe { msg_send![super(this), init] };
-        this.ivars()
-            .menu
-            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
-        this
+        unsafe { msg_send![super(this), init] }
     }
 
     /// Forwards sleep and wake, screen lock and unlock, and network path
@@ -256,16 +315,74 @@ impl Ui {
         let item = &self.ivars().status_item;
         if let Some(button) = item.button(mtm) {
             button.setTitle(&NSString::from_str(&view.menu_bar.label));
+            button.setAppearsDisabled(view.menu_bar.dimmed);
         }
-        let mut actions = Vec::new();
-        let menu = &self.ivars().menu;
-        menu.removeAllItems();
-        self.fill_menu(menu, &view.menu.items, &mut actions);
-        *self.ivars().actions.borrow_mut() = actions;
+        if self.ivars().menu_open.get() {
+            if !self.update_open_menu(&view.menu.items) {
+                *self.ivars().pending_menu.borrow_mut() = Some(view.menu.items.clone());
+            }
+        } else {
+            self.set_menu(&view.menu.items);
+        }
+        *self.ivars().hidden.borrow_mut() = view
+            .settings
+            .hidden_discovered
+            .iter()
+            .map(|hidden| (hidden.title.clone(), hidden.restore.clone()))
+            .collect();
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
         }
         self.render_first_run(view);
+    }
+
+    /// Replaces the status item's menu and its tag table.
+    fn set_menu(&self, items: &[MenuItem]) {
+        let mut actions = Vec::new();
+        let menu = self.build_menu(items, &mut actions);
+        menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+        self.ivars().status_item.setMenu(Some(&menu));
+        *self.ivars().actions.borrow_mut() = actions;
+        *self.ivars().shown_menu.borrow_mut() = items.to_vec();
+    }
+
+    /// Updates the open menu in place (a refreshed Limit reading, the
+    /// offline line) when its clickable items, and so its tags, are
+    /// unchanged: each changed item is swapped for a fresh one. Returns
+    /// `false` when the change has to wait until the menu closes.
+    fn update_open_menu(&self, items: &[MenuItem]) -> bool {
+        let Some(menu) = self.ivars().status_item.menu(self.mtm()) else {
+            return false;
+        };
+        let shown = self.ivars().shown_menu.borrow().clone();
+        if shown.len() != items.len() || menu.numberOfItems() as usize != items.len() {
+            return false;
+        }
+        let mut actions = Vec::new();
+        let fresh = self.build_menu(items, &mut actions);
+        if actions != *self.ivars().actions.borrow() {
+            return false;
+        }
+        let fresh_items = fresh.itemArray();
+        fresh.removeAllItems();
+        for (index, (old, new)) in shown.iter().zip(items).enumerate() {
+            if old != new {
+                menu.removeItemAtIndex(index as isize);
+                menu.insertItem_atIndex(&fresh_items.objectAtIndex(index), index as isize);
+            }
+        }
+        *self.ivars().shown_menu.borrow_mut() = items.to_vec();
+        true
+    }
+
+    fn apply_pending_menu(&self) {
+        if self.ivars().menu_open.get() {
+            return;
+        }
+        let pending = self.ivars().pending_menu.borrow_mut().take();
+        if let Some(items) = pending {
+            self.set_menu(&items);
+        }
     }
 
     /// Opens the first-run window when the view has an offer, closes it once
@@ -316,14 +433,60 @@ impl Ui {
                     actions.push(command.clone());
                     row
                 }
+                MenuItem::Check {
+                    title,
+                    checked,
+                    command,
+                } => {
+                    let row = menu_item(mtm, title);
+                    unsafe {
+                        row.setAction(Some(sel!(menuItemClicked:)));
+                        row.setTarget(Some(self));
+                    }
+                    row.setState(if *checked {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
+                    row.setTag(actions.len() as isize);
+                    actions.push(command.clone());
+                    row
+                }
                 MenuItem::Profile(profile) => {
                     let row = menu_item(mtm, &profile.title);
                     row.setView(Some(&RowView::wrap(
                         mtm,
                         &profile_row_content(mtm, profile),
                     )));
+                    // The row sends this itself on click (see RowView).
+                    if let Some(command) = &profile.command {
+                        unsafe {
+                            row.setAction(Some(sel!(menuItemClicked:)));
+                            row.setTarget(Some(self));
+                        }
+                        row.setTag(actions.len() as isize);
+                        actions.push(command.clone());
+                    }
                     if !profile.submenu.is_empty() {
                         row.setSubmenu(Some(&self.build_menu(&profile.submenu, actions)));
+                    }
+                    row
+                }
+                MenuItem::Discovered(discovered) => {
+                    let row = menu_item(mtm, &discovered.title);
+                    row.setView(Some(&RowView::wrap(
+                        mtm,
+                        &discovered_row_content(mtm, discovered),
+                    )));
+                    // The row sends this itself on click (see RowView).
+                    unsafe {
+                        row.setAction(Some(sel!(menuItemClicked:)));
+                        row.setTarget(Some(self));
+                    }
+                    row.setTag(actions.len() as isize);
+                    actions.push(discovered.command.clone());
+                    if !discovered.submenu.is_empty() {
+                        row.setSubmenu(Some(&self.build_menu(&discovered.submenu, actions)));
                     }
                     row
                 }
@@ -372,10 +535,34 @@ impl Ui {
                 NSWorkspace::sharedWorkspace()
                     .activateFileViewerSelectingURLs(&NSArray::from_slice(&[&*url]));
             }
+            Effect::OpenUrl(url) => {
+                if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
+                    NSWorkspace::sharedWorkspace().openURL(&url);
+                }
+            }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
             },
+            Effect::CopyToClipboard(text) => {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                pasteboard.setString_forType(&NSString::from_str(&text), unsafe {
+                    NSPasteboardTypeString
+                });
+            }
             Effect::Terminate => app.terminate(None),
+            Effect::AskNickname {
+                name,
+                current,
+                target,
+            } => {
+                if let Some(nickname) = ask_nickname(mtm, &name, current.as_deref()) {
+                    self.send(Command::SetNickname {
+                        target,
+                        nickname: Some(nickname),
+                    });
+                }
+            }
         }
     }
 
@@ -443,7 +630,7 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 200.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 340.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -457,6 +644,28 @@ impl Ui {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("AccRoster Settings"));
         let content = window.contentView().expect("a window has a content view");
+
+        let cli_switching = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("CLI switching: clicking a Profile picks it for new claude runs"),
+                Some(self),
+                Some(sel!(cliSwitchingClicked:)),
+                mtm,
+            )
+        };
+        cli_switching.setFrameOrigin(NSPoint::new(20.0, 302.0));
+        content.addSubview(&cli_switching);
+
+        let cli_switching_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        cli_switching_note.setSelectable(true);
+        cli_switching_note.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        cli_switching_note.setFrame(NSRect::new(
+            NSPoint::new(40.0, 196.0),
+            NSSize::new(360.0, 102.0),
+        ));
+        content.addSubview(&cli_switching_note);
 
         let launch_at_login = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -511,12 +720,26 @@ impl Ui {
         reveal.setFrameOrigin(NSPoint::new(14.0, 24.0));
         content.addSubview(&reveal);
 
+        let hidden = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Hidden (0)…"),
+                Some(self),
+                Some(sel!(hiddenClicked:)),
+                mtm,
+            )
+        };
+        hidden.setFrameOrigin(NSPoint::new(230.0, 24.0));
+        content.addSubview(&hidden);
+
         SettingsWindow {
             window,
+            cli_switching,
+            cli_switching_note,
             launch_at_login,
             launch_at_login_note,
             verbose_logging,
             verbose_logging_note,
+            hidden,
         }
     }
 }
@@ -530,6 +753,31 @@ define_class!(
     struct RowView;
 
     impl RowView {
+        /// A custom view gets the click instead of the menu: close the menu,
+        /// then send the item's action as a plain item would.
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            let Some(item) = self.enclosingMenuItem() else {
+                return;
+            };
+            let Some(action) = item.action() else {
+                return;
+            };
+            // SAFETY: the item belongs to the open menu; reading its menu
+            // has no other precondition.
+            if let Some(menu) = unsafe { item.menu() } {
+                menu.cancelTracking();
+            }
+            let target = item.target();
+            unsafe {
+                NSApplication::sharedApplication(MainThreadMarker::from(self)).sendAction_to_from(
+                    action,
+                    target.as_deref(),
+                    Some(&item),
+                );
+            }
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             if self.enclosingMenuItem().is_some_and(|item| item.isHighlighted()) {
@@ -576,15 +824,28 @@ impl RowView {
     }
 }
 
-/// A Profile row: the name and a submenu arrow, one bar per limit, the note.
+/// A Profile row: the name and a submenu arrow, one bar per limit, the Banked
+/// reset / Session refill lines, the note.
 fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSView> {
     let name = label(mtm, &row.title, NSFont::boldSystemFontOfSize(13.0), false);
+    let badges: Vec<Retained<NSTextField>> = row
+        .badges
+        .iter()
+        .map(|badge| label(mtm, badge, NSFont::boldSystemFontOfSize(9.0), true))
+        .collect();
     let filler = NSView::new(mtm);
     filler.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
     let arrow = label(mtm, "›", NSFont::systemFontOfSize(13.0), true);
-    let mut lines: Vec<Retained<NSView>> =
-        vec![stack(mtm, false, 5.0, &[&name, &filler, &arrow]).into_super()];
+    let mut name_line: Vec<&NSView> = vec![&name];
+    name_line.extend(badges.iter().map(|badge| -> &NSView { badge }));
+    name_line.extend([&*filler, &arrow]);
+    let mut lines: Vec<Retained<NSView>> = vec![stack(mtm, false, 5.0, &name_line).into_super()];
     lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    lines.extend(row.offers.iter().map(|offer| {
+        label(mtm, offer, NSFont::systemFontOfSize(10.0), false)
+            .into_super()
+            .into_super()
+    }));
     if let Some(note) = &row.note {
         lines.push(
             label(mtm, note, NSFont::systemFontOfSize(10.0), true)
@@ -610,6 +871,54 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
             .setActive(true);
     }
     body.into_super()
+}
+
+/// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
+/// Unknown Login line.
+fn discovered_row_content(mtm: MainThreadMarker, row: &DiscoveredRow) -> Retained<NSView> {
+    let name = label(mtm, &row.title, NSFont::systemFontOfSize(13.0), true);
+    let filler = NSView::new(mtm);
+    filler.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
+    let arrow = label(mtm, "›", NSFont::systemFontOfSize(13.0), true);
+    let mut lines: Vec<Retained<NSView>> =
+        vec![stack(mtm, false, 5.0, &[&name, &filler, &arrow]).into_super()];
+    if let Some(subtitle) = &row.subtitle {
+        let line = label(mtm, subtitle, NSFont::systemFontOfSize(10.0), true);
+        line.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+        lines.push(line.into_super().into_super());
+    }
+    let refs: Vec<&NSView> = lines.iter().map(|view| &**view).collect();
+    let body = stack(mtm, true, 2.0, &refs);
+    body.setEdgeInsets(NSEdgeInsets {
+        top: 4.0,
+        left: 16.0,
+        bottom: 4.0,
+        right: 14.0,
+    });
+    for line in body.arrangedSubviews().iter() {
+        line.widthAnchor()
+            .constraintEqualToAnchor_constant(&body.widthAnchor(), -30.0)
+            .setActive(true);
+    }
+    body.into_super()
+}
+
+/// Asks for a nickname; `None` on Cancel. An empty answer clears it.
+fn ask_nickname(mtm: MainThreadMarker, name: &str, current: Option<&str>) -> Option<String> {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(&format!("Nickname for {name}")));
+    alert.setInformativeText(ns_string!("Leave it empty to use the full name."));
+    alert.addButtonWithTitle(ns_string!("Save"));
+    alert.addButtonWithTitle(ns_string!("Cancel"));
+    let field = NSTextField::textFieldWithString(&NSString::from_str(current.unwrap_or("")), mtm);
+    field.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(260.0, 24.0),
+    ));
+    alert.setAccessoryView(Some(&field));
+    alert.window().setInitialFirstResponder(Some(&field));
+    NSApplication::sharedApplication(mtm).activate();
+    (alert.runModal() == NSAlertFirstButtonReturn).then(|| field.stringValue().to_string())
 }
 
 /// `Session ▓▓▓░░ 62%`: an `NSLevelIndicator`, continuous capacity, warning at
@@ -704,6 +1013,27 @@ fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
 }
 
 fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
+    let cli = &view.cli_switching;
+    settings.cli_switching.setState(if cli.on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    let cli_text = match &cli.note {
+        Some(note) => note.clone(),
+        None => format!(
+            "Turning it on backs up ~/.zshrc, then adds this line at its end, between # >>> accroster >>> markers:\n{}\nOpen a new terminal afterwards. Turning it off removes it.",
+            cli.line
+        ),
+    };
+    settings
+        .cli_switching_note
+        .setStringValue(&NSString::from_str(&cli_text));
+    let hidden = view.hidden_discovered.len();
+    settings
+        .hidden
+        .setTitle(&NSString::from_str(&format!("Hidden ({hidden})…")));
+    settings.hidden.setEnabled(hidden > 0);
     let launch_at_login = &view.launch_at_login;
     settings.launch_at_login.setState(if launch_at_login.on {
         NSControlStateValueOn

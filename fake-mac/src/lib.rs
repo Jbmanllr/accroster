@@ -299,6 +299,31 @@ impl FakeMac {
     pub fn write_zshrc(&self, contents: &str) -> PathBuf {
         self.write_file(".zshrc", contents)
     }
+
+    /// Runs the app's real `claude` shim (`bin/claude` in the app's folder)
+    /// with `sh`, as a terminal would after the `.zshrc` block: the app's
+    /// `bin/` first on `PATH`, then the stub `claude`, then the system
+    /// folders. The environment is exactly `HOME`, that `PATH` and `vars`.
+    /// What reached the real binary shows in [`StubClaude::calls`].
+    pub fn run_shim(&self, args: &[&str], vars: &[(&str, &str)]) -> std::process::Output {
+        let bin = AppPaths::new(&self.home).bin();
+        let path = std::env::join_paths([
+            bin.clone(),
+            self.claude.bin_dir(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("PATH entries contain no colon");
+        std::process::Command::new(bin.join("claude"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .envs(vars.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the claude shim")
+    }
 }
 
 /// A Login acting within an Organization, as Claude Code records it in
@@ -608,7 +633,8 @@ impl Clock for FakeClock {
         *self.0.lock().unwrap()
     }
 
-    /// UTC, so times shown in tests read like [`START_TIME`] ("14:02").
+    /// UTC, so shown dates and times don't depend on the machine running
+    /// the tests.
     fn time_zone(&self) -> jiff::tz::TimeZone {
         jiff::tz::TimeZone::UTC
     }
