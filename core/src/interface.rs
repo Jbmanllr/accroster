@@ -41,6 +41,35 @@ pub enum Command {
     /// "Limit resets → claude.ai" in a Profile's hover submenu: open
     /// claude.ai Settings > Usage, where the user checks resets by hand.
     OpenLimitResets,
+    /// A Discovered Profile's row: Add Profile… aimed at that pair (passing
+    /// its email to the sign-in when known).
+    SignInDiscovered(DiscoveredPair),
+    /// Hide in a Discovered Profile's submenu.
+    HideDiscovered(DiscoveredPair),
+    /// Restore in Settings > Hidden (n)….
+    UnhideDiscovered(DiscoveredPair),
+    /// Rename… in a submenu: asks the UI for a nickname
+    /// ([`Effect::AskNickname`]).
+    Rename(NicknameTarget),
+    /// The answer to [`Effect::AskNickname`]. `None`, empty or blank clears
+    /// the nickname.
+    SetNickname {
+        target: NicknameTarget,
+        nickname: Option<String>,
+    },
+}
+
+/// A Discovered Profile's identity: an account uuid and an Organization uuid.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiscoveredPair {
+    pub account_uuid: String,
+    pub organization_uuid: String,
+}
+
+/// What a nickname is given to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicknameTarget {
+    Discovered(DiscoveredPair),
 }
 
 impl Command {
@@ -56,6 +85,11 @@ impl Command {
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
             Command::OpenLimitResets => "open_limit_resets",
+            Command::SignInDiscovered(_) => "sign_in_discovered",
+            Command::HideDiscovered(_) => "hide_discovered",
+            Command::UnhideDiscovered(_) => "unhide_discovered",
+            Command::Rename(_) => "rename",
+            Command::SetNickname { .. } => "set_nickname",
         }
     }
 }
@@ -66,6 +100,8 @@ pub enum Event {
     /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
     /// the core reads the actual time from its [`crate::Clock`].
     Tick,
+    /// The status item's menu is opening.
+    MenuOpened,
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -85,6 +121,14 @@ pub enum Effect {
     OpenLoginItemsSettings,
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
+    /// Ask for a nickname for `name` (prefilled with `current`), then send
+    /// [`Command::SetNickname`] with `target` and the answer. Cancel sends
+    /// nothing.
+    AskNickname {
+        name: String,
+        current: Option<String>,
+        target: NicknameTarget,
+    },
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -147,6 +191,24 @@ pub enum MenuItem {
     Detail(String),
     /// A signed-in Profile's row, drawn as a custom view with limit bars.
     Profile(ProfileRow),
+    /// A Discovered Profile, drawn greyed. Clicking the row sends `command`.
+    Discovered(DiscoveredRow),
+}
+
+/// A Discovered Profile's row in the menu: an account the Mac has evidence of
+/// that has no Profile yet. It never shows limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredRow {
+    /// `Sign in to <name>…`, where the name is the nickname, else
+    /// `email · Organization`, else "Unknown Login".
+    pub title: String,
+    /// A second line for an Unknown Login: Session count, last activity and
+    /// "Desktop's last account" when it applies.
+    pub subtitle: Option<String>,
+    /// Sent when the row is clicked: [`Command::SignInDiscovered`].
+    pub command: Command,
+    /// The hover submenu: details (uuids, first 8 characters), Rename…, Hide.
+    pub submenu: Vec<MenuItem>,
 }
 
 /// One Profile's row in the menu.
@@ -185,6 +247,19 @@ pub struct SettingsView {
     /// The explanatory line under the switch.
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
+    /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
+    /// Mac.
+    pub hidden_discovered: Vec<HiddenDiscovered>,
+}
+
+/// One entry of Settings > Hidden (n)….
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenDiscovered {
+    /// The nickname, else `email · Organization`, else "Unknown Login" with
+    /// the account's first 8 characters.
+    pub title: String,
+    /// Sent by its Restore item: [`Command::UnhideDiscovered`].
+    pub restore: Command,
 }
 
 /// The About panel.
