@@ -66,6 +66,24 @@ pub enum Command {
         target: NicknameTarget,
         nickname: Option<String>,
     },
+    /// Diagnostics… in the menu.
+    OpenDiagnostics,
+    /// "Copy report" in Diagnostics: field names and versions only.
+    CopyDiagnosticsReport,
+    /// "Resume <feature>" in Diagnostics, offered once the checks pass again.
+    /// The only way a Safety pause ends.
+    ResumeFeature(SafetyFeature),
+}
+
+/// A feature that writes Claude's files and can get a Safety pause
+/// (ADR 0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SafetyFeature {
+    /// The pointer and row clicks.
+    CliSwitching,
+    /// The Profile links that share Transcripts and resume data
+    /// (`projects`, `file-history`, `session-env`).
+    TranscriptSharing,
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -102,6 +120,9 @@ impl Command {
             Command::UnhideDiscovered(_) => "unhide_discovered",
             Command::Rename(_) => "rename",
             Command::SetNickname { .. } => "set_nickname",
+            Command::OpenDiagnostics => "open_diagnostics",
+            Command::CopyDiagnosticsReport => "copy_diagnostics_report",
+            Command::ResumeFeature(_) => "resume_feature",
         }
     }
 }
@@ -131,6 +152,10 @@ pub enum Effect {
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
+    /// Bring the Diagnostics window forward, rendering [`View::diagnostics`].
+    ShowDiagnostics,
+    /// Post a user notification.
+    Notify { title: String, body: String },
     /// Put this text on the general pasteboard.
     CopyToClipboard(String),
     /// Quit the app. The core has already flushed what it needed to.
@@ -154,6 +179,61 @@ pub struct View {
     pub about: AboutView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
+    pub diagnostics: DiagnosticsView,
+}
+
+/// The Diagnostics window: every format check, the Claude versions, and the
+/// paused features with their Resume buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsView {
+    pub checks: Vec<CheckRow>,
+    pub versions: ClaudeVersions,
+    pub paused: Vec<PausedFeature>,
+    /// What "Copy report" copies: check names, results, field names and
+    /// versions; never ids, emails, paths or values.
+    pub report: String,
+}
+
+/// One format check in Diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRow {
+    /// For example "Sidebar entries".
+    pub name: String,
+    pub status: CheckStatus,
+    /// What was found, in field names (for example "unknown fields: foo").
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    /// Nothing of that format was on the Mac to check.
+    NeverSeen,
+}
+
+/// A feature under a Safety pause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausedFeature {
+    pub feature: SafetyFeature,
+    /// "CLI switching paused".
+    pub title: String,
+    /// Why, for example "settings.json sets CLAUDE_CONFIG_DIR".
+    pub reason: String,
+    /// `Resume <feature>`, present only once the checks pass again:
+    /// [`Command::ResumeFeature`].
+    pub resume: Option<Command>,
+}
+
+/// The installed Claude versions, read from files (nothing is spawned).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeVersions {
+    /// The Terminal's Claude Code: where `~/.local/bin/claude` links to.
+    pub claude_code: Option<String>,
+    /// The Claude Code versions bundled with the desktop app, oldest first.
+    pub desktop_claude_code: Vec<String>,
+    /// The desktop app's `CFBundleShortVersionString`.
+    pub desktop: Option<String>,
 }
 
 /// The first-run window: the one-time launch-at-login offer.

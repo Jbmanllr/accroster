@@ -94,8 +94,9 @@ pub(crate) struct CliMenu {
 
 /// Adds CLI switching to the listed Profiles' rows (the `CLI` badge, the row
 /// click, "Use for new CLI runs" and "Copy shell override"), and says what
-/// the menu bar and the header show.
-pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>]) -> CliMenu {
+/// the menu bar and the header show. Under a Safety pause (`paused`), rows
+/// don't switch and the menu bar shows `?`.
+pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], paused: bool) -> CliMenu {
     let on = is_on(paths);
     let pointer = if on { pointer(paths) } else { None };
     let mut active = None;
@@ -103,7 +104,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>]) -> CliMenu {
         let is_active = pointer.as_deref() == Some(profile.config_dir);
         let row = &mut profile.row;
         let mut items = Vec::new();
-        if on {
+        if on && !paused {
             let command = Command::UseForNewCliRuns(profile.id.to_owned());
             row.command = Some(command.clone());
             items.push(MenuItem::Check {
@@ -136,6 +137,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>]) -> CliMenu {
         // The pointer names a folder no listed Profile has.
         (Some(_), None) => ("unknown Profile".to_owned(), "?".to_owned()),
     };
+    let label = if paused { "?".to_owned() } else { label };
     CliMenu {
         label: Some(label),
         header: Some(format!("CLI: {name}")),
@@ -364,10 +366,44 @@ pub(crate) struct BlockedLink {
     pub path: PathBuf,
 }
 
-/// Makes every missing link from `profile_dir` to `claude_home`. Never
-/// replaces what is already there: a regular file or folder in a link's place
-/// is reported, not overwritten. A link that exists is left as it is.
-pub(crate) fn ensure_links(profile_dir: &Path, claude_home: &Path) -> io::Result<Vec<BlockedLink>> {
+/// The links that share Transcripts and resume data. One replaced pauses
+/// Transcript sharing for every Profile (ADR 0004).
+pub(crate) const TRANSCRIPT_LINKS: [&str; 3] = ["projects", "file-history", "session-env"];
+
+/// The links of `profile_dir` whose place holds something else: a regular
+/// file or folder, or a link to anywhere but `claude_home/<name>`. A missing
+/// link isn't replaced (it is made again); a file link counts only while its
+/// target exists.
+pub(crate) fn replaced_links(profile_dir: &Path, claude_home: &Path) -> Vec<&'static str> {
+    let file_links = LINKED_FILES
+        .into_iter()
+        .filter(|name| claude_home.join(name).exists());
+    LINKED_DIRS
+        .into_iter()
+        .chain(file_links)
+        .filter(|name| {
+            let path = profile_dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    fs::read_link(&path).ok() != Some(claude_home.join(name))
+                }
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        })
+        .collect()
+}
+
+/// Makes every missing link from `profile_dir` to `claude_home`, except the
+/// [`TRANSCRIPT_LINKS`] unless `share_transcripts` (Transcript sharing is
+/// not under a Safety pause). Never replaces what is already there: a
+/// regular file or folder in a link's place is reported, not overwritten. A
+/// link that exists is left as it is.
+pub(crate) fn ensure_links(
+    profile_dir: &Path,
+    claude_home: &Path,
+    share_transcripts: bool,
+) -> io::Result<Vec<BlockedLink>> {
     let mut blocked = Vec::new();
     let mut link = |name: &str| -> io::Result<()> {
         let path = profile_dir.join(name);
@@ -384,6 +420,9 @@ pub(crate) fn ensure_links(profile_dir: &Path, claude_home: &Path) -> io::Result
         }
     };
     for name in LINKED_DIRS {
+        if !share_transcripts && TRANSCRIPT_LINKS.contains(&name) {
+            continue;
+        }
         fs::create_dir_all(claude_home.join(name))?;
         link(name)?;
     }

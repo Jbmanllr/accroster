@@ -435,6 +435,9 @@ pub struct Reply {
     pub config_dir_files: Vec<(PathBuf, String)>,
     /// Never answer: wait until killed (a sign-in nobody finishes).
     pub hang: bool,
+    /// Answer `auth status --json` from the spawn folder's own
+    /// `oauthAccount` (logged out when it has none), like Claude Code.
+    pub from_folder: bool,
 }
 
 impl Reply {
@@ -443,6 +446,16 @@ impl Reply {
     pub fn hanging() -> Reply {
         Reply {
             hang: true,
+            ..Reply::default()
+        }
+    }
+
+    /// An honest `claude auth status --json`: reports whatever `oauthAccount`
+    /// the spawn's `$CLAUDE_CONFIG_DIR/.claude.json` holds, whichever folder
+    /// asks.
+    pub fn auth_status_from_folder() -> Reply {
+        Reply {
+            from_folder: true,
             ..Reply::default()
         }
     }
@@ -555,6 +568,9 @@ impl StubClaude {
         if reply.hang {
             fs::write(dir.join("hang"), "").expect("write hang marker");
         }
+        if reply.from_folder {
+            fs::write(dir.join("from-folder"), "").expect("write from-folder marker");
+        }
         for (relative, contents) in &reply.config_dir_files {
             let path = dir.join("files").join(relative);
             fs::create_dir_all(path.parent().expect("has parent")).expect("create reply files");
@@ -644,6 +660,7 @@ impl Clock for FakeClock {
 struct FakeOsState {
     processes: HashMap<u32, ProcessFacts>,
     desktop_app_version: Option<String>,
+    managed_settings: Option<Vec<u8>>,
 }
 
 /// OS facts the test sets by hand. Clones share the facts.
@@ -671,6 +688,13 @@ impl FakeOs {
     pub fn set_desktop_app_version(&self, version: Option<&str>) {
         self.0.lock().unwrap().desktop_app_version = version.map(str::to_owned);
     }
+
+    /// Writes (or with `None`, removes) Claude Code's managed settings file,
+    /// which lives outside the home folder on a real Mac.
+    pub fn set_managed_settings(&self, body: Option<&Value>) {
+        self.0.lock().unwrap().managed_settings =
+            body.map(|body| serde_json::to_vec(body).expect("serialize managed settings"));
+    }
 }
 
 impl OsFacts for FakeOs {
@@ -680,6 +704,10 @@ impl OsFacts for FakeOs {
 
     fn desktop_app_version(&self) -> Option<String> {
         self.0.lock().unwrap().desktop_app_version.clone()
+    }
+
+    fn managed_settings(&self) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().managed_settings.clone()
     }
 }
 

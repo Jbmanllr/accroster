@@ -34,6 +34,9 @@ pub(crate) struct Context<'a> {
     pub paths: &'a AppPaths,
     pub logger: &'a Logger,
     pub verbose: bool,
+    /// Whether the links sharing Transcripts may be made (Transcript sharing
+    /// isn't under a Safety pause).
+    pub share_transcripts: bool,
 }
 
 impl Context<'_> {
@@ -103,6 +106,24 @@ pub(crate) struct Listed<'a> {
     /// The menu bar's short name for it (`Perso`).
     pub short_label: String,
     pub row: ProfileRow,
+}
+
+/// A signed-in Profile's folder and the account its `oauthAccount` names.
+pub(crate) struct SignedInAccount<'a> {
+    pub config_dir: &'a Path,
+    pub email: &'a str,
+    pub organization_uuid: &'a str,
+}
+
+/// The latest usage reads, as the format check sees them.
+#[derive(Debug, Default)]
+pub(crate) struct UsageSummary {
+    /// Profiles whose last read was understood.
+    pub read: usize,
+    /// Profiles whose last read gave no readable answer.
+    pub unreadable: usize,
+    /// Limit kinds this app doesn't know, as Claude Code named them.
+    pub new_kinds: Vec<String>,
 }
 
 /// `state/profiles.json`.
@@ -227,13 +248,17 @@ pub(crate) struct ProfileRegistry {
     sign_in: Option<SignIn>,
     /// The outcome of the last sign-in, shown as a menu line until the next.
     notice: Option<String>,
+    /// Set when `auth status` in a newly signed-in folder named another
+    /// account than its `oauthAccount`; taken by the format checks.
+    auth_disagreed: bool,
 }
 
 impl ProfileRegistry {
     /// Loads the Profiles at launch: recorded folders that still exist, plus
     /// any signed-in folder missing from the record (recorded now). A folder
     /// with no record and no sign-in is what an interrupted Add Profile left
-    /// behind, and is deleted. Missing links are made again.
+    /// behind, and is deleted. Links are healed separately
+    /// ([`ProfileRegistry::heal_links`]), after the format checks.
     pub(crate) fn load(ctx: &Context) -> ProfileRegistry {
         let path = ctx.paths.state().join("profiles.json");
         let file = match storage::read_versioned::<RegistryFile>(&path) {
@@ -320,10 +345,63 @@ impl ProfileRegistry {
         if changed {
             registry.save(ctx);
         }
-        for profile in &registry.profiles {
+        registry
+    }
+
+    /// Makes every Profile's missing links again.
+    pub(crate) fn heal_links(&self, ctx: &Context) {
+        for profile in &self.profiles {
             link(ctx, &profile.id, &profile.config_dir);
         }
-        registry
+    }
+
+    /// Every Profile folder, signed in or not, with its id.
+    pub(crate) fn folders(&self) -> Vec<(&str, &Path)> {
+        self.profiles
+            .iter()
+            .map(|profile| (profile.id.as_str(), profile.config_dir.as_path()))
+            .collect()
+    }
+
+    /// Every signed-in Profile's folder with the account its `oauthAccount`
+    /// names, for the `auth status` cross-check.
+    pub(crate) fn accounts(&self) -> Vec<SignedInAccount<'_>> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInAccount {
+                    config_dir: &profile.config_dir,
+                    email: &identity.email,
+                    organization_uuid: &identity.organization_uuid,
+                })
+            })
+            .collect()
+    }
+
+    /// What the latest usage reads say about the usage format.
+    pub(crate) fn usage_summary(&self) -> UsageSummary {
+        let mut summary = UsageSummary::default();
+        for profile in &self.profiles {
+            match &profile.reading {
+                None => {}
+                Some(Reading::Failed) => summary.unreadable += 1,
+                Some(Reading::Read(reply)) => {
+                    summary.read += 1;
+                    for (kind, _) in reply.limits.iter().flat_map(|limits| &limits.other) {
+                        if !summary.new_kinds.contains(kind) {
+                            summary.new_kinds.push(kind.clone());
+                        }
+                    }
+                }
+            }
+        }
+        summary
+    }
+
+    /// Whether `auth status` contradicted a sign-in since the last call.
+    pub(crate) fn take_auth_disagreement(&mut self) -> bool {
+        std::mem::take(&mut self.auth_disagreed)
     }
 
     /// Add Profile…: creates the folder, links it, seeds `.claude.json`, and
@@ -548,7 +626,10 @@ impl ProfileRegistry {
                 if status.logged_in
                     && status.email.as_deref() == Some(identity.email.as_str())
                     && status.org_id.as_deref() == Some(identity.organization_uuid.as_str()) => {}
-            _ => {
+            status => {
+                // A readable, logged-in answer naming another account means
+                // Claude Code didn't use this folder's login.
+                self.auth_disagreed = status.is_some_and(|status| status.logged_in);
                 ctx.log(
                     Level::Warn,
                     "sign-in not confirmed by auth status",
@@ -654,7 +735,11 @@ fn create_folder(paths: &AppPaths) -> io::Result<(String, PathBuf)> {
 
 /// Makes the Profile folder's missing links back to `~/.claude`.
 fn link(ctx: &Context, id: &str, config_dir: &Path) {
-    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
+    match cli_switcher::ensure_links(
+        config_dir,
+        &ctx.env.home.join(".claude"),
+        ctx.share_transcripts,
+    ) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(

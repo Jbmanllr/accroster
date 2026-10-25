@@ -72,6 +72,24 @@ if [ -f "$reply/hang" ]; then
   exec /bin/sleep 600
 fi
 
+# An honest `auth status --json`: answers from the folder's own
+# oauthAccount, as Claude Code does.
+if [ -f "$reply/from-folder" ]; then
+  if [ "$count" -gt 1 ]; then
+    mkdir -p "$state/used/$key"
+    mv "$reply" "$state/used/$key/$first"
+  fi
+  f="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  email=$(/usr/bin/plutil -extract oauthAccount.emailAddress raw -o - "$f" 2>/dev/null)
+  org=$(/usr/bin/plutil -extract oauthAccount.organizationUuid raw -o - "$f" 2>/dev/null)
+  if [ -n "$email" ]; then
+    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"%s","orgId":"%s"}\n' "$email" "$org"
+    exit 0
+  fi
+  printf '{"loggedIn":false,"authMethod":"none"}\n'
+  exit 1
+fi
+
 if [ -d "$reply/files" ]; then
   if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then
     echo "stub claude: reply writes files but CLAUDE_CONFIG_DIR is unset" >&2
