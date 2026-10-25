@@ -14,18 +14,21 @@ use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect, Event,
-    FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, SafetyFeature, SettingsView, View,
+    AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
+    Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
+    NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, SidebarSyncMode,
+    SidebarSyncView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, LimitsView, Watched};
+use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening::{self, Clients, DefaultOpen, DesktopClient, InClaude, NamedProfile};
-use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
 use crate::runner::Runner;
 use crate::safety::{self, CheckId, Finding, Safety};
 use crate::sessions::{SessionFacts, SessionIndex, SidebarProfile};
-use crate::settings::{self, DiscoveredChoice, Settings};
+use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
+use crate::sidebar_sync::{self, Run};
 use crate::storage::{self, AppPaths};
 
 /// The tagline, shown in About and the README.
@@ -83,6 +86,8 @@ pub struct Core {
     warnings: Vec<String>,
     profiles: ProfileRegistry,
     monitor: LimitMonitor,
+    /// Which limit notifications already fired.
+    notifier: Notifier,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
@@ -96,6 +101,8 @@ pub struct Core {
     versions: ClaudeVersions,
     /// Each Profile's links as of the last check, by Profile id.
     links: Vec<ProfileLinks>,
+    /// What the last "Sync now" did, for Settings.
+    sync_note: Option<String>,
 }
 
 /// What the last link check found in one Profile folder.
@@ -141,6 +148,7 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             monitor: LimitMonitor::default(),
+            notifier: Notifier::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
             discovered: Vec::new(),
@@ -148,6 +156,7 @@ impl Core {
             versions: ClaudeVersions::default(),
             links: Vec::new(),
             sessions: SessionIndex::default(),
+            sync_note: None,
         };
         core.log(
             Level::Info,
@@ -212,6 +221,7 @@ impl Core {
         }
         core.rescan_discovered();
         core.monitor = LimitMonitor::load(&core.context());
+        core.notifier = Notifier::load(&core.context());
         // Recent Sessions in the first menu: the index fills in by ticks.
         core.sessions.warm_up(&core.env, &core.paths);
         Ok(core)
@@ -432,6 +442,14 @@ impl Core {
                 self.sessions.set_search(text);
                 Vec::new()
             }
+            Command::SetSidebarSync(mode) => {
+                self.set_sidebar_sync(mode);
+                Vec::new()
+            }
+            Command::SyncSidebarNow => {
+                self.sync_sidebar();
+                Vec::new()
+            }
             Command::FilterSessions(filter) => {
                 self.sessions.set_filter(filter);
                 Vec::new()
@@ -456,6 +474,27 @@ impl Core {
             Command::OpenInClaude(id) => self.open_in_claude(&id),
             Command::SwitchClaudeThenOpen { profile, session } => {
                 self.switch_claude_then_open(&profile, &session)
+            }
+            Command::SetMuted { id, muted } => {
+                let mut updated = self.settings.clone();
+                updated.muted_profiles.retain(|known| *known != id);
+                if muted {
+                    updated.muted_profiles.push(id);
+                }
+                self.save_settings(updated);
+                Vec::new()
+            }
+            Command::SetThresholds(values) => {
+                let mut updated = self.settings.clone();
+                updated.thresholds = Thresholds::new(values);
+                self.save_settings(updated);
+                Vec::new()
+            }
+            Command::SetResetNotification(on) => {
+                let mut updated = self.settings.clone();
+                updated.reset_notification = on;
+                self.save_settings(updated);
+                Vec::new()
             }
         }
     }
@@ -555,7 +594,48 @@ impl Core {
         if let Some(done) = self.monitor.start_due(&ctx, &watched) {
             self.profiles.record_reading(&ctx, &done.id, done.reply);
         }
-        self.profiles.take_effects()
+        let mut effects = self.profiles.take_effects();
+        effects.extend(self.notify_limits());
+        effects
+    }
+
+    /// The limit notifications due now (thresholds crossed, warned limits
+    /// that reset).
+    fn notify_limits(&mut self) -> Vec<Effect> {
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        };
+        let watched = self.watched();
+        let listed = self.profiles.listed(&self.settings, |id| {
+            let active = watched.iter().any(|w| w.id == id && w.active);
+            self.monitor.view(&ctx, id, active)
+        });
+        let headroom = most_headroom(&listed, &watched);
+        let pointer = cli_switcher::pointer(&self.paths);
+        let subjects: Vec<Subject> = watched
+            .iter()
+            .filter_map(|w| {
+                let listed = listed.iter().find(|listed| listed.id == w.id)?;
+                Some(Subject {
+                    id: &w.id,
+                    name: &listed.short_label,
+                    limits: self.monitor.limits(&w.id),
+                    tightest: tightest(&listed.row),
+                    muted: self.settings.muted_profiles.contains(&w.id),
+                    cli_active: pointer.as_deref() == Some(w.config_dir.as_path()),
+                })
+            })
+            .collect();
+        let choices = Choices {
+            thresholds: self.settings.thresholds.values(),
+            reset_notification: self.settings.reset_notification,
+        };
+        self.notifier
+            .check(&ctx, &subjects, headroom.as_ref(), &choices)
     }
 
     /// The signed-in Profiles the Limit monitor reads, with which are a
@@ -596,6 +676,11 @@ impl Core {
             let active = watched.iter().any(|w| w.id == id && w.active);
             self.monitor.view(&ctx, id, active)
         });
+        if let Some(headroom) = most_headroom(&listed, &watched) {
+            for listed in listed.iter_mut() {
+                listed.row.most_headroom = listed.id == headroom.id;
+            }
+        }
         for profile in &mut listed {
             self.annotate_links(profile.id, &mut profile.row);
         }
@@ -633,6 +718,26 @@ impl Core {
                 continue;
             };
             let row = &mut listed.row;
+            let muted = self.settings.muted_profiles.contains(&profile.id);
+            let remove = row
+                .submenu
+                .iter()
+                .position(|item| {
+                    matches!(item, MenuItem::Action { title, .. } | MenuItem::Submenu { title, .. }
+                        if title == "Remove…")
+                })
+                .unwrap_or(row.submenu.len());
+            row.submenu.insert(
+                remove,
+                MenuItem::Check {
+                    title: "Mute notifications".into(),
+                    checked: muted,
+                    command: Command::SetMuted {
+                        id: profile.id.clone(),
+                        muted: !muted,
+                    },
+                },
+            );
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
                 row.badges.push("Desktop".into());
             } else if desktop_installed {
@@ -724,6 +829,12 @@ impl Core {
                     line: cli_switcher::path_line(&self.paths),
                     note: self.cli_note.clone(),
                 },
+                sidebar_sync: SidebarSyncView {
+                    mode: self.settings.sidebar_sync,
+                    sync_now: (self.settings.sidebar_sync == SidebarSyncMode::Manual)
+                        .then_some(Command::SyncSidebarNow),
+                    note: self.sync_note.clone(),
+                },
                 hidden_discovered: shown
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
@@ -732,6 +843,10 @@ impl Core {
                         restore: Command::UnhideDiscovered(evidence.pair.clone()),
                     })
                     .collect(),
+                notifications: NotificationsView {
+                    thresholds: self.settings.thresholds.values().to_vec(),
+                    reset_notification: self.settings.reset_notification,
+                },
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -1070,8 +1185,7 @@ impl Core {
             self.check_config_dir_honoured();
         }
         let home = self.env.home.clone();
-        self.safety
-            .record(CheckId::SidebarEntries, checks::sidebar_entries(&home));
+        self.check_sidebar_entries();
         let mut session_dirs = vec![home.join(".claude")];
         session_dirs.extend(
             self.profiles
@@ -1255,6 +1369,7 @@ impl Core {
                 self.check_config_dir_honoured();
             }
             SafetyFeature::TranscriptSharing => self.check_links(),
+            SafetyFeature::SidebarSync => self.check_sidebar_entries(),
         }
         self.settle();
         if !self.safety.resume(feature) {
@@ -1275,6 +1390,124 @@ impl Core {
             profiles.heal_links(&ctx);
             self.check_links();
         }
+        if feature == SafetyFeature::SidebarSync {
+            // The user accepts the sidebars as they are now.
+            sidebar_sync::accept_current(&self.env, &self.paths);
+            self.sync_note = None;
+        }
+    }
+
+    /// The Sidebar entries check. A failure pauses Sidebar sync only while
+    /// sync is on: with it off, nothing would be written anyway.
+    fn check_sidebar_entries(&mut self) {
+        let mut finding = checks::sidebar_entries(&self.env.home);
+        if finding.status == CheckStatus::Fail && self.settings.sidebar_sync != SidebarSyncMode::Off
+        {
+            let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
+            finding = finding.blocking(SafetyFeature::SidebarSync, reason);
+        }
+        self.safety.record(CheckId::SidebarEntries, finding);
+    }
+
+    /// The Sidebar sync mode in Settings. Turning sync on checks the Sidebar
+    /// entries first, so a changed format pauses it before any write.
+    fn set_sidebar_sync(&mut self, mode: SidebarSyncMode) {
+        let mut updated = self.settings.clone();
+        updated.sidebar_sync = mode;
+        if !self.save_settings(updated) {
+            return;
+        }
+        self.sync_note = None;
+        self.log(
+            Level::Info,
+            "sidebar sync mode",
+            &[(
+                "mode",
+                Field::Word(match mode {
+                    SidebarSyncMode::Off => "off",
+                    SidebarSyncMode::Manual => "manual",
+                }),
+            )],
+        );
+        self.check_sidebar_entries();
+        self.settle();
+    }
+
+    /// "Sync now": checks the Sidebar entries again, then copies every entry
+    /// into every other Profile's sidebar (ADR 0003).
+    fn sync_sidebar(&mut self) {
+        if self.settings.sidebar_sync == SidebarSyncMode::Off {
+            return;
+        }
+        self.check_sidebar_entries();
+        self.settle();
+        if self.safety.is_paused(SafetyFeature::SidebarSync) {
+            self.sync_note =
+                Some("Sidebar sync is paused · see Diagnostics for why and to resume it".into());
+            self.log(Level::Info, "sidebar sync not run: paused", &[]);
+            return;
+        }
+        match sidebar_sync::run(&self.env, &self.paths) {
+            Run::Synced(report) => {
+                self.safety
+                    .record(CheckId::MultiAccountMode, Finding::pass());
+                self.log(
+                    Level::Info,
+                    "sidebar synced",
+                    &[
+                        ("entries", Field::Number(report.written as i64)),
+                        ("folders", Field::Number(report.folders as i64)),
+                        ("not_backed_up", Field::Number(report.not_backed_up as i64)),
+                    ],
+                );
+                self.sync_note = Some(sync_note(&report));
+            }
+            Run::DesktopAccountUnknown => {
+                self.log(
+                    Level::Info,
+                    "sidebar sync not run: desktop account unknown",
+                    &[],
+                );
+                self.sync_note =
+                    Some("Couldn't tell which Profile Claude is using · nothing was synced".into());
+            }
+            Run::UnknownFields(fields) => {
+                let detail = format!(
+                    "unknown fields: {}",
+                    fields.into_iter().collect::<Vec<_>>().join(", ")
+                );
+                let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
+                self.safety.record(
+                    CheckId::SidebarEntries,
+                    Finding::fail(detail).blocking(SafetyFeature::SidebarSync, reason),
+                );
+                self.paused_sync_note();
+            }
+            Run::FoldersChanged(count) => {
+                let whose = if count > 1 { "sidebars" } else { "sidebar" };
+                let detail =
+                    format!("{count} {whose} Claude wasn't using changed since the last sync");
+                self.safety.record(
+                    CheckId::MultiAccountMode,
+                    Finding::fail(detail.clone()).blocking(
+                        SafetyFeature::SidebarSync,
+                        "Claude wrote to a Profile it isn't using",
+                    ),
+                );
+                self.paused_sync_note();
+                // The pause stays until Resume, which accepts the sidebars as
+                // they are; the finding itself no longer blocks.
+                self.safety
+                    .record(CheckId::MultiAccountMode, Finding::fail(detail));
+            }
+        }
+    }
+
+    fn paused_sync_note(&mut self) {
+        self.settle();
+        self.log(Level::Warn, "sidebar sync stopped before writing", &[]);
+        self.sync_note =
+            Some("Sidebar sync is paused · nothing was written · see Diagnostics".into());
     }
 
     /// Reads the next batch of the Session index while a build runs.
@@ -1446,6 +1679,7 @@ impl Core {
                 share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
             };
             self.monitor.forget(&ctx, id);
+            self.notifier.forget(&ctx, id);
             self.forget_profile_settings(id);
         }
     }
@@ -1482,6 +1716,7 @@ impl Core {
     fn forget_profile_settings(&mut self, id: &str) {
         let mut updated = self.settings.clone();
         updated.nicknames.remove(id);
+        updated.muted_profiles.retain(|known| known != id);
         updated.profile_order.retain(|known| known != id);
         if updated != self.settings {
             self.save_settings(updated);
@@ -1702,10 +1937,71 @@ impl Core {
     }
 }
 
+/// "Claude 3.6556.2", or "Claude" when the desktop app's version is unknown.
+fn desktop_name(versions: &ClaudeVersions) -> String {
+    match &versions.desktop {
+        Some(version) => format!("Claude {version}"),
+        None => "Claude".to_owned(),
+    }
+}
+
+/// Settings' line after a sync.
+fn sync_note(report: &sidebar_sync::Report) -> String {
+    let mut note = if report.written == 0 {
+        "Every sidebar was already in sync".to_owned()
+    } else {
+        let entries = if report.written == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        let profiles = if report.folders == 1 {
+            "Profile"
+        } else {
+            "Profiles"
+        };
+        format!(
+            "Updated {} Sidebar {entries} in {} {profiles}",
+            report.written, report.folders
+        )
+    };
+    if report.left_desktop_account {
+        note.push_str(" · the Profile Claude is using syncs once Claude is quit");
+    }
+    if report.not_backed_up > 0 {
+        note.push_str(&format!(
+            " · {} couldn't be backed up and were left as they were",
+            report.not_backed_up
+        ));
+    }
+    note
+}
+
+/// A row's tightest limit: its highest bar, unknown limit kinds included.
+fn tightest(row: &ProfileRow) -> Option<u32> {
+    row.limits.iter().map(|bar| bar.percent).max()
+}
+
+/// The non-stale watched Profile with the lowest tightest limit, among two
+/// or more.
+fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom> {
+    notifications::most_headroom(listed.iter().filter_map(|listed| {
+        if listed.row.dimmed || !watched.iter().any(|w| w.id == listed.id) {
+            return None;
+        }
+        Some((
+            listed.id,
+            listed.short_label.as_str(),
+            tightest(&listed.row)?,
+        ))
+    }))
+}
+
 fn feature_word(feature: SafetyFeature) -> &'static str {
     match feature {
         SafetyFeature::CliSwitching => "cli_switching",
         SafetyFeature::TranscriptSharing => "transcript_sharing",
+        SafetyFeature::SidebarSync => "sidebar_sync",
     }
 }
 

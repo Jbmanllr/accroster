@@ -9,6 +9,10 @@
 //!     20261025T140200.123Z.bak       one copy per backup, named by when it was taken
 //! ```
 //!
+//! A folder (a Profile's Sidebar folder, before Sidebar sync writes into it)
+//! is backed up the same way, as a `<stamp>.bak/` folder holding a copy of
+//! each file directly inside it; subfolders aren't copied.
+//!
 //! Each file keeps its last [`KEEP_LAST`] backups plus any younger than
 //! [`KEEP_YOUNGER_THAN`]; [`prune`] enforces that at launch. `.zshrc`
 //! backups are never pruned.
@@ -47,19 +51,30 @@ impl VersionedFile for Source {
 /// Copies `file` into `backups/` and returns the copy's path. Call it right
 /// before writing `file`; if it fails, don't write.
 pub(crate) fn back_up(backups: &Path, file: &Path, now: Timestamp) -> io::Result<PathBuf> {
-    let name = file
+    let copy = new_copy_path(backups, file, now)?;
+    fs::copy(file, &copy)?;
+    Ok(copy)
+}
+
+/// The group folder for `original` (created with its `source.json`) and a
+/// free `<stamp>.bak` name in it.
+fn new_copy_path(backups: &Path, original: &Path, now: Timestamp) -> io::Result<PathBuf> {
+    let name = original
         .file_name()
         .ok_or_else(|| io::Error::other("a backed-up file has a name"))?
         .to_string_lossy()
         .into_owned();
-    let group = backups.join(format!("{name}-{}", short_hash(&file.to_string_lossy())));
+    let group = backups.join(format!(
+        "{name}-{}",
+        short_hash(&original.to_string_lossy())
+    ));
     fs::create_dir_all(&group)?;
     let source = group.join("source.json");
     if !source.exists() {
         storage::write_versioned(
             &source,
             &Source {
-                path: file.to_path_buf(),
+                path: original.to_path_buf(),
             },
         )?;
     }
@@ -70,7 +85,21 @@ pub(crate) fn back_up(backups: &Path, file: &Path, now: Timestamp) -> io::Result
         copy = group.join(format!("{stamp}-{n}.bak"));
         n += 1;
     }
-    fs::copy(file, &copy)?;
+    Ok(copy)
+}
+
+/// Copies every file directly inside `folder` into one backup folder and
+/// returns its path. Call it right before writing into `folder`; if it
+/// fails, don't write.
+pub(crate) fn back_up_folder(backups: &Path, folder: &Path, now: Timestamp) -> io::Result<PathBuf> {
+    let copy = new_copy_path(backups, folder, now)?;
+    fs::create_dir(&copy)?;
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), copy.join(entry.file_name()))?;
+        }
+    }
     Ok(copy)
 }
 
@@ -93,7 +122,11 @@ pub(crate) fn prune(backups: &Path, now: Timestamp) -> io::Result<usize> {
         copies.sort_by(|a, b| b.0.cmp(&a.0));
         for (taken, path) in copies.into_iter().skip(KEEP_LAST) {
             if now.duration_since(taken) >= KEEP_YOUNGER_THAN {
-                fs::remove_file(path)?;
+                if path.is_dir() {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
                 deleted += 1;
             }
         }

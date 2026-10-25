@@ -583,6 +583,7 @@ fn on_an_empty_mac_every_check_is_never_seen_except_the_settings_env() {
             "Sidebar entries",
             "Live-process files",
             "Transcript records",
+            "Dormant multi-account mode",
         ]
     );
     for check in &checks {

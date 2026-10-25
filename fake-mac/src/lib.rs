@@ -667,6 +667,7 @@ struct FakeOsState {
     desktop_children: BTreeSet<u32>,
     /// Terminal devices, by pid.
     terminals: HashMap<u32, String>,
+    desktop_app_running: bool,
 }
 
 /// OS facts the test sets by hand. Clones share the facts.
@@ -702,6 +703,11 @@ impl FakeOs {
     /// Puts live process `pid` on terminal device `tty` (`ttys004`).
     pub fn set_terminal(&self, pid: u32, tty: &str) {
         self.0.lock().unwrap().terminals.insert(pid, tty.to_owned());
+    }
+
+    /// Starts (`true`) or quits (`false`) the desktop app. It starts quit.
+    pub fn set_desktop_app_running(&self, running: bool) {
+        self.0.lock().unwrap().desktop_app_running = running;
     }
 
     /// Installs (or with `None`, removes) the desktop app.
@@ -744,6 +750,10 @@ impl OsFacts for FakeOs {
             .iter()
             .copied()
             .collect()
+    }
+
+    fn desktop_app_running(&self) -> bool {
+        self.0.lock().unwrap().desktop_app_running
     }
 }
 

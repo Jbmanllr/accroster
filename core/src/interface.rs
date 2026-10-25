@@ -103,6 +103,14 @@ pub enum Command {
     /// That removal confirmed: point the CLI at `next` (or delete the
     /// pointer) first, then remove the Profile.
     RemoveProfileWithNextCli { id: String, next: Option<String> },
+    /// "Mute notifications" in a Profile's hover submenu (by id): mutes
+    /// (`true`) or unmutes its limit notifications.
+    SetMuted { id: String, muted: bool },
+    /// The thresholds in Settings, in whole percent (1–100). Out-of-range
+    /// values are dropped; the rest are kept sorted, without repeats.
+    SetThresholds(Vec<u32>),
+    /// The reset notification switch in Settings.
+    SetResetNotification(bool),
     /// Diagnostics… in the menu.
     OpenDiagnostics,
     /// "Copy report" in Diagnostics: field names and versions only.
@@ -124,6 +132,23 @@ pub enum Command {
     /// `profile` (by id), then opening Session `session` (by Transcript id)
     /// from that Profile's entry.
     SwitchClaudeThenOpen { profile: String, session: String },
+    /// The Sidebar sync mode in Settings.
+    SetSidebarSync(SidebarSyncMode),
+    /// "Sync now" in Settings: copy every Session's Sidebar entry into every
+    /// other Profile's sidebar.
+    SyncSidebarNow,
+}
+
+/// How Sidebar sync runs (ADR 0003). Saved in `settings.json` as
+/// `"off"` / `"manual"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarSyncMode {
+    /// Sync never writes (the default).
+    #[default]
+    Off,
+    /// Sync runs on "Sync now".
+    Manual,
 }
 
 /// A feature that writes Claude's files and can get a Safety pause
@@ -135,6 +160,8 @@ pub enum SafetyFeature {
     /// The Profile links that share Transcripts and resume data
     /// (`projects`, `file-history`, `session-env`).
     TranscriptSharing,
+    /// Copying Sidebar entries between Profiles.
+    SidebarSync,
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -180,6 +207,8 @@ impl Command {
             Command::OpenDiagnostics => "open_diagnostics",
             Command::CopyDiagnosticsReport => "copy_diagnostics_report",
             Command::ResumeFeature(_) => "resume_feature",
+            Command::SetSidebarSync(_) => "set_sidebar_sync",
+            Command::SyncSidebarNow => "sync_sidebar_now",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
             Command::FilterSessions(_) => "filter_sessions",
@@ -195,6 +224,9 @@ impl Command {
             Command::ResumeInTerminal(_) => "resume_in_terminal",
             Command::OpenInClaude(_) => "open_in_claude",
             Command::SwitchClaudeThenOpen { .. } => "switch_claude_then_open",
+            Command::SetMuted { .. } => "set_muted",
+            Command::SetThresholds(_) => "set_thresholds",
+            Command::SetResetNotification(_) => "set_reset_notification",
         }
     }
 }
@@ -247,6 +279,14 @@ pub enum Effect {
     BringDesktopAppForward,
     /// Post a user notification.
     Notify { title: String, body: String },
+    /// Post a user notification with one action button titled `action`;
+    /// clicking it sends `command`. Nothing happens unless it is clicked.
+    NotifyWithAction {
+        title: String,
+        body: String,
+        action: String,
+        command: Command,
+    },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
     /// Ask for a nickname for `name` (prefilled with `current`), then send
@@ -451,6 +491,9 @@ pub struct ProfileRow {
     /// Drawn dimmed: the reading is not current (stale, unreadable, or the
     /// Login expired).
     pub dimmed: bool,
+    /// The most-headroom marker: of the non-stale signed-in Profiles (two or
+    /// more), this one has the lowest tightest limit.
+    pub most_headroom: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,
@@ -484,6 +527,29 @@ pub struct SettingsView {
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
+    pub sidebar_sync: SidebarSyncView,
+    pub notifications: NotificationsView,
+}
+
+/// Settings > Notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationsView {
+    /// The thresholds every limit of every signed-in Profile warns at, in
+    /// whole percent, lowest first ([`Command::SetThresholds`]).
+    pub thresholds: Vec<u32>,
+    /// Whether a limit that warned notifies again when it resets
+    /// ([`Command::SetResetNotification`]). Off by default.
+    pub reset_notification: bool,
+}
+
+/// Sidebar sync in Settings: the mode and "Sync now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSyncView {
+    pub mode: SidebarSyncMode,
+    /// "Sync now", present in Manual mode: [`Command::SyncSidebarNow`].
+    pub sync_now: Option<Command>,
+    /// What the last sync did, or why it didn't run.
+    pub note: Option<String>,
 }
 
 /// One entry of Settings > Hidden (n)….

@@ -9,10 +9,12 @@ use std::ffi::{c_int, c_void};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::watcher::{self, FolderWatch};
+
+use crate::notifications;
 use accroster_core::{
     AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
     LimitBar, MenuItem, ProfileRow, RunningDot, SessionDetail, SessionFilter, SessionRow,
-    SettingsView, SidebarGroup, View,
+    SettingsView, SidebarGroup, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -64,6 +66,13 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
         });
     });
     ui.ivars().core.set(handle).expect("the core starts once");
+    notifications::start(|command| {
+        UI.with(|cell| {
+            if let Some(ui) = cell.get() {
+                ui.send(command);
+            }
+        });
+    });
     ui.observe_the_mac();
 }
 
@@ -127,6 +136,9 @@ struct DiagnosticsWindow {
 
 struct SettingsWindow {
     window: Retained<NSWindow>,
+    sidebar_sync: Retained<NSButton>,
+    sync_now: Retained<NSButton>,
+    sidebar_sync_note: Retained<NSTextField>,
     cli_switching: Retained<NSButton>,
     cli_switching_note: Retained<NSTextField>,
     launch_at_login: Retained<NSButton>,
@@ -134,6 +146,8 @@ struct SettingsWindow {
     verbose_logging: Retained<NSButton>,
     verbose_logging_note: Retained<NSTextField>,
     hidden: Retained<NSButton>,
+    thresholds: Retained<NSTextField>,
+    reset_notification: Retained<NSButton>,
 }
 
 define_class!(
@@ -279,6 +293,41 @@ define_class!(
             if let Some(on) = on {
                 self.send(Command::SetLaunchAtLogin(on));
             }
+        }
+
+        /// The Sidebar sync checkbox: on is Manual ("Sync now").
+        #[unsafe(method(sidebarSyncClicked:))]
+        fn sidebar_sync_clicked(&self, sender: &NSButton) {
+            let mode = if sender.state() == NSControlStateValueOn {
+                SidebarSyncMode::Manual
+            } else {
+                SidebarSyncMode::Off
+            };
+            self.send(Command::SetSidebarSync(mode));
+        }
+
+        #[unsafe(method(syncNowClicked:))]
+        fn sync_now_clicked(&self, _sender: &NSButton) {
+            self.send(Command::SyncSidebarNow);
+        }
+
+        /// The thresholds field was committed: whole percents separated by
+        /// commas or spaces ("80, 95").
+        #[unsafe(method(thresholdsChanged:))]
+        fn thresholds_changed(&self, sender: &NSTextField) {
+            let text = sender.stringValue().to_string();
+            let values = text
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            self.send(Command::SetThresholds(values));
+        }
+
+        #[unsafe(method(resetNotificationClicked:))]
+        fn reset_notification_clicked(&self, sender: &NSButton) {
+            self.send(Command::SetResetNotification(
+                sender.state() == NSControlStateValueOn,
+            ));
         }
 
         #[unsafe(method(cliSwitchingClicked:))]
@@ -792,7 +841,13 @@ impl Ui {
             Effect::BringDesktopAppForward => bring_desktop_app_forward(),
             Effect::RunInTerminal(line) => run_in_terminal(&line),
             Effect::ShowInTerminal { tty } => show_in_terminal(tty.as_deref()),
-            Effect::Notify { title, body } => notify(&title, &body),
+            Effect::Notify { title, body } => notifications::post(&title, &body, None),
+            Effect::NotifyWithAction {
+                title,
+                body,
+                action,
+                command,
+            } => notifications::post(&title, &body, Some((&action, command))),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
                 name,
@@ -1044,7 +1099,7 @@ impl Ui {
     /// a Resume button per resumable pause, and Copy report.
     fn make_diagnostics_window(&self) -> DiagnosticsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 440.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1065,7 +1120,7 @@ impl Ui {
         )));
         text.setFrame(NSRect::new(
             NSPoint::new(20.0, 64.0),
-            NSSize::new(520.0, 360.0),
+            NSSize::new(680.0, 360.0),
         ));
         content.addSubview(&text);
 
@@ -1080,7 +1135,7 @@ impl Ui {
         copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
         content.addSubview(&copy);
 
-        let resume = [180.0, 360.0]
+        let resume = [140.0, 330.0, 530.0]
             .into_iter()
             .map(|x| {
                 let button = unsafe {
@@ -1183,7 +1238,7 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 340.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 488.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1197,6 +1252,65 @@ impl Ui {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("AccRoster Settings"));
         let content = window.contentView().expect("a window has a content view");
+
+        let sidebar_sync = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Sidebar sync: every Session in every Profile's desktop sidebar"),
+                Some(self),
+                Some(sel!(sidebarSyncClicked:)),
+                mtm,
+            )
+        };
+        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 456.0));
+        content.addSubview(&sidebar_sync);
+
+        let sync_now = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Sync now"),
+                Some(self),
+                Some(sel!(syncNowClicked:)),
+                mtm,
+            )
+        };
+        sync_now.setFrameOrigin(NSPoint::new(34.0, 422.0));
+        content.addSubview(&sync_now);
+
+        let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        sidebar_sync_note.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        sidebar_sync_note.setFrame(NSRect::new(
+            NSPoint::new(140.0, 410.0),
+            NSSize::new(260.0, 44.0),
+        ));
+        content.addSubview(&sidebar_sync_note);
+
+        let thresholds_label =
+            NSTextField::labelWithString(ns_string!("Notify when a limit reaches (%):"), mtm);
+        thresholds_label.setFrameOrigin(NSPoint::new(20.0, 370.0));
+        thresholds_label.sizeToFit();
+        content.addSubview(&thresholds_label);
+        let thresholds = NSTextField::textFieldWithString(ns_string!(""), mtm);
+        thresholds.setFrame(NSRect::new(
+            NSPoint::new(240.0, 367.0),
+            NSSize::new(80.0, 22.0),
+        ));
+        unsafe {
+            thresholds.setTarget(Some(self));
+            thresholds.setAction(Some(sel!(thresholdsChanged:)));
+        }
+        content.addSubview(&thresholds);
+
+        let reset_notification = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Also notify when a limit that warned resets"),
+                Some(self),
+                Some(sel!(resetNotificationClicked:)),
+                mtm,
+            )
+        };
+        reset_notification.setFrameOrigin(NSPoint::new(20.0, 338.0));
+        content.addSubview(&reset_notification);
 
         let cli_switching = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -1286,6 +1400,9 @@ impl Ui {
 
         SettingsWindow {
             window,
+            sidebar_sync,
+            sync_now,
+            sidebar_sync_note,
             cli_switching,
             cli_switching_note,
             launch_at_login,
@@ -1293,6 +1410,8 @@ impl Ui {
             verbose_logging,
             verbose_logging_note,
             hidden,
+            thresholds,
+            reset_notification,
         }
     }
 }
@@ -1747,6 +1866,8 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     let badges: Vec<Retained<NSTextField>> = row
         .badges
         .iter()
+        .map(String::as_str)
+        .chain(row.most_headroom.then_some("Most headroom"))
         .map(|badge| label(mtm, badge, NSFont::boldSystemFontOfSize(9.0), true))
         .collect();
     let filler = NSView::new(mtm);
@@ -1811,52 +1932,6 @@ fn bring_desktop_app_forward() {
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(true);
     workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
-}
-
-#[link(name = "UserNotifications", kind = "framework")]
-unsafe extern "C" {}
-
-/// Posts a notification through `UNUserNotificationCenter`, asking for
-/// permission the first time. Only a bundled app may use it (outside a bundle
-/// the center throws), so an unbundled run skips notifications.
-fn notify(title: &str, body: &str) {
-    use block2::RcBlock;
-    use objc2::runtime::{AnyClass, Bool};
-    use objc2_foundation::{NSBundle, NSUUID};
-    if NSBundle::mainBundle().bundleIdentifier().is_none() {
-        return;
-    }
-    let (Some(center_class), Some(content_class), Some(request_class)) = (
-        AnyClass::get(c"UNUserNotificationCenter"),
-        AnyClass::get(c"UNMutableNotificationContent"),
-        AnyClass::get(c"UNNotificationRequest"),
-    ) else {
-        return;
-    };
-    // SAFETY: documented UserNotifications selectors with their documented
-    // argument types; nil completion handlers are allowed.
-    unsafe {
-        let center: Retained<AnyObject> = msg_send![center_class, currentNotificationCenter];
-        // UNAuthorizationOptionSound | UNAuthorizationOptionAlert.
-        let options: usize = (1 << 1) | (1 << 2);
-        let asked = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
-        let _: () = msg_send![&center, requestAuthorizationWithOptions: options, completionHandler: &*asked];
-        let content: Retained<AnyObject> = msg_send![content_class, new];
-        let _: () = msg_send![&content, setTitle: &*NSString::from_str(title)];
-        let _: () = msg_send![&content, setBody: &*NSString::from_str(body)];
-        let id = NSUUID::UUID().UUIDString();
-        let request: Retained<AnyObject> = msg_send![
-            request_class,
-            requestWithIdentifier: &*id,
-            content: &*content,
-            trigger: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![
-            &center,
-            addNotificationRequest: &*request,
-            withCompletionHandler: std::ptr::null::<AnyObject>()
-        ];
-    }
 }
 
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
@@ -2031,6 +2106,45 @@ fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
 }
 
 fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
+    let sync = &view.sidebar_sync;
+    settings
+        .sidebar_sync
+        .setState(if sync.mode == SidebarSyncMode::Off {
+            NSControlStateValueOff
+        } else {
+            NSControlStateValueOn
+        });
+    settings.sync_now.setEnabled(sync.sync_now.is_some());
+    let sync_text = match (&sync.note, sync.mode) {
+        (Some(note), _) => note.clone(),
+        (None, SidebarSyncMode::Off) => "Off: sidebars are left as they are.".to_owned(),
+        (None, SidebarSyncMode::Manual) => {
+            "Copies entries, never deletes. While Claude runs, its own Profile is left alone."
+                .to_owned()
+        }
+    };
+    settings
+        .sidebar_sync_note
+        .setStringValue(&NSString::from_str(&sync_text));
+    let notifications = &view.notifications;
+    let thresholds: Vec<String> = notifications
+        .thresholds
+        .iter()
+        .map(u32::to_string)
+        .collect();
+    // Leave the field alone while the user is typing in it.
+    if settings.thresholds.currentEditor().is_none() {
+        settings
+            .thresholds
+            .setStringValue(&NSString::from_str(&thresholds.join(", ")));
+    }
+    settings
+        .reset_notification
+        .setState(if notifications.reset_notification {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
     let cli = &view.cli_switching;
     settings.cli_switching.setState(if cli.on {
         NSControlStateValueOn

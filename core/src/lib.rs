@@ -17,12 +17,14 @@ pub mod interface;
 mod limit_offers;
 mod logging;
 mod monitor;
+mod notifications;
 mod opening;
 mod profiles;
 mod runner;
 mod safety;
 mod sessions;
 mod settings;
+mod sidebar_sync;
 mod storage;
 mod usage;
 pub mod watcher;
@@ -44,7 +46,8 @@ pub use interface::{
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, NicknameTarget,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView,
 };
+pub use interface::{SidebarSyncMode, SidebarSyncView};
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};
