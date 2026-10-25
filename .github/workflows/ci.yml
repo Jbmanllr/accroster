@@ -1,12 +1,12 @@
 # The hosted gate: format, lint, then every test, on macOS (the app and its
-# tests are macOS-only). One job, so one required check and one setup; the
-# steps run cheapest first and stop at the first failure.
+# tests are macOS-only). The check job's steps run cheapest first and stop at
+# the first failure; pull requests also run the release dry run beside it.
 #
 # The tests need nothing a runner lacks: Claude Code is a stub script, the Mac
 # is a temp folder (fake-mac), FSEvents works in any folder, and the shells
 # and tools they start (/bin/sh, /bin/zsh, /bin/kill, plutil) ship with macOS.
-# Bundling and signing (scripts/bundle.sh: rsvg-convert, a keychain identity)
-# and the running app (a GUI session) are not part of this gate.
+# Local bundling (scripts/bundle.sh: a keychain identity) and the running app
+# (a GUI session) are not part of this gate.
 name: CI
 
 on:
@@ -47,3 +47,24 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+
+  # The release build without Apple: universal executable, hardened-runtime
+  # ad-hoc signature with the entitlements, dmg, and the checks that need no
+  # notarization (scripts/release.sh). No secrets: the Developer ID path runs
+  # only in the release workflow.
+  release-dry-run:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # The runner's rustup installs rust-toolchain.toml's toolchain with
+      # both Mac targets.
+      - name: Toolchain
+        run: rustup toolchain install
+      # No cache: release builds of two targets aren't built on main, so
+      # nothing would save one.
+      - name: Icon tool
+        run: brew install librsvg
+      - name: Release dry run
+        run: scripts/release.sh --dry-run
