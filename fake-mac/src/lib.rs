@@ -399,9 +399,20 @@ pub struct Reply {
     /// Files written into the spawn's `$CLAUDE_CONFIG_DIR` before answering,
     /// relative to it (for example a sign-in writing `.claude.json`).
     pub config_dir_files: Vec<(PathBuf, String)>,
+    /// Never answer: wait until killed (a sign-in nobody finishes).
+    pub hang: bool,
 }
 
 impl Reply {
+    /// Prints nothing and never exits on its own, like a browser sign-in the
+    /// user never finishes.
+    pub fn hanging() -> Reply {
+        Reply {
+            hang: true,
+            ..Reply::default()
+        }
+    }
+
     /// Exit 0 printing `stdout`.
     pub fn ok(stdout: impl Into<String>) -> Reply {
         Reply {
@@ -441,11 +452,23 @@ pub struct RecordedCall {
     pub env: BTreeMap<String, String>,
     /// The stdin line the stub read (only for `--input-format` calls).
     pub stdin: String,
+    /// The stub's process id.
+    pub pid: u32,
 }
 
 impl RecordedCall {
     pub fn var(&self, name: &str) -> Option<&str> {
         self.env.get(name).map(String::as_str)
+    }
+
+    /// Whether the stub process for this call is still alive (for example a
+    /// hanging sign-in that was never killed).
+    pub fn still_running(&self) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &self.pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
 
@@ -495,6 +518,9 @@ impl StubClaude {
         fs::write(dir.join("stdout"), &reply.stdout).expect("write reply stdout");
         fs::write(dir.join("stderr"), &reply.stderr).expect("write reply stderr");
         fs::write(dir.join("exit_code"), reply.exit_code.to_string()).expect("write exit code");
+        if reply.hang {
+            fs::write(dir.join("hang"), "").expect("write hang marker");
+        }
         for (relative, contents) in &reply.config_dir_files {
             let path = dir.join("files").join(relative);
             fs::create_dir_all(path.parent().expect("has parent")).expect("create reply files");
@@ -509,7 +535,12 @@ impl StubClaude {
         let Ok(entries) = fs::read_dir(&calls_dir) else {
             return Vec::new();
         };
-        let mut dirs: Vec<PathBuf> = entries.map(|e| e.expect("readable").path()).collect();
+        let mut dirs: Vec<PathBuf> = entries
+            .map(|e| e.expect("readable").path())
+            // The pid is recorded last: a call without one is still being
+            // recorded by a stub running right now.
+            .filter(|dir| dir.join("pid").is_file())
+            .collect();
         dirs.sort();
         dirs.iter()
             .map(|dir| {
@@ -533,6 +564,9 @@ impl StubClaude {
                     args: split(read("args")),
                     env,
                     stdin: String::from_utf8_lossy(&read("stdin")).into_owned(),
+                    pid: String::from_utf8_lossy(&read("pid"))
+                        .parse()
+                        .expect("the stub records its pid"),
                 }
             })
             .collect()

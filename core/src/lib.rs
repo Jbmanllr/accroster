@@ -6,21 +6,26 @@
 //! and [`env`] for the boundary between the core and the rest of the Mac.
 
 mod backups;
+mod cli_switcher;
 mod core;
 pub mod driver;
 pub mod env;
 pub mod interface;
 mod logging;
+mod profiles;
+mod runner;
 mod settings;
 mod storage;
+mod usage;
 
 pub use crate::core::{Core, LaunchError};
 pub use env::{
-    Clock, Environment, OsFacts, ProcessFacts, ProcessSpawner, SpawnOutput, SpawnRequest,
-    SystemClock, SystemOsFacts, SystemSpawner,
+    Clock, Environment, OsFacts, ProcessFacts, ProcessSpawner, RunningProcess, SpawnOutput,
+    SpawnRequest, SystemClock, SystemOsFacts, SystemSpawner,
 };
 pub use interface::{
-    AboutView, Command, Effect, Event, MenuBarView, MenuItem, MenuView, SettingsView, View,
+    AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
+    SettingsView, View,
 };
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

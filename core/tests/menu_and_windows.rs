@@ -1,4 +1,4 @@
-//! The minimal menu (Settings…, About, Quit), the Settings window and About.
+//! The minimal menu (Add Profile…, Settings…, About, Quit), the Settings window and About.
 //!
 //! This file is also the worked example of a fake-Mac test: set up the Mac,
 //! launch the core, click through the view model, and assert on what the
@@ -38,7 +38,7 @@ fn titles(core: &accroster_core::Core) -> Vec<String> {
 }
 
 #[test]
-fn the_menu_offers_settings_about_and_quit_and_each_does_what_it_says() {
+fn the_menu_offers_add_profile_settings_about_and_quit() {
     let mac = FakeMac::new();
     mac.with_claude_home(&FixtureLogin::perso());
     mac.write_zshrc("export PATH=\"$HOME/.local/bin:$PATH\"\n");
@@ -46,7 +46,10 @@ fn the_menu_offers_settings_about_and_quit_and_each_does_what_it_says() {
 
     let mut core = mac.launch();
 
-    assert_eq!(titles(&core), ["Settings…", "About", "Quit"]);
+    assert_eq!(
+        titles(&core),
+        ["Add Profile…", "Settings…", "About", "Quit"]
+    );
     assert_eq!(click(&mut core, "Settings…"), [Effect::ShowSettings]);
     assert_eq!(click(&mut core, "About"), [Effect::ShowAbout]);
     assert_eq!(click(&mut core, "Quit"), [Effect::Terminate]);

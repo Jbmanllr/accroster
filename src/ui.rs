@@ -7,21 +7,27 @@
 use std::cell::{OnceCell, RefCell};
 
 use accroster_core::driver::{self, CoreHandle, Update};
-use accroster_core::{Command, Core, Effect, MenuItem, SettingsView, View};
+use accroster_core::{Command, Core, Effect, LimitBar, MenuItem, ProfileRow, SettingsView, View};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
-    NSAboutPanelOptionCredits, NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOff,
-    NSControlStateValueOn, NSFont, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSTextField,
-    NSVariableStatusItemLength, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSAboutPanelOptionCredits, NSApplication, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
+    NSControlSize, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontWeightRegular,
+    NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle,
+    NSMenu, NSMenuItem, NSResponder, NSStackView, NSStatusBar, NSStatusItem, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-    NSURL, ns_string,
+    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString, NSURL, ns_string,
 };
+
+/// Width of a Profile row in the menu.
+const ROW_WIDTH: f64 = 300.0;
 
 thread_local! {
     /// The one [`Ui`], reachable from main-queue blocks.
@@ -49,8 +55,8 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
 pub struct Ivars {
     core: OnceCell<CoreHandle>,
     status_item: Retained<NSStatusItem>,
-    /// The latest view, to map clicks back to the commands it attached.
-    view: RefCell<Option<View>>,
+    /// The commands of the menu's clickable items (submenus included), by tag.
+    actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
 }
 
@@ -71,15 +77,12 @@ define_class!(
     unsafe impl NSObjectProtocol for Ui {}
 
     impl Ui {
-        /// A menu item was clicked; its tag is its index in the view's menu.
+        /// A menu item was clicked; its tag indexes the menu's commands.
         #[unsafe(method(menuItemClicked:))]
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
-            let command = self.ivars().view.borrow().as_ref().and_then(|view| {
-                match view.menu.items.get(usize::try_from(sender.tag()).ok()?)? {
-                    MenuItem::Action { command, .. } => Some(command.clone()),
-                    _ => None,
-                }
-            });
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().actions.borrow().get(tag).cloned());
             if let Some(command) = command {
                 self.send(command);
             }
@@ -104,7 +107,7 @@ impl Ui {
         let this = Ui::alloc(mtm).set_ivars(Ivars {
             core: OnceCell::new(),
             status_item,
-            view: RefCell::new(None),
+            actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
         });
         unsafe { msg_send![super(this), init] }
@@ -123,7 +126,6 @@ impl Ui {
     /// Renders the update's view, then performs its effects.
     fn apply(&self, update: Update) {
         self.render(&update.view);
-        *self.ivars().view.borrow_mut() = Some(update.view.clone());
         for effect in update.effects {
             self.perform(effect, &update.view);
         }
@@ -135,31 +137,44 @@ impl Ui {
         if let Some(button) = item.button(mtm) {
             button.setTitle(&NSString::from_str(&view.menu_bar.label));
         }
-        item.setMenu(Some(&self.build_menu(view)));
+        let mut actions = Vec::new();
+        item.setMenu(Some(&self.build_menu(&view.menu.items, &mut actions)));
+        *self.ivars().actions.borrow_mut() = actions;
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
         }
     }
 
-    fn build_menu(&self, view: &View) -> Retained<NSMenu> {
+    /// Builds a menu from `items`, recording each clickable item's command in
+    /// `actions` under the tag it gets.
+    fn build_menu(&self, items: &[MenuItem], actions: &mut Vec<Command>) -> Retained<NSMenu> {
         let mtm = self.mtm();
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
-        for (index, item) in view.menu.items.iter().enumerate() {
+        for item in items {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
-                MenuItem::Warning(text) => {
-                    let row = menu_item(mtm, &format!("⚠︎ {text}"));
-                    row.setEnabled(false);
-                    row
-                }
-                MenuItem::Action { title, .. } => {
+                MenuItem::Warning(text) => disabled_item(mtm, &format!("⚠︎ {text}")),
+                MenuItem::Detail(text) => disabled_item(mtm, text),
+                MenuItem::Action { title, command } => {
                     let row = menu_item(mtm, title);
                     unsafe {
                         row.setAction(Some(sel!(menuItemClicked:)));
                         row.setTarget(Some(self));
                     }
-                    row.setTag(index as isize);
+                    row.setTag(actions.len() as isize);
+                    actions.push(command.clone());
+                    row
+                }
+                MenuItem::Profile(profile) => {
+                    let row = menu_item(mtm, &profile.title);
+                    row.setView(Some(&RowView::wrap(
+                        mtm,
+                        &profile_row_content(mtm, profile),
+                    )));
+                    if !profile.submenu.is_empty() {
+                        row.setSubmenu(Some(&self.build_menu(&profile.submenu, actions)));
+                    }
                     row
                 }
             };
@@ -267,6 +282,169 @@ impl Ui {
             verbose_logging_note,
         }
     }
+}
+
+define_class!(
+    /// A custom-view menu row. Custom views get no highlight from NSMenu, so
+    /// it draws its own when its item is highlighted (hovered).
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AccRosterRowView"]
+    struct RowView;
+
+    impl RowView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            if self.enclosingMenuItem().is_some_and(|item| item.isHighlighted()) {
+                let bounds = self.bounds();
+                let inset = NSRect::new(
+                    NSPoint::new(bounds.origin.x + 5.0, bounds.origin.y + 1.0),
+                    NSSize::new(bounds.size.width - 10.0, bounds.size.height - 2.0),
+                );
+                NSColor::controlAccentColor().colorWithAlphaComponent(0.18).set();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset, 5.0, 5.0).fill();
+            }
+        }
+    }
+);
+
+impl RowView {
+    /// A row of [`ROW_WIDTH`] holding `content`, as tall as it needs.
+    fn wrap(mtm: MainThreadMarker, content: &NSView) -> Retained<RowView> {
+        content.setTranslatesAutoresizingMaskIntoConstraints(false);
+        content
+            .widthAnchor()
+            .constraintEqualToConstant(ROW_WIDTH)
+            .setActive(true);
+        let height = content.fittingSize().height;
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(ROW_WIDTH, height));
+        let this = RowView::alloc(mtm).set_ivars(());
+        let this: Retained<RowView> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.addSubview(content);
+        for (a, b) in [
+            (content.leadingAnchor(), this.leadingAnchor()),
+            (content.trailingAnchor(), this.trailingAnchor()),
+        ] {
+            a.constraintEqualToAnchor(&b).setActive(true);
+        }
+        content
+            .topAnchor()
+            .constraintEqualToAnchor(&this.topAnchor())
+            .setActive(true);
+        content
+            .bottomAnchor()
+            .constraintEqualToAnchor(&this.bottomAnchor())
+            .setActive(true);
+        this
+    }
+}
+
+/// A Profile row: the name and a submenu arrow, one bar per limit, the note.
+fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSView> {
+    let name = label(mtm, &row.title, NSFont::boldSystemFontOfSize(13.0), false);
+    let filler = NSView::new(mtm);
+    filler.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
+    let arrow = label(mtm, "›", NSFont::systemFontOfSize(13.0), true);
+    let mut lines: Vec<Retained<NSView>> =
+        vec![stack(mtm, false, 5.0, &[&name, &filler, &arrow]).into_super()];
+    lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    if let Some(note) = &row.note {
+        lines.push(
+            label(mtm, note, NSFont::systemFontOfSize(10.0), true)
+                .into_super()
+                .into_super(),
+        );
+    }
+    let refs: Vec<&NSView> = lines.iter().map(|view| &**view).collect();
+    let body = stack(mtm, true, 3.0, &refs);
+    body.setEdgeInsets(NSEdgeInsets {
+        top: 5.0,
+        left: 16.0,
+        bottom: 5.0,
+        right: 14.0,
+    });
+    // Every line as wide as the row's content area.
+    for line in body.arrangedSubviews().iter() {
+        line.widthAnchor()
+            .constraintEqualToAnchor_constant(&body.widthAnchor(), -30.0)
+            .setActive(true);
+    }
+    body.into_super()
+}
+
+/// `Session ▓▓▓░░ 62%`: an `NSLevelIndicator`, continuous capacity, warning at
+/// 70 and critical at 90.
+fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
+    let regular =
+        || unsafe { NSFont::monospacedDigitSystemFontOfSize_weight(11.0, NSFontWeightRegular) };
+    let name = label(mtm, &bar.label, regular(), true);
+    fixed_width(&name, 60.0);
+    let level = NSLevelIndicator::new(mtm);
+    level.setLevelIndicatorStyle(NSLevelIndicatorStyle::ContinuousCapacity);
+    level.setMinValue(0.0);
+    level.setMaxValue(100.0);
+    level.setWarningValue(70.0);
+    level.setCriticalValue(90.0);
+    level.setDoubleValue(f64::from(bar.percent));
+    level.setControlSize(NSControlSize::Small);
+    fixed_width(&level, 150.0);
+    level
+        .heightAnchor()
+        .constraintEqualToConstant(10.0)
+        .setActive(true);
+    let percent = label(mtm, &format!("{}%", bar.percent), regular(), false);
+    stack(mtm, false, 6.0, &[&name, &level, &percent]).into_super()
+}
+
+fn label(
+    mtm: MainThreadMarker,
+    text: &str,
+    font: Retained<NSFont>,
+    secondary: bool,
+) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setFont(Some(&font));
+    if secondary {
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    }
+    label
+}
+
+fn fixed_width(view: &NSView, width: f64) {
+    view.setTranslatesAutoresizingMaskIntoConstraints(false);
+    view.widthAnchor()
+        .constraintEqualToConstant(width)
+        .setActive(true);
+}
+
+fn stack(
+    mtm: MainThreadMarker,
+    vertical: bool,
+    spacing: f64,
+    views: &[&NSView],
+) -> Retained<NSStackView> {
+    let stack = NSStackView::new(mtm);
+    stack.setOrientation(if vertical {
+        NSUserInterfaceLayoutOrientation::Vertical
+    } else {
+        NSUserInterfaceLayoutOrientation::Horizontal
+    });
+    stack.setAlignment(if vertical {
+        NSLayoutAttribute::Leading
+    } else {
+        NSLayoutAttribute::CenterY
+    });
+    stack.setSpacing(spacing);
+    for view in views {
+        stack.addArrangedSubview(view);
+    }
+    stack
+}
+
+fn disabled_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
+    let item = menu_item(mtm, title);
+    item.setEnabled(false);
+    item
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
