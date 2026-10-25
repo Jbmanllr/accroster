@@ -37,9 +37,9 @@ use objc2_app_kit::{
     NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSDistributedNotificationCenter, NSEdgeInsets,
-    NSIndexSet, NSInteger, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSBundle, NSDictionary, NSDistributedNotificationCenter,
+    NSEdgeInsets, NSFileManager, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObjectProtocol,
+    NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -151,6 +151,8 @@ struct SettingsWindow {
     hidden: Retained<NSButton>,
     thresholds: Retained<NSTextField>,
     reset_notification: Retained<NSButton>,
+    retry_uninstall: Retained<NSButton>,
+    uninstall_note: Retained<NSTextField>,
 }
 
 define_class!(
@@ -319,6 +321,17 @@ define_class!(
                 SidebarSyncMode::Manual
             };
             self.send(Command::SetSidebarSync(mode));
+        }
+
+        #[unsafe(method(uninstallClicked:))]
+        fn uninstall_clicked(&self, _sender: &NSButton) {
+            self.send(Command::AskUninstall);
+        }
+
+        /// Retry after a stopped uninstall (already confirmed once).
+        #[unsafe(method(retryUninstallClicked:))]
+        fn retry_uninstall_clicked(&self, _sender: &NSButton) {
+            self.send(Command::Uninstall);
         }
 
         #[unsafe(method(syncNowClicked:))]
@@ -881,6 +894,28 @@ impl Ui {
                 command,
             } => notifications::post(&title, &body, Some((&action, command))),
             Effect::Terminate => app.terminate(None),
+            Effect::ConfirmUninstall {
+                title,
+                message,
+                confirm,
+            } => {
+                let alert = NSAlert::new(mtm);
+                alert.setAlertStyle(NSAlertStyle::Warning);
+                alert.setMessageText(&NSString::from_str(&title));
+                alert.setInformativeText(&NSString::from_str(&message));
+                alert
+                    .addButtonWithTitle(ns_string!("Uninstall"))
+                    .setHasDestructiveAction(true);
+                alert.addButtonWithTitle(ns_string!("Cancel"));
+                app.activate();
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.send(confirm);
+                }
+            }
+            Effect::TrashAppAndQuit => {
+                trash_app(mtm);
+                app.terminate(None);
+            }
             Effect::AskNickname {
                 name,
                 current,
@@ -1270,7 +1305,7 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 488.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 552.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1293,7 +1328,7 @@ impl Ui {
                 mtm,
             )
         };
-        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 456.0));
+        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 520.0));
         content.addSubview(&sidebar_sync);
 
         let sidebar_sync_automatic = unsafe {
@@ -1304,7 +1339,7 @@ impl Ui {
                 mtm,
             )
         };
-        sidebar_sync_automatic.setFrameOrigin(NSPoint::new(34.0, 434.0));
+        sidebar_sync_automatic.setFrameOrigin(NSPoint::new(34.0, 498.0));
         content.addSubview(&sidebar_sync_automatic);
 
         let sync_now = unsafe {
@@ -1315,7 +1350,7 @@ impl Ui {
                 mtm,
             )
         };
-        sync_now.setFrameOrigin(NSPoint::new(34.0, 400.0));
+        sync_now.setFrameOrigin(NSPoint::new(34.0, 464.0));
         content.addSubview(&sync_now);
 
         let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
@@ -1323,19 +1358,19 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         sidebar_sync_note.setFrame(NSRect::new(
-            NSPoint::new(140.0, 396.0),
+            NSPoint::new(140.0, 460.0),
             NSSize::new(260.0, 34.0),
         ));
         content.addSubview(&sidebar_sync_note);
 
         let thresholds_label =
             NSTextField::labelWithString(ns_string!("Notify when a limit reaches (%):"), mtm);
-        thresholds_label.setFrameOrigin(NSPoint::new(20.0, 370.0));
+        thresholds_label.setFrameOrigin(NSPoint::new(20.0, 434.0));
         thresholds_label.sizeToFit();
         content.addSubview(&thresholds_label);
         let thresholds = NSTextField::textFieldWithString(ns_string!(""), mtm);
         thresholds.setFrame(NSRect::new(
-            NSPoint::new(240.0, 367.0),
+            NSPoint::new(240.0, 431.0),
             NSSize::new(80.0, 22.0),
         ));
         unsafe {
@@ -1352,7 +1387,7 @@ impl Ui {
                 mtm,
             )
         };
-        reset_notification.setFrameOrigin(NSPoint::new(20.0, 338.0));
+        reset_notification.setFrameOrigin(NSPoint::new(20.0, 402.0));
         content.addSubview(&reset_notification);
 
         let cli_switching = unsafe {
@@ -1363,7 +1398,7 @@ impl Ui {
                 mtm,
             )
         };
-        cli_switching.setFrameOrigin(NSPoint::new(20.0, 302.0));
+        cli_switching.setFrameOrigin(NSPoint::new(20.0, 366.0));
         content.addSubview(&cli_switching);
 
         let cli_switching_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
@@ -1372,7 +1407,7 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         cli_switching_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 196.0),
+            NSPoint::new(40.0, 260.0),
             NSSize::new(360.0, 102.0),
         ));
         content.addSubview(&cli_switching_note);
@@ -1385,7 +1420,7 @@ impl Ui {
                 mtm,
             )
         };
-        launch_at_login.setFrameOrigin(NSPoint::new(20.0, 162.0));
+        launch_at_login.setFrameOrigin(NSPoint::new(20.0, 226.0));
         content.addSubview(&launch_at_login);
 
         let launch_at_login_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
@@ -1393,7 +1428,7 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         launch_at_login_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 126.0),
+            NSPoint::new(40.0, 190.0),
             NSSize::new(360.0, 32.0),
         ));
         content.addSubview(&launch_at_login_note);
@@ -1406,7 +1441,7 @@ impl Ui {
                 mtm,
             )
         };
-        verbose_logging.setFrameOrigin(NSPoint::new(20.0, 98.0));
+        verbose_logging.setFrameOrigin(NSPoint::new(20.0, 162.0));
         content.addSubview(&verbose_logging);
 
         let verbose_logging_note = NSTextField::labelWithString(ns_string!(""), mtm);
@@ -1414,7 +1449,7 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         verbose_logging_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 76.0),
+            NSPoint::new(40.0, 140.0),
             NSSize::new(320.0, 18.0),
         ));
         content.addSubview(&verbose_logging_note);
@@ -1427,7 +1462,7 @@ impl Ui {
                 mtm,
             )
         };
-        reveal.setFrameOrigin(NSPoint::new(14.0, 24.0));
+        reveal.setFrameOrigin(NSPoint::new(14.0, 88.0));
         content.addSubview(&reveal);
 
         let hidden = unsafe {
@@ -1438,8 +1473,40 @@ impl Ui {
                 mtm,
             )
         };
-        hidden.setFrameOrigin(NSPoint::new(230.0, 24.0));
+        hidden.setFrameOrigin(NSPoint::new(230.0, 88.0));
         content.addSubview(&hidden);
+
+        let uninstall = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Uninstall…"),
+                Some(self),
+                Some(sel!(uninstallClicked:)),
+                mtm,
+            )
+        };
+        uninstall.setFrameOrigin(NSPoint::new(14.0, 50.0));
+        content.addSubview(&uninstall);
+
+        let retry_uninstall = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Retry"),
+                Some(self),
+                Some(sel!(retryUninstallClicked:)),
+                mtm,
+            )
+        };
+        retry_uninstall.setFrameOrigin(NSPoint::new(120.0, 50.0));
+        content.addSubview(&retry_uninstall);
+
+        let uninstall_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        uninstall_note.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        uninstall_note.setFrame(NSRect::new(
+            NSPoint::new(20.0, 8.0),
+            NSSize::new(380.0, 40.0),
+        ));
+        content.addSubview(&uninstall_note);
 
         SettingsWindow {
             window,
@@ -1456,6 +1523,8 @@ impl Ui {
             hidden,
             thresholds,
             reset_notification,
+            retry_uninstall,
+            uninstall_note,
         }
     }
 }
@@ -2149,7 +2218,36 @@ fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
     }
 }
 
+/// Moves the running app's bundle to the Trash (the uninstall's last step).
+/// Outside a bundle (`cargo run`) there is nothing to trash. If it fails,
+/// says so: everything else is already removed.
+fn trash_app(mtm: MainThreadMarker) {
+    let bundle = NSBundle::mainBundle();
+    if !bundle.bundlePath().to_string().ends_with(".app") {
+        return;
+    }
+    let url = bundle.bundleURL();
+    if let Err(error) =
+        NSFileManager::defaultManager().trashItemAtURL_resultingItemURL_error(&url, None)
+    {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(ns_string!("Move AccRoster to the Trash yourself"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Everything else is removed, but the app couldn't be moved to the Trash: {}",
+            error.localizedDescription()
+        )));
+        alert.runModal();
+    }
+}
+
 fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
+    let uninstall = &view.uninstall;
+    settings
+        .retry_uninstall
+        .setHidden(uninstall.retry.is_none());
+    settings.uninstall_note.setStringValue(&NSString::from_str(
+        uninstall.note.as_deref().unwrap_or_default(),
+    ));
     let sync = &view.sidebar_sync;
     settings
         .sidebar_sync

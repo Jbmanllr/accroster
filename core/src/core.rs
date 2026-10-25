@@ -17,7 +17,7 @@ use crate::interface::{
     AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
     Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
     NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, SidebarSyncMode,
-    SidebarSyncView, View,
+    SidebarSyncView, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, LimitsView, Watched};
@@ -30,6 +30,7 @@ use crate::sessions::{SessionFacts, SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
 use crate::sidebar_sync::{self, Run};
 use crate::storage::{self, AppPaths};
+use crate::uninstaller;
 
 /// The tagline, shown in About and the README.
 pub const TAGLINE: &str =
@@ -105,6 +106,10 @@ pub struct Core {
     sync_note: Option<String>,
     /// The sidebars' watch while Sidebar sync is on.
     sidebar_watch: sidebar_sync::Watch,
+    /// Why the last uninstall stopped, for Settings (offers Retry).
+    uninstall_note: Option<String>,
+    /// The app's folder is gone: nothing is read, written or started again.
+    uninstalled: bool,
 }
 
 /// What the last link check found in one Profile folder.
@@ -160,6 +165,8 @@ impl Core {
             sessions: SessionIndex::default(),
             sync_note: None,
             sidebar_watch: sidebar_sync::Watch::default(),
+            uninstall_note: None,
+            uninstalled: false,
         };
         core.log(
             Level::Info,
@@ -235,6 +242,9 @@ impl Core {
     /// while a usage read runs, by the time the next read is due, and at most
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
+        if self.uninstalled {
+            return crate::driver::TICK_INTERVAL;
+        }
         if self.sessions.busy() {
             // The next batch of the Session index, as soon as input allows.
             return Duration::ZERO;
@@ -256,6 +266,9 @@ impl Core {
     /// launch). The driver hands them to the UI with the first view;
     /// [`Core::command`] and [`Core::event`] include them in what they return.
     pub fn take_effects(&mut self) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
         let mut effects = self.safety.take_effects();
         let sync_on = self.settings.sidebar_sync != SidebarSyncMode::Off;
         effects.extend(self.sidebar_watch.reconcile(&self.env, sync_on));
@@ -264,6 +277,13 @@ impl Core {
 
     /// Handles a user intent.
     pub fn command(&mut self, command: Command) -> Vec<Effect> {
+        if self.uninstalled {
+            // Only quitting is left; the app's folder must not reappear.
+            return match command {
+                Command::Quit => vec![Effect::Terminate],
+                _ => Vec::new(),
+            };
+        }
         self.log(
             Level::Debug,
             "command",
@@ -457,6 +477,12 @@ impl Core {
                 self.set_sidebar_sync(mode);
                 Vec::new()
             }
+            Command::AskUninstall => vec![Effect::ConfirmUninstall {
+                title: uninstaller::TITLE.into(),
+                message: uninstaller::confirmation(self.profiles.folders().len()),
+                confirm: Command::Uninstall,
+            }],
+            Command::Uninstall => self.uninstall(),
             Command::SyncSidebarNow => {
                 self.sync_sidebar();
                 Vec::new()
@@ -512,6 +538,9 @@ impl Core {
 
     /// Handles something that happened outside the core.
     pub fn event(&mut self, event: Event) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
         let mut effects = match event {
             Event::Tick => {
                 if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
@@ -870,6 +899,10 @@ impl Core {
                 notifications: NotificationsView {
                     thresholds: self.settings.thresholds.values().to_vec(),
                     reset_notification: self.settings.reset_notification,
+                },
+                uninstall: UninstallView {
+                    note: self.uninstall_note.clone(),
+                    retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
                 },
             },
             about: AboutView {
@@ -1744,6 +1777,108 @@ impl Core {
             self.notifier.forget(&ctx, id);
             self.forget_profile_settings(id);
         }
+    }
+
+    /// Runs the uninstall's steps in order (see [`uninstaller`]), each
+    /// skipped when already done. Stops, with a note and Retry in Settings,
+    /// where going on could break `claude` or orphan a login.
+    fn uninstall(&mut self) -> Vec<Effect> {
+        self.log(Level::Info, "uninstall started", &[]);
+        self.uninstall_note = None;
+        let mut left_to_user = Vec::new();
+        if self.profiles.signing_in() {
+            let (profiles, ctx) = self.profiles();
+            profiles.cancel(&ctx);
+        }
+        if self.desktop.waiting() {
+            let (desktop, ctx) = self.desktop();
+            desktop.cancel(&ctx);
+        }
+
+        // 1. Unhook the CLI while every Profile folder still exists.
+        self.set_cli_switching(false);
+        if cli_switcher::is_on(&self.paths) {
+            let why = self.cli_note.take().unwrap_or_default();
+            return self.stop_uninstall(format!(
+                "{why}\nUninstall stopped before signing anything out. Retry once that is fixed."
+            ));
+        }
+        left_to_user.extend(self.cli_note.take());
+
+        // 2. Remove each Profile: sign out, then delete.
+        let ids: Vec<String> = self
+            .profiles
+            .folders()
+            .into_iter()
+            .map(|(id, _)| id.to_owned())
+            .collect();
+        for id in &ids {
+            self.remove_profile(id);
+        }
+        let mut kept: Vec<String> = self
+            .profiles
+            .folders()
+            .into_iter()
+            .filter_map(|(id, _)| self.profiles.name(id))
+            .collect();
+        let unlisted = self.profiles.remove_unlisted(&self.context());
+        if unlisted > 0 {
+            kept.push(format!("{unlisted} unlisted sign-in folder(s)"));
+        }
+        if !kept.is_empty() {
+            return self.stop_uninstall(format!(
+                "Couldn't sign out {} · kept so the login can still be revoked. CLI switching is already off. Check your connection, then Retry.",
+                kept.join(", ")
+            ));
+        }
+
+        // 3. Unregister launch at login.
+        match self.env.login_item.status() {
+            LoginItemStatus::NotRegistered | LoginItemStatus::NotFound => {}
+            LoginItemStatus::Enabled | LoginItemStatus::RequiresApproval => {
+                if let Err(error) = self.env.login_item.unregister() {
+                    self.log(
+                        Level::Warn,
+                        "login item not unregistered",
+                        &[("error", Field::Text(&error))],
+                    );
+                    left_to_user.push(
+                        "Launch at login couldn't be turned off: remove AccRoster in System Settings → Login Items.".into(),
+                    );
+                }
+            }
+        }
+
+        // 4. Delete the app's folder, log included.
+        self.log(Level::Info, "uninstall deleting app folder", &[]);
+        if let Err(error) = uninstaller::delete_app_folder(&self.paths) {
+            return self.stop_uninstall(format!(
+                "Every Profile is signed out and removed, but AccRoster's folder couldn't be deleted ({error}). Retry, or delete it yourself: {}",
+                self.paths.root().display()
+            ));
+        }
+        self.uninstalled = true;
+
+        // 5. The UI moves the app to the Trash and quits.
+        let mut effects = vec![
+            Effect::StopWatchingSessionFiles,
+            Effect::StopWatchingSidebarFolders,
+        ];
+        if !left_to_user.is_empty() {
+            effects.push(Effect::Notify {
+                title: "AccRoster uninstalled · one thing left to do".into(),
+                body: left_to_user.join("\n"),
+            });
+        }
+        effects.push(Effect::TrashAppAndQuit);
+        effects
+    }
+
+    /// Ends an uninstall early: Settings shows `note` and Retry.
+    fn stop_uninstall(&mut self, note: String) -> Vec<Effect> {
+        self.log(Level::Warn, "uninstall stopped", &[]);
+        self.uninstall_note = Some(note);
+        vec![Effect::ShowSettings]
     }
 
     /// Points new CLI runs at Profile `next`, or at Default (`~/.claude`,

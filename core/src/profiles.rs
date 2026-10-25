@@ -760,6 +760,49 @@ impl ProfileRegistry {
         true
     }
 
+    /// A Profile's name for notices: `email · Organization`, or
+    /// "Signed-out Profile".
+    pub(crate) fn name(&self, id: &str) -> Option<String> {
+        self.profile(id).map(Profile::name)
+    }
+
+    /// Signs out, then deletes, every folder under `profiles/` that isn't a
+    /// Profile (a kept duplicate sign-in); a folder holding no sign-in is
+    /// just deleted. A folder whose sign-out fails is kept so its login can
+    /// still be revoked. Returns how many were kept.
+    pub(crate) fn remove_unlisted(&self, ctx: &Context) -> usize {
+        let unlisted: Vec<(String, PathBuf)> = fs::read_dir(ctx.paths.profiles())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+            .filter(|(id, _)| !self.has(id))
+            .collect();
+        let mut kept = 0;
+        for (id, config_dir) in unlisted {
+            let signed_out = Identity::read(&config_dir).is_none()
+                || matches!(ctx.runner().sign_out(&config_dir), Ok(true));
+            if !signed_out {
+                ctx.log(
+                    Level::Warn,
+                    "sign-out failed, unlisted folder kept",
+                    &[("profile", Field::Profile(&id))],
+                );
+                kept += 1;
+            } else {
+                // Signed out: a folder left here goes with the app's folder.
+                remove_folder(ctx, &id, &config_dir);
+            }
+        }
+        kept
+    }
+
     fn profile(&self, id: &str) -> Option<&Profile> {
         self.profiles.iter().find(|profile| profile.id == id)
     }

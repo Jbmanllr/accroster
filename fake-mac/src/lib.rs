@@ -324,6 +324,56 @@ impl FakeMac {
             .output()
             .expect("run the claude shim")
     }
+
+    /// Runs `claude` the way a terminal opened while CLI switching was on
+    /// does: `sh` resolves it through a `PATH` that still starts with the
+    /// app's `bin/` (whether or not it still exists), then the stub `claude`,
+    /// then the system folders.
+    pub fn run_claude_in_open_terminal(&self, args: &[&str]) -> std::process::Output {
+        let path = std::env::join_paths([
+            AppPaths::new(&self.home).bin(),
+            self.claude.bin_dir(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("PATH entries contain no colon");
+        self.run_in_shell("/bin/sh", "claude \"$@\"", &path, args)
+    }
+
+    /// Runs `claude` the way a terminal opened now does: `zsh` sources
+    /// `~/.zshrc` (if any) over a `PATH` of the stub `claude` and the system
+    /// folders, then resolves `claude`.
+    pub fn run_claude_in_new_terminal(&self, args: &[&str]) -> std::process::Output {
+        let path = std::env::join_paths([
+            self.claude.bin_dir(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("PATH entries contain no colon");
+        let script = "[ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"; claude \"$@\"";
+        self.run_in_shell("/bin/zsh", script, &path, args)
+    }
+
+    fn run_in_shell(
+        &self,
+        shell: &str,
+        script: &str,
+        path: &std::ffi::OsStr,
+        args: &[&str],
+    ) -> std::process::Output {
+        std::process::Command::new(shell)
+            .arg("-f")
+            .arg("-c")
+            .arg(script)
+            .arg("claude")
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run a shell")
+    }
 }
 
 /// A Login acting within an Organization, as Claude Code records it in
@@ -759,11 +809,21 @@ impl OsFacts for FakeOs {
 
 // ----- Fake login item -------------------------------------------------------------
 
-#[derive(Debug)]
 struct FakeLoginItemState {
     status: LoginItemStatus,
     registrations: usize,
     refusal: Option<String>,
+    on_unregister: Option<Box<dyn FnMut() + Send>>,
+}
+
+impl std::fmt::Debug for FakeLoginItemState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeLoginItemState")
+            .field("status", &self.status)
+            .field("registrations", &self.registrations)
+            .field("refusal", &self.refusal)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The app's Login Items entry, behaving like `SMAppService.mainApp`: it
@@ -779,6 +839,7 @@ impl Default for FakeLoginItem {
             status: LoginItemStatus::NotRegistered,
             registrations: 0,
             refusal: None,
+            on_unregister: None,
         })))
     }
 }
@@ -798,6 +859,12 @@ impl FakeLoginItem {
     /// How many times the app asked to be registered.
     pub fn registrations(&self) -> usize {
         self.0.lock().unwrap().registrations
+    }
+
+    /// Runs `observe` each time the app asks to be unregistered, before the
+    /// entry changes: lets a test look at the Mac at that moment.
+    pub fn on_unregister(&self, observe: impl FnMut() + Send + 'static) {
+        self.0.lock().unwrap().on_unregister = Some(Box::new(observe));
     }
 
     /// Makes every later `register` fail with this reason.
@@ -828,6 +895,11 @@ impl LoginItem for FakeLoginItem {
     }
 
     fn unregister(&self) -> Result<(), String> {
+        let observe = self.0.lock().unwrap().on_unregister.take();
+        if let Some(mut observe) = observe {
+            observe();
+            self.0.lock().unwrap().on_unregister = Some(observe);
+        }
         let mut state = self.0.lock().unwrap();
         match state.status {
             LoginItemStatus::NotFound => Err("The app is not a valid login item.".into()),
