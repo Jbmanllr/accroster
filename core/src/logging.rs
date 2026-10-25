@@ -4,9 +4,9 @@
 //! Redaction is enforced by construction, then checked again per line:
 //!
 //! 1. A log line is a `&'static str` message plus typed [`Field`]s. Free text
-//!    from the outside world can only enter as [`Field::Text`]; Profiles,
-//!    project folders and paths each have their own field that renders them
-//!    safely (`<Profile 3f2a>`, `<project 9c1e2b4a>`, `~/…`).
+//!    from the outside world can only enter as [`Field::Text`]; Profiles and
+//!    paths each have their own field that renders them safely
+//!    (`<Profile 3f2a>`, `~/…` with project folders as `<project 9c1e2b4a>`).
 //! 2. Every finished line goes through [`scrub`]: the home folder becomes `~`,
 //!    emails become `<email>` and token-shaped strings become `<token>`.
 //!
@@ -52,17 +52,14 @@ impl Level {
 
 /// A value in a log line, rendered so it reveals nothing private.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Project and SessionId are for the Session tickets.
 pub(crate) enum Field<'a> {
     /// Outside text (an error message, a version string). Scrubbed.
     Text(&'a str),
     /// A path: the home folder is written `~`, and a folder under
-    /// `.claude/projects/` is hashed like [`Field::Project`].
+    /// `.claude/projects/` is hashed (`<project 9c1e2b4a>`).
     Path(&'a Path),
     /// A Profile id, written `<Profile 3f2a>`.
     Profile(&'a str),
-    /// A project folder name, written `<project 9c1e2b4a>`.
-    Project(&'a str),
     /// A Session id; allowed verbatim.
     SessionId(&'a str),
     /// A number: a count, an exit code, a percentage.
@@ -127,7 +124,6 @@ fn render(home: &Path, field: &Field<'_>) -> String {
         Field::Text(text) => format!("{text:?}"),
         Field::Path(path) => format!("{:?}", render_path(home, path)),
         Field::Profile(id) => format!("<Profile {}>", &short_hash(id)[..4]),
-        Field::Project(name) => format!("<project {}>", short_hash(name)),
         Field::SessionId(id) => id.to_owned(),
         Field::Number(n) => n.to_string(),
         Field::Word(word) => word.to_owned(),
@@ -245,15 +241,16 @@ fn rotate(path: &Path) -> std::io::Result<()> {
     fs::rename(path, numbered(1))
 }
 
-/// Installs a panic hook that writes the panic (redacted) to `app.log` before
-/// the process exits, then runs the previously installed hook.
+/// Installs a panic hook that writes the panic (redacted) to `app.log` and
+/// a one-line pointer to it on stderr before the process exits. It replaces
+/// the previous hook, which would print the raw payload to stderr (and so
+/// to Console).
 ///
 /// The app calls this once at startup with [`crate::Environment::home`]. It is
 /// process-wide, so the core never installs it itself.
 pub fn install_panic_hook(home: &Path) {
     let path = crate::AppPaths::new(home).app_log();
     let home = home.to_path_buf();
-    let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
             .payload()
@@ -265,20 +262,38 @@ pub fn install_panic_hook(home: &Path) {
             .location()
             .map(|location| format!("{}:{}", location.file(), location.line()))
             .unwrap_or_default();
+        let message = scrub_panic(&home, &payload);
         let line = format_line(
             &home,
             Timestamp::now(),
             Level::Error,
             "panic",
             &[
-                ("message", Field::Text(&payload)),
+                ("message", Field::Text(&message)),
                 ("at", Field::Text(&location)),
             ],
         );
         let _ = append_line(&path, &line);
-        previous(info);
+        eprintln!("AccRoster panicked at {location}; the details are in its log, redacted.");
     }));
 }
+
+/// A panic payload can carry anything the code was handling: quoted text
+/// (a title, a prompt) becomes `<text>` and paths become `<path>`, on top
+/// of [`scrub`].
+fn scrub_panic(home: &Path, payload: &str) -> String {
+    let text = scrub(home, payload);
+    let text = QUOTED.replace_all(&text, "<text>");
+    PATH.replace_all(&text, "<path>").into_owned()
+}
+
+/// `"…"`, `'…'`, `` `…` `` and curly-quoted text.
+static QUOTED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""[^"]*"|'[^']*'|`[^`]*`|“[^”]*”|‘[^’]*’"#).expect("valid quote pattern")
+});
+/// Anything with a slash in it: an absolute, `~/` or relative path.
+static PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\S*/\S*").expect("valid path pattern"));
 
 #[cfg(test)]
 mod tests {
@@ -307,16 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn project_folders_are_hashed_alone_and_inside_transcript_paths() {
-        let written = line(&[
-            ("project", Field::Project("secret-client")),
-            (
-                "transcript",
-                Field::Path(Path::new(
-                    "/Users/tester/.claude/projects/-Users-tester-secret-client/0b9c.jsonl",
-                )),
-            ),
-        ]);
+    fn project_folders_are_hashed_inside_transcript_paths() {
+        let written = line(&[(
+            "transcript",
+            Field::Path(Path::new(
+                "/Users/tester/.claude/projects/-Users-tester-secret-client/0b9c.jsonl",
+            )),
+        )]);
         assert!(!written.contains("secret-client"), "{written}");
         assert!(
             written.contains("transcript=\"~/.claude/projects/<project "),
