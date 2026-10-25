@@ -156,8 +156,18 @@ pub enum Event {
     /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
     /// the core reads the actual time from its [`crate::Clock`].
     Tick,
-    /// The status item's menu is opening.
+    /// The status item's menu is about to open.
     MenuOpened,
+    /// The Mac is going to sleep.
+    WillSleep,
+    /// The Mac woke from sleep.
+    DidWake,
+    /// The screen locked.
+    ScreenLocked,
+    /// The screen unlocked.
+    ScreenUnlocked,
+    /// The Mac gained (`true`) or lost (`false`) its network path.
+    NetworkChanged { online: bool },
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -328,10 +338,10 @@ pub struct ProfileRow {
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
-    /// A short line under the bars (for example "Couldn't read limits").
+    /// A short line under the bars (for example "as of 14:02").
     pub note: Option<String>,
-    /// Draw the bars and title dimmed: the reading is not current (for
-    /// example the Login expired).
+    /// Drawn dimmed: the reading is not current (stale, unreadable, or the
+    /// Login expired).
     pub dimmed: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
@@ -349,6 +359,9 @@ pub struct LimitBar {
     /// Utilization, whole percent (0–100, rounded down like Claude Code's
     /// `/usage`).
     pub percent: u32,
+    /// The limit's reset time has passed since the reading: drawn as
+    /// "Reset" at 0%.
+    pub reset: bool,
 }
 
 /// The Settings window.

@@ -29,7 +29,10 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
         rows[0].limits,
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
-    assert_eq!(details(&rows[0]), ["me@work.example · Work Inc · Max"]);
+    assert_eq!(
+        details(&rows[0]),
+        ["me@work.example · Work Inc · Max", "Limits as of 14:02"]
+    );
     assert!(rows[0].submenu.contains(&MenuItem::Action {
         title: "Limit resets → claude.ai".into(),
         command: Command::OpenLimitResets,

@@ -15,6 +15,7 @@ pub mod env;
 pub mod interface;
 mod limit_offers;
 mod logging;
+mod monitor;
 mod profiles;
 mod runner;
 mod sessions;

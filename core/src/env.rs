@@ -118,6 +118,9 @@ pub trait RunningProcess: Send {
     fn try_wait(&mut self) -> io::Result<Option<SpawnOutput>>;
     /// Kills the program (if still running) and waits for it to go.
     fn kill(&mut self) -> io::Result<SpawnOutput>;
+    /// Closes the program's stdin (EOF), for a program that should finish
+    /// once it has read its input.
+    fn close_stdin(&mut self);
 }
 
 /// The current time.
@@ -268,6 +271,10 @@ impl RunningProcess for SystemProcess {
         self.child.kill()?;
         let status = self.child.wait()?;
         Ok(self.finish(status))
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 }
 
