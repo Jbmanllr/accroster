@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::claude_json;
+use crate::claude_json::{self, LoginNames};
 use crate::desktop::{self, DesktopPaths};
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 
@@ -44,32 +44,38 @@ pub(crate) struct Evidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Login {
-    email: String,
-    organization_name: String,
+    names: LoginNames,
     /// When Claude Code last refreshed these names (`profileFetchedAt`), else
     /// when `~/.claude.json` was last written.
     as_of: Option<Timestamp>,
 }
 
 impl Evidence {
+    /// The names of the default CLI login (`~/.claude.json`'s
+    /// `oauthAccount`), when this pair is it: no other evidence carries
+    /// names.
+    pub fn default_login(&self) -> Option<&LoginNames> {
+        self.login.as_ref().map(|login| &login.names)
+    }
+
     /// The email to pass to the sign-in, when known.
     pub fn email(&self) -> Option<&str> {
         self.login
             .as_ref()
-            .map(|login| login.email.as_str())
+            .map(|login| login.names.email.as_str())
             .filter(|email| !email.is_empty())
     }
 
-    /// `email · Organization`, else "Unknown Login". A uuid appears only in
-    /// hover detail.
+    /// The Login's Profile name, else "Unknown Login". A uuid appears only
+    /// in hover detail.
     pub fn known_name(&self) -> String {
         match &self.login {
-            Some(login) => format!("{} · {}", login.email, login.organization_name),
+            Some(login) => login.names.name(),
             None => "Unknown Login".to_owned(),
         }
     }
 
-    /// The nickname, else `email · Organization`, else "Unknown Login".
+    /// The nickname, else the Profile name, else "Unknown Login".
     pub fn name(&self, nickname: Option<&str>) -> String {
         nickname.map_or_else(|| self.known_name(), str::to_owned)
     }
@@ -106,10 +112,12 @@ impl Evidence {
     pub fn row(&self, nickname: Option<&str>, tz: &TimeZone) -> DiscoveredRow {
         let name = self.name(nickname);
         let title = match (nickname, &self.login) {
-            (Some(_), Some(login)) => format!(
-                "Sign in to {name} ({} · {})…",
-                login.email, login.organization_name
-            ),
+            (Some(_), Some(login)) => {
+                format!(
+                    "Sign in to {name} ({})…",
+                    login.names.email_and_organization()
+                )
+            }
             _ => format!("Sign in to {name}…"),
         };
         let subtitle = self.evidence_line(tz);
@@ -257,8 +265,7 @@ fn cli_login(path: &Path) -> Option<(ProfileKey, Login)> {
     Some((
         account.key,
         Login {
-            email: account.email,
-            organization_name: account.organization_name,
+            names: account.names,
             as_of,
         },
     ))

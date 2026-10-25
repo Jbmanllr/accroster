@@ -16,6 +16,18 @@ _Avoid_: org, team, workspace
 One Login acting within one Organization: the unit the app lists, measures and switches to.
 _Avoid_: account, identity
 
+**Profile name**:
+How a Profile is called wherever it is listed: the person's full name and the Login's email, plus the Organization when it isn't the personal one or two Profiles would otherwise share a name; a nickname replaces it.
+_Avoid_: title, display name, `email · Organization`
+
+**Short label**:
+The few words that call a Profile where space is tight (the menu bar, the menu header): its nickname or the person's first name, lengthened only as far as needed to tell two Profiles apart.
+_Avoid_: short name, label (alone)
+
+**Default login**:
+The Login the CLI uses when CLI switching is off: the one the default `~/.claude` folder is signed in to.
+_Avoid_: Default (alone), home account
+
 **Active Profile**:
 The Profile a given client (the desktop app or the CLI) is currently signed in as; the two clients can differ.
 _Avoid_: current account

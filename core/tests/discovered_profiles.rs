@@ -102,7 +102,7 @@ fn a_sidebar_folder_with_entries_is_an_unknown_login_with_its_sessions() {
 }
 
 #[test]
-fn todays_cli_login_is_named_by_its_email_and_organization() {
+fn todays_cli_login_is_named_with_when_claude_code_recorded_it() {
     let mac = FakeMac::new();
     let mut claude_json = FixtureLogin::perso().claude_json();
     claude_json["oauthAccount"]["profileFetchedAt"] = json!(OCT_24);
@@ -113,10 +113,7 @@ fn todays_cli_login_is_named_by_its_email_and_organization() {
 
     let rows = discovered(&core);
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(
-        rows[0].title,
-        "Sign in to me@example.com · me@example.com's Organization…"
-    );
+    assert_eq!(rows[0].title, "Sign in to me@example.com…");
     assert_eq!(rows[0].subtitle, None);
     assert_eq!(
         details(&rows[0]),
@@ -147,7 +144,7 @@ fn one_pair_found_in_both_sources_is_one_row() {
     assert_eq!(
         titles(&core),
         [
-            "Sign in to me@example.com · me@example.com's Organization…",
+            "Sign in to me@example.com…",
             "Sign in to Unknown Login…",
             "Sign in to Unknown Login…",
         ]
@@ -208,10 +205,7 @@ fn signing_in_to_a_discovered_profile_passes_its_email_and_replaces_its_row() {
         ["auth", "login", "--claudeai", "--email", "me@example.com"]
     );
     assert!(discovered(&core).is_empty(), "{:?}", discovered(&core));
-    assert_eq!(
-        profile_titles(&core),
-        ["me@example.com · me@example.com's Organization"]
-    );
+    assert_eq!(profile_titles(&core), ["me@example.com"]);
     assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
 }
 
@@ -254,10 +248,7 @@ fn signing_in_as_another_account_keeps_it_and_leaves_the_discovered_profile() {
     );
     assert_eq!(
         titles(&core),
-        [
-            "Sign in to me@example.com · me@example.com's Organization…",
-            "Sign in to Unknown Login…",
-        ],
+        ["Sign in to me@example.com…", "Sign in to Unknown Login…",],
         "both Discovered Profiles stay greyed"
     );
     assert_eq!(
@@ -342,10 +333,7 @@ fn a_hidden_discovered_profile_is_remembered_and_restorable_from_settings() {
 
     click_in(&mut core, &unknown, "Hide");
 
-    assert_eq!(
-        titles(&core),
-        ["Sign in to me@example.com · me@example.com's Organization…"]
-    );
+    assert_eq!(titles(&core), ["Sign in to me@example.com…"]);
     drop(core);
     let mut core = mac.launch();
     assert_eq!(titles(&core).len(), 1, "Hide is remembered");
@@ -385,7 +373,7 @@ fn a_nickname_names_the_discovered_profile_and_persists() {
     else {
         panic!("{effects:?}");
     };
-    assert_eq!(name, "me@example.com · me@example.com's Organization");
+    assert_eq!(name, "me@example.com");
     assert_eq!(current, &None);
     core.command(Command::SetNickname {
         target: target.clone(),
@@ -402,10 +390,7 @@ fn a_nickname_names_the_discovered_profile_and_persists() {
         target: target.clone(),
         nickname: Some("  ".into()),
     });
-    assert_eq!(
-        titles(&core),
-        ["Sign in to me@example.com · me@example.com's Organization…"]
-    );
+    assert_eq!(titles(&core), ["Sign in to me@example.com…"]);
 }
 
 #[test]

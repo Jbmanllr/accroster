@@ -83,19 +83,23 @@ fn row<'a>(rows: &'a [ProfileRow], title: &str) -> &'a ProfileRow {
         .unwrap_or_else(|| panic!("a row titled {title}: {rows:?}"))
 }
 
-const PERSO: &str = "me@example.com · me@example.com's Organization";
+const PERSO: &str = "me@example.com";
 const WORK: &str = "me@work.example · Work Inc";
 
 #[test]
 fn the_desktop_badge_and_header_follow_the_account_and_the_folder_claude_writes() {
     let (mac, core) = mac_with_two_profiles();
-    assert_eq!(header(&core), None, "no desktop config, no Desktop part");
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: me@example.com (default login)"),
+        "no desktop config, no Desktop part"
+    );
 
     desktop_signed_in_as(&mac, &work());
     sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me · Work Inc")
+        Some("CLI: me@example.com (default login)    Desktop: me · Work Inc")
     );
     let rows = rows(&core);
     assert_eq!(row(&rows, WORK).badges, [Badge::Desktop]);
@@ -138,7 +142,7 @@ fn the_header_names_each_clients_active_profile_by_its_short_name() {
     sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: Work"),
+        Some("CLI: Perso (default login)    Desktop: Work"),
         "the CLI part shows with CLI switching off"
     );
 
@@ -174,7 +178,7 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
     sidebar_entry(&mac, &other_org, "b", "New", Duration::from_secs(10));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: another Profile"),
+        Some("CLI: me@example.com (default login)    Desktop: another Profile"),
         "the newest folder belongs to no Profile"
     );
     assert!(rows(&core).iter().all(|row| row.badges.is_empty()));
@@ -182,7 +186,7 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
     sidebar_entry(&mac, &work(), "c", "Newer", Duration::from_secs(1));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me · Work Inc")
+        Some("CLI: me@example.com (default login)    Desktop: me · Work Inc")
     );
 }
 
@@ -199,7 +203,7 @@ fn the_desktop_config_is_read_for_its_account_only_and_never_logged() {
     assert!(!view.contains("sk-ant"), "{view}");
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me · me@example.com's Organization")
+        Some("CLI: me@example.com (default login)    Desktop: me@example.com")
     );
 }
 
@@ -620,7 +624,7 @@ fn the_switch_is_confirmed_from_the_folder_claude_writes() {
     assert_eq!(warnings(&core), [format!("Claude now uses {WORK}")]);
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me · Work Inc")
+        Some("CLI: me@example.com (default login)    Desktop: me · Work Inc")
     );
     assert_eq!(row(&rows(&core), WORK).badges, [Badge::Desktop]);
 }

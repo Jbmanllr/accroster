@@ -13,8 +13,9 @@ use accroster_core::watcher::{self, FolderWatch};
 use crate::notifications;
 use accroster_core::{
     AllSessionsView, Badge, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect,
-    Event, LimitBar, MenuItem, ProfileRow, ProfileSettings, RunningDot, SafetyFeature,
-    SessionDetail, SessionFilter, SessionRow, SettingsView, SidebarGroup, SidebarSyncMode, View,
+    Event, LimitBar, MOST_HEADROOM, MenuItem, ProfileRow, ProfileSettings, RunningDot,
+    SafetyFeature, SessionDetail, SessionFilter, SessionRow, SettingsView, SidebarGroup,
+    SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -109,6 +110,8 @@ pub struct Ivars {
     pending_menu: RefCell<Option<Vec<MenuItem>>>,
     /// The items the status item's menu shows now.
     shown_menu: RefCell<Vec<MenuItem>>,
+    /// The width its custom rows were given.
+    shown_width: Cell<f64>,
     /// Settings > Hidden (n)…: each entry's title and Restore command, by tag.
     hidden: RefCell<Vec<(String, Command)>>,
     /// Settings > Profiles as last drawn, and its buttons' commands by tag.
@@ -492,6 +495,7 @@ impl Ui {
             menu_open: Cell::new(false),
             pending_menu: RefCell::new(None),
             shown_menu: RefCell::new(Vec::new()),
+            shown_width: Cell::new(ROW_WIDTH),
             hidden: RefCell::new(Vec::new()),
             profile_settings: RefCell::new(None),
             profile_commands: RefCell::new(Vec::new()),
@@ -616,6 +620,7 @@ impl Ui {
         self.ivars().status_item.setMenu(Some(&menu));
         *self.ivars().actions.borrow_mut() = actions;
         *self.ivars().shown_menu.borrow_mut() = items.to_vec();
+        self.ivars().shown_width.set(rows_width(self.mtm(), items));
     }
 
     /// Updates the open menu in place (a refreshed Limit reading, the
@@ -628,6 +633,10 @@ impl Ui {
         };
         let shown = self.ivars().shown_menu.borrow().clone();
         if shown.len() != items.len() || menu.numberOfItems() as usize != items.len() {
+            return false;
+        }
+        // An open menu keeps its width: a wider row would be clipped.
+        if rows_width(self.mtm(), items) > self.ivars().shown_width.get() {
             return false;
         }
         let mut actions = Vec::new();
@@ -734,7 +743,6 @@ impl Ui {
     /// `actions` under the tag it gets.
     fn fill_menu(&self, menu: &NSMenu, items: &[MenuItem], actions: &mut Vec<Command>) {
         let mtm = self.mtm();
-        // Custom rows share one width, the widest row's, so none is clipped.
         let contents: Vec<Option<Retained<NSView>>> = items
             .iter()
             .map(|item| match item {
@@ -743,11 +751,7 @@ impl Ui {
                 _ => None,
             })
             .collect();
-        let width = contents
-            .iter()
-            .flatten()
-            .map(|content| content.fittingSize().width.ceil())
-            .fold(ROW_WIDTH, f64::max);
+        let width = rows_width(mtm, items);
         for (item, content) in items.iter().zip(&contents) {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
@@ -2184,12 +2188,39 @@ impl RowView {
     }
 }
 
+/// The one width every custom row in `items` gets, so none is clipped: the
+/// widest row's, with room on each Profile row for the most-headroom marker
+/// and the "default login" note, which can appear while the menu is open
+/// (an open menu keeps its width).
+fn rows_width(mtm: MainThreadMarker, items: &[MenuItem]) -> f64 {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Profile(profile) => {
+                let widest = ProfileRow {
+                    marker: Some(MOST_HEADROOM.to_owned()),
+                    default_login: true,
+                    ..profile.clone()
+                };
+                Some(profile_row_content(mtm, &widest))
+            }
+            MenuItem::Discovered(discovered) => Some(discovered_row_content(mtm, discovered)),
+            _ => None,
+        })
+        .map(|content| content.fittingSize().width.ceil())
+        .fold(ROW_WIDTH, f64::max)
+}
+
 /// A Profile row: the name and a submenu arrow, one bar per limit, the Banked
 /// reset / Session refill lines, the note.
 fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSView> {
     let name = label(mtm, &row.title, NSFont::boldSystemFontOfSize(13.0), false);
     let mut badges: Vec<Retained<NSView>> =
         row.badges.iter().map(|badge| pill(mtm, *badge)).collect();
+    if row.default_login {
+        let note = label(mtm, "default login", NSFont::systemFontOfSize(10.0), true);
+        badges.push(note.into_super().into_super());
+    }
     if let Some(marker) = &row.marker {
         let marker = label(mtm, marker, NSFont::systemFontOfSize(10.0), true);
         badges.push(marker.into_super().into_super());

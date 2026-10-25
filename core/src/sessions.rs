@@ -285,7 +285,7 @@ pub(crate) struct Built {
 /// A Profile's Sidebar as the All Sessions window names it.
 pub(crate) struct SidebarProfile {
     pub pair: ProfileKey,
-    /// The nickname, else `email · Organization`, else "Unknown Login …".
+    /// The nickname, else the Profile name, else "Unknown Login …".
     pub name: String,
     /// It is a signed-in Profile in AccRoster.
     pub signed_in: bool,

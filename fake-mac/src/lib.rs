@@ -384,6 +384,10 @@ pub struct FixtureLogin {
     pub organization_uuid: String,
     pub email: String,
     pub organization_name: String,
+    /// `fullName`, written only when set.
+    pub full_name: Option<String>,
+    /// `displayName`, written only when set.
+    pub display_name: Option<String>,
 }
 
 impl FixtureLogin {
@@ -398,7 +402,17 @@ impl FixtureLogin {
             organization_uuid: organization_uuid.into(),
             email: email.into(),
             organization_name: organization_name.into(),
+            full_name: None,
+            display_name: None,
         }
+    }
+
+    /// The same Login with the person's names Claude Code records
+    /// (`fullName`, `displayName`); `None` leaves a key out.
+    pub fn named(mut self, full_name: Option<&str>, display_name: Option<&str>) -> Self {
+        self.full_name = full_name.map(str::to_owned);
+        self.display_name = display_name.map(str::to_owned);
+        self
     }
 
     /// A personal Login for tests that need any signed-in identity.
@@ -413,12 +427,21 @@ impl FixtureLogin {
 
     /// The `oauthAccount` object.
     pub fn oauth_account(&self) -> Value {
-        serde_json::json!({
+        let mut account = serde_json::json!({
             "accountUuid": self.account_uuid,
             "organizationUuid": self.organization_uuid,
             "emailAddress": self.email,
             "organizationName": self.organization_name,
-        })
+        });
+        for (key, value) in [
+            ("fullName", &self.full_name),
+            ("displayName", &self.display_name),
+        ] {
+            if let Some(value) = value {
+                account[key] = value.as_str().into();
+            }
+        }
+        account
     }
 
     /// A minimal `.claude.json` signed in as this Login.

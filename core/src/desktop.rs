@@ -398,7 +398,7 @@ fn is_sidebar_id(id: &str) -> bool {
 pub(crate) struct Target {
     pub profile_id: String,
     pub key: ProfileKey,
-    /// `email · Organization`.
+    /// Its Profile name.
     pub name: String,
     /// The Sidebar entry (`local_…`) to open once the switch is confirmed.
     pub then_open: Option<String>,

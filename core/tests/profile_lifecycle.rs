@@ -54,7 +54,7 @@ fn rename_sets_a_nickname_that_titles_the_row_and_survives_a_relaunch() {
 }
 
 const WORK: &str = "me@work.example · Work Inc";
-const PERSO: &str = "me@example.com · me@example.com's Organization";
+const PERSO: &str = "me@example.com";
 
 /// A Mac whose first two Add Profile… sign in as `work()`, then as perso.
 fn mac_with_two_sign_ins() -> FakeMac {
