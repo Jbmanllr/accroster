@@ -75,6 +75,22 @@ pub enum Command {
         target: NicknameTarget,
         nickname: Option<String>,
     },
+    /// Moves a Profile (by id) to position `to` in the Profile order.
+    MoveProfile { id: String, to: usize },
+    /// "Sign in again…" on an expired or signed-out Profile (by id): Claude
+    /// Code's browser sign-in in that same folder.
+    SignInAgain(String),
+    /// Remove… in a row's hover submenu: asks first
+    /// ([`Effect::ConfirmRemoval`]).
+    AskRemoveProfile(String),
+    /// The removal confirmed: sign the Profile out, then delete its folder.
+    RemoveProfile(String),
+    /// A choice under the CLI's Active Profile's "Remove…": which Profile
+    /// new CLI runs use next (`None` = Default, `~/.claude`). Asks first.
+    AskRemoveProfileWithNextCli { id: String, next: Option<String> },
+    /// That removal confirmed: point the CLI at `next` (or delete the
+    /// pointer) first, then remove the Profile.
+    RemoveProfileWithNextCli { id: String, next: Option<String> },
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -87,6 +103,8 @@ pub struct DiscoveredPair {
 /// What a nickname is given to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NicknameTarget {
+    /// A Profile, by id.
+    Profile(String),
     Discovered(DiscoveredPair),
 }
 
@@ -115,6 +133,12 @@ impl Command {
             Command::UnhideDiscovered(_) => "unhide_discovered",
             Command::Rename(_) => "rename",
             Command::SetNickname { .. } => "set_nickname",
+            Command::MoveProfile { .. } => "move_profile",
+            Command::SignInAgain(_) => "sign_in_again",
+            Command::AskRemoveProfile(_) => "ask_remove_profile",
+            Command::RemoveProfile(_) => "remove_profile",
+            Command::AskRemoveProfileWithNextCli { .. } => "ask_remove_profile_with_next_cli",
+            Command::RemoveProfileWithNextCli { .. } => "remove_profile_with_next_cli",
         }
     }
 }
@@ -161,6 +185,14 @@ pub enum Effect {
         name: String,
         current: Option<String>,
         target: NicknameTarget,
+    },
+    /// Ask before an irreversible action: an alert with `title` and
+    /// `message`, a destructive confirm button and Cancel. Confirming sends
+    /// `confirm`; Cancel sends nothing.
+    ConfirmRemoval {
+        title: String,
+        message: String,
+        confirm: Command,
     },
 }
 
@@ -245,6 +277,11 @@ pub enum MenuItem {
     /// A disabled plain line (for example `email · Organization · plan` in a
     /// Profile's hover submenu).
     Detail(String),
+    /// An item opening a nested submenu of `items`.
+    Submenu {
+        title: String,
+        items: Vec<MenuItem>,
+    },
     /// A signed-in Profile's row, drawn as a custom view with limit bars.
     Profile(ProfileRow),
     /// A Discovered Profile, drawn greyed. Clicking the row sends `command`.
@@ -282,6 +319,9 @@ pub struct ProfileRow {
     pub limits: Vec<LimitBar>,
     /// A short line under the bars (for example "Couldn't read limits").
     pub note: Option<String>,
+    /// Draw the bars and title dimmed: the reading is not current (for
+    /// example the Login expired).
+    pub dimmed: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,

@@ -14,6 +14,7 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
@@ -313,6 +314,11 @@ impl Ui {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
                 MenuItem::Warning(text) => disabled_item(mtm, &format!("⚠︎ {text}")),
                 MenuItem::Detail(text) => disabled_item(mtm, text),
+                MenuItem::Submenu { title, items } => {
+                    let row = menu_item(mtm, title);
+                    row.setSubmenu(Some(&self.build_menu(items, actions)));
+                    row
+                }
                 MenuItem::Action { title, command } => {
                     let row = menu_item(mtm, title);
                     unsafe {
@@ -454,6 +460,24 @@ impl Ui {
                         target,
                         nickname: Some(nickname),
                     });
+                }
+            }
+            Effect::ConfirmRemoval {
+                title,
+                message,
+                confirm,
+            } => {
+                let alert = NSAlert::new(mtm);
+                alert.setAlertStyle(NSAlertStyle::Warning);
+                alert.setMessageText(&NSString::from_str(&title));
+                alert.setInformativeText(&NSString::from_str(&message));
+                alert
+                    .addButtonWithTitle(ns_string!("Remove"))
+                    .setHasDestructiveAction(true);
+                alert.addButtonWithTitle(ns_string!("Cancel"));
+                app.activate();
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.send(confirm);
                 }
             }
         }
@@ -733,7 +757,13 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     name_line.extend(badges.iter().map(|badge| -> &NSView { badge }));
     name_line.extend([&*filler, &arrow]);
     let mut lines: Vec<Retained<NSView>> = vec![stack(mtm, false, 5.0, &name_line).into_super()];
-    lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    lines.extend(row.limits.iter().map(|bar| {
+        let line = limit_line(mtm, bar);
+        if row.dimmed {
+            line.setAlphaValue(0.45);
+        }
+        line
+    }));
     lines.extend(row.offers.iter().map(|offer| {
         label(mtm, offer, NSFont::systemFontOfSize(10.0), false)
             .into_super()
