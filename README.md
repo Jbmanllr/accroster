@@ -6,6 +6,24 @@ A menu bar app for Claude Code accounts: limits, sessions and one-click switchin
 
 AccRoster is a lightweight native macOS menu bar app, written in Rust. It is pre-release: today it is the app skeleton (menu bar item, Settings, About, its own storage and logs); Profiles, limits, switching and the Unified session view are on the way.
 
+## Install
+
+1. Open the [Releases page](https://github.com/Jbmanllr/accroster/releases) (the first release is not published yet) and download the latest `AccRoster-<version>.dmg`. Each release lists its SHA-256 so you can check the download.
+2. Open the dmg and drag AccRoster onto the Applications folder next to it.
+3. Open AccRoster from Applications. It appears in the menu bar.
+
+Releases are signed with a Developer ID and notarized by Apple, so macOS opens them without a security warning. One download runs on Apple Silicon and Intel Macs. It needs macOS 14 or later.
+
+Install [Claude Code](https://code.claude.com/docs/en/overview) first: AccRoster drives the `claude` it finds on your Mac and holds no sign-in of its own.
+
+macOS asks for permissions when a feature first needs them:
+
+- **Notifications**, when a limit threshold is reached.
+- **Automation (Terminal)**, the first time you use Resume in Terminal.
+- **Launch at login** is offered on first run and in Settings.
+
+To update, install the new release over the old one; the permissions stay. To remove AccRoster, see [Uninstall](#uninstall).
+
 ## Privacy
 
 AccRoster holds no token and makes no network request. Claude Code does every sign-in, refresh and usage read itself. There is no telemetry, no server and no crash upload: nothing leaves your Mac.
@@ -72,7 +90,7 @@ By hand, the same steps:
 
 Trashing the app without uninstalling is harmless: the shim and the `~/.zshrc` block stay, and `claude` keeps routing through the shim to the Profile it last pointed at, because the shim is a plain shell script that doesn't need the app. Run steps 1–4 above whenever you want the rest gone.
 
-## Build
+## Build from source
 
 Requires macOS 14 or later and Rust 1.93 or later.
 
@@ -82,7 +100,7 @@ scripts/bundle.sh                    # builds and signs target/release/AccRoster
 open target/release/AccRoster.app
 ```
 
-The stable identity keeps Keychain approvals and notification permission across rebuilds; `scripts/bundle.sh --ad-hoc` builds without it. This is local signing only; the app is not notarized.
+The stable identity keeps Keychain approvals and notification permission across rebuilds; `scripts/bundle.sh --ad-hoc` builds without it. This is local signing only; the app is not notarized, and launch at login is not available in a local build. Releases are built by `scripts/release.sh`; see [Releasing](#releasing).
 
 Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI (`.github/workflows/ci.yml`) runs the same three on `macos-latest` for every pull request and push to `main`; bundling and signing stay local.
 
@@ -91,6 +109,10 @@ Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo
 - `core/` (`accroster-core`): all behaviour. Commands and events in, view models and effects out; everything outside goes through one environment boundary (home folder, process spawner, clock, OS facts).
 - `src/` (`accroster`): the AppKit UI layer, which only renders view models and forwards clicks.
 - `fake-mac/` (`accroster-fake-mac`): the test harness, a fake Mac with a temporary home, a stub `claude`, a fake clock and fake OS facts.
+
+## Releasing
+
+Maintainers: [docs/RELEASING.md](docs/RELEASING.md) covers the one-time Apple and GitHub setup, how to cut a release and how to recover from a failed one.
 
 ## Prior art
 
