@@ -144,6 +144,23 @@ impl<'a> Runner<'a> {
         Ok(process)
     }
 
+    /// `claude --desktop --resume <id>`: Claude Code hands the Session to the
+    /// desktop app, which opens it under its own Active Profile. Runs in the
+    /// Session's folder when it still exists (the Transcript is looked up
+    /// from there). `Ok(false)` when Claude Code reported a failure.
+    pub(crate) fn open_in_desktop(
+        &self,
+        config_dir: &Path,
+        session_id: &str,
+        session_folder: Option<&Path>,
+    ) -> io::Result<bool> {
+        let mut request = self.request(config_dir, &["--desktop", "--resume", session_id], None)?;
+        if let Some(folder) = session_folder.filter(|folder| folder.is_dir()) {
+            request.cwd = Some(folder.to_path_buf());
+        }
+        Ok(self.env.spawner.run(&request)?.succeeded())
+    }
+
     fn run(
         &self,
         config_dir: &Path,

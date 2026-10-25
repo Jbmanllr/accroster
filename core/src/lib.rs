@@ -17,6 +17,7 @@ pub mod interface;
 mod limit_offers;
 mod logging;
 mod monitor;
+mod opening;
 mod profiles;
 mod runner;
 mod safety;
@@ -37,8 +38,8 @@ pub use interface::{
     SettingsView, View,
 };
 pub use interface::{
-    AllSessionsView, RunningDot, SessionDetail, SessionFilter, SessionRow, SidebarGroup,
-    SidebarItem, SidebarPresence,
+    AllSessionsView, OpenChoice, RunningDot, SessionDetail, SessionFilter, SessionRow,
+    SidebarGroup, SidebarItem, SidebarPresence,
 };
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{

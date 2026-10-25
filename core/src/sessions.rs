@@ -245,6 +245,9 @@ impl EntryFile {
 #[derive(Debug, Clone)]
 struct SidebarEntry {
     pair: DiscoveredPair,
+    /// The entry's `local_…` id (its file name, which is always its
+    /// `sessionId`).
+    entry_id: String,
     cli_session_id: String,
     title: Option<String>,
     /// `titleSource` is set and isn't `auto` (an entry with no `titleSource`
@@ -303,7 +306,7 @@ pub(crate) struct SessionIndex {
     read: usize,
     entries: Cached<SidebarEntry>,
     live: Cached<LiveFile>,
-    running: HashMap<String, RunningDot>,
+    running: HashMap<String, Running>,
     /// The desktop's account and Organization, for title precedence and
     /// "desktop now".
     desktop: Option<DesktopAccount>,
@@ -336,6 +339,13 @@ impl SessionIndex {
         self.restat_entries();
         self.restat_live(env, paths);
         self.building = true;
+    }
+
+    /// The rescan at launch, so the first menu's Recent Sessions is filled:
+    /// batches follow only when a Transcript is new or changed.
+    pub(crate) fn warm_up(&mut self, env: &Environment, paths: &AppPaths) {
+        self.rescan(env, paths);
+        self.building = !self.pending.is_empty();
     }
 
     /// Opens the All Sessions window: a rescan, then the folders to watch
@@ -511,7 +521,7 @@ impl SessionIndex {
     fn restat_entries(&mut self) {
         let files = entry_files(&self.home);
         refresh_cached(&mut self.entries, files, |path, inside| {
-            let [account, org, _] = inside else {
+            let [account, org, name] = inside else {
                 return None;
             };
             let entry = read_entry(path)?;
@@ -520,6 +530,7 @@ impl SessionIndex {
                     account_uuid: account.clone(),
                     organization_uuid: org.clone(),
                 },
+                entry_id: name.strip_suffix(".json")?.to_owned(),
                 cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
                 title: entry.title.filter(|title| !title.trim().is_empty()),
                 user_title: entry.title_source.is_some_and(|source| source != "auto"),
@@ -655,14 +666,14 @@ impl SessionIndex {
             cwd,
             last_ms,
             haystack,
-            dot: transcript.and_then(|_| self.running.get(id).copied()),
+            running: transcript.and_then(|_| self.running.get(id).copied()),
         }
     }
 
     fn filter_admits(&self, session: &Session) -> bool {
         match &self.filter {
             SessionFilter::All => !session.archived,
-            SessionFilter::Running => session.dot.is_some(),
+            SessionFilter::Running => session.running.is_some(),
             SessionFilter::Project(folder) => session.cwd == Some(folder.as_str()),
             SessionFilter::Sidebar(pair) => session.entries.iter().any(|e| e.pair == *pair),
             SessionFilter::CliOnly => session.entries.is_empty(),
@@ -741,7 +752,7 @@ impl SessionIndex {
             last_used,
             turns: transcript.map(|t| t.turns),
             first_prompt: transcript.and_then(|t| t.first_prompt.clone()),
-            dot: session.dot,
+            dot: session.dot(),
             sidebars,
             deleted: transcript.is_none().then(|| {
                 "The Transcript was deleted (Claude Code removes old ones after \
@@ -749,7 +760,45 @@ impl SessionIndex {
                  nothing to open or resume."
                     .to_owned()
             }),
+            open: Vec::new(),
         }
+    }
+
+    /// What opening Session `id` depends on, when it is listed.
+    pub(crate) fn facts(&self, id: &str) -> Option<SessionFacts> {
+        let sessions = self.sessions();
+        let session = sessions.iter().find(|session| session.id == id)?;
+        Some(SessionFacts {
+            id: session.id.to_owned(),
+            cwd: session.cwd.map(PathBuf::from),
+            entrypoint: session.transcript.and_then(|t| t.entrypoint.clone()),
+            deleted: session.transcript.is_none(),
+            running: session.running,
+            entries: session
+                .entries
+                .iter()
+                .map(|entry| EntryFacts {
+                    pair: entry.pair.clone(),
+                    entry_id: entry.entry_id.clone(),
+                    archived: entry.archived,
+                    last_activity_at: entry.last_activity_at,
+                })
+                .collect(),
+        })
+    }
+
+    /// The newest `count` Sessions All Sessions lists that can be opened
+    /// (Transcript still there), as `(id, "title · project")`.
+    pub(crate) fn recent(&self, count: usize) -> Vec<(String, String)> {
+        self.sessions()
+            .iter()
+            .filter(|session| session.transcript.is_some() && !session.archived)
+            .take(count)
+            .map(|session| {
+                let line = format!("{} · {}", session.title, project(session.cwd));
+                (session.id.to_owned(), line)
+            })
+            .collect()
     }
 
     /// `cwd` with the home folder as `~`.
@@ -812,10 +861,14 @@ struct Session<'a> {
     last_ms: i64,
     /// Lowercased title, first prompt, project and branch, for search.
     haystack: String,
-    dot: Option<RunningDot>,
+    running: Option<Running>,
 }
 
 impl Session<'_> {
+    fn dot(&self) -> Option<RunningDot> {
+        self.running.map(|running| running.dot)
+    }
+
     fn row(&self, now: Timestamp) -> SessionRow {
         let mut subtitle = format!("{} · {}", project(self.cwd), age(now, self.last_ms));
         if self.transcript.is_none() {
@@ -828,7 +881,7 @@ impl Session<'_> {
             id: self.id.to_owned(),
             title: self.title.clone(),
             subtitle,
-            dot: self.dot,
+            dot: self.dot(),
             deleted: self.transcript.is_none(),
         }
     }
@@ -1067,13 +1120,43 @@ fn live_files(home: &Path, paths: &AppPaths) -> Vec<(PathBuf, Stamp, Vec<String>
         .collect()
 }
 
+/// A running Session: its dot and the process that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Running {
+    pub dot: RunningDot,
+    pub pid: u32,
+}
+
+/// What opening one Session depends on.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionFacts {
+    pub id: String,
+    pub cwd: Option<PathBuf>,
+    /// The client the Transcript was last used in.
+    pub entrypoint: Option<String>,
+    /// The Transcript is gone; only Sidebar entries remain.
+    pub deleted: bool,
+    pub running: Option<Running>,
+    pub entries: Vec<EntryFacts>,
+}
+
+/// One Profile's Sidebar entry for a Session.
+#[derive(Debug, Clone)]
+pub(crate) struct EntryFacts {
+    pub pair: DiscoveredPair,
+    /// `local_…`.
+    pub entry_id: String,
+    pub archived: bool,
+    pub last_activity_at: i64,
+}
+
 /// Running dots by Transcript id, from live-process files. A file whose pid
 /// is dead, or whose pid now belongs to a process started at another time,
 /// is stale and ignored.
 fn running<'a>(
     env: &Environment,
     lives: impl Iterator<Item = &'a LiveFile>,
-) -> HashMap<String, RunningDot> {
+) -> HashMap<String, Running> {
     let time_zone = env.clock.time_zone();
     let mut dots = HashMap::new();
     for live in lives {
@@ -1097,9 +1180,10 @@ fn running<'a>(
             // Busy, waiting, or a status we don't know: fail closed.
             RunningDot::Desktop
         };
-        let slot = dots.entry(session_id).or_insert(dot);
+        let running = Running { dot, pid: live.pid };
+        let slot = dots.entry(session_id).or_insert(running);
         if dot == RunningDot::Terminal {
-            *slot = dot;
+            *slot = running;
         }
     }
     dots

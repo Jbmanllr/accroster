@@ -665,6 +665,8 @@ struct FakeOsState {
     managed_settings: Option<Vec<u8>>,
     /// Live pids running the desktop app's bundled Claude Code.
     desktop_children: BTreeSet<u32>,
+    /// Terminal devices, by pid.
+    terminals: HashMap<u32, String>,
 }
 
 /// OS facts the test sets by hand. Clones share the facts.
@@ -697,6 +699,11 @@ impl FakeOs {
         self.0.lock().unwrap().desktop_children.insert(pid);
     }
 
+    /// Puts live process `pid` on terminal device `tty` (`ttys004`).
+    pub fn set_terminal(&self, pid: u32, tty: &str) {
+        self.0.lock().unwrap().terminals.insert(pid, tty.to_owned());
+    }
+
     /// Installs (or with `None`, removes) the desktop app.
     pub fn set_desktop_app_version(&self, version: Option<&str>) {
         self.0.lock().unwrap().desktop_app_version = version.map(str::to_owned);
@@ -721,6 +728,12 @@ impl OsFacts for FakeOs {
 
     fn managed_settings(&self) -> Option<Vec<u8>> {
         self.0.lock().unwrap().managed_settings.clone()
+    }
+
+    fn terminal_of(&self, pid: u32) -> Option<String> {
+        let state = self.0.lock().unwrap();
+        state.processes.get(&pid)?;
+        state.terminals.get(&pid).cloned()
     }
 
     fn desktop_claude_code_children(&self) -> Vec<u32> {

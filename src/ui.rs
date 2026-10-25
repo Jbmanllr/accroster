@@ -94,6 +94,8 @@ pub struct Ivars {
     session_rows: RefCell<Vec<SessionRow>>,
     /// The detail pane as last drawn.
     session_detail: RefCell<Option<SessionDetail>>,
+    /// The detail pane's Open buttons' commands, by tag.
+    open_commands: RefCell<Vec<Command>>,
     /// Set while the UI changes a selection itself, so the selection
     /// callbacks don't echo it back to the core.
     rendering: Cell<bool>,
@@ -332,6 +334,29 @@ define_class!(
             self.send(Command::CopyDiagnosticsReport);
         }
 
+        /// An Open button in the All Sessions detail pane.
+        #[unsafe(method(openChoiceClicked:))]
+        fn open_choice_clicked(&self, sender: &NSButton) {
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().open_commands.borrow().get(tag).cloned());
+            if let Some(command) = command {
+                self.send(command);
+            }
+        }
+
+        /// A double-click on an All Sessions row: open where it was last
+        /// used.
+        #[unsafe(method(sessionDoubleClicked:))]
+        fn session_double_clicked(&self, sender: &NSTableView) {
+            let id = usize::try_from(sender.clickedRow())
+                .ok()
+                .and_then(|row| self.ivars().session_rows.borrow().get(row).map(|r| r.id.clone()));
+            if let Some(id) = id {
+                self.send(Command::OpenSession(id));
+            }
+        }
+
         #[unsafe(method(resumeClicked:))]
         fn resume_clicked(&self, sender: &NSButton) {
             let command = usize::try_from(sender.tag())
@@ -364,6 +389,7 @@ impl Ui {
             all_sessions: OnceCell::new(),
             session_rows: RefCell::new(Vec::new()),
             session_detail: RefCell::new(None),
+            open_commands: RefCell::new(Vec::new()),
             rendering: Cell::new(false),
             watch: RefCell::new(None),
         });
@@ -538,7 +564,7 @@ impl Ui {
         }
         if *self.ivars().session_detail.borrow() != view.detail {
             *self.ivars().session_detail.borrow_mut() = view.detail.clone();
-            render_session_detail(self.mtm(), &window.detail, view.detail.as_ref());
+            self.render_session_detail(&window.detail, view.detail.as_ref());
         }
         self.ivars().rendering.set(false);
         let count = view.rows.len();
@@ -764,6 +790,8 @@ impl Ui {
                 });
             }
             Effect::BringDesktopAppForward => bring_desktop_app_forward(),
+            Effect::RunInTerminal(line) => run_in_terminal(&line),
+            Effect::ShowInTerminal { tty } => show_in_terminal(tty.as_deref()),
             Effect::Notify { title, body } => notify(&title, &body),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
@@ -956,6 +984,8 @@ impl Ui {
         unsafe {
             table.setDataSource(Some(ProtocolObject::from_ref(self)));
             table.setDelegate(Some(ProtocolObject::from_ref(self)));
+            table.setTarget(Some(self));
+            table.setDoubleAction(Some(sel!(sessionDoubleClicked:)));
         }
         let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), list_frame);
         scroll.setHasVerticalScroller(true);
@@ -997,7 +1027,7 @@ impl Ui {
             .constraintEqualToAnchor(&holder.topAnchor())
             .setActive(true);
         content.addSubview(&holder);
-        render_session_detail(mtm, &detail, None);
+        self.render_session_detail(&detail, None);
 
         AllSessionsWindow {
             window,
@@ -1447,103 +1477,186 @@ fn line_index(item: &AnyObject) -> Option<usize> {
 /// Refills the detail pane: title, folder and branch, last client and age,
 /// turns, first prompt, the running state, one ✓/– line per Profile's
 /// Sidebar, and why nothing opens when the Transcript is gone.
-fn render_session_detail(
-    mtm: MainThreadMarker,
-    pane: &NSStackView,
-    detail: Option<&SessionDetail>,
-) {
-    const WIDTH: f64 = 290.0;
-    for view in pane.arrangedSubviews() {
-        view.removeFromSuperview();
-    }
-    let wrapping = |text: &str, font: Retained<NSFont>, color: Retained<NSColor>| {
-        let field = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
-        field.setFont(Some(&font));
-        field.setTextColor(Some(&color));
-        field.setPreferredMaxLayoutWidth(WIDTH);
-        fixed_width(&field, WIDTH);
-        field
-    };
-    let Some(detail) = detail else {
+impl Ui {
+    fn render_session_detail(&self, pane: &NSStackView, detail: Option<&SessionDetail>) {
+        const WIDTH: f64 = 290.0;
+        let mtm = self.mtm();
+        self.ivars().open_commands.borrow_mut().clear();
+        for view in pane.arrangedSubviews() {
+            view.removeFromSuperview();
+        }
+        let wrapping = |text: &str, font: Retained<NSFont>, color: Retained<NSColor>| {
+            let field = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+            field.setFont(Some(&font));
+            field.setTextColor(Some(&color));
+            field.setPreferredMaxLayoutWidth(WIDTH);
+            fixed_width(&field, WIDTH);
+            field
+        };
+        let Some(detail) = detail else {
+            pane.addArrangedSubview(&wrapping(
+                "Select a Session.",
+                NSFont::systemFontOfSize(13.0),
+                NSColor::secondaryLabelColor(),
+            ));
+            return;
+        };
+        let small = || NSFont::systemFontOfSize(11.0);
         pane.addArrangedSubview(&wrapping(
-            "Select a Session.",
-            NSFont::systemFontOfSize(13.0),
+            &detail.title,
+            NSFont::systemFontOfSize(15.0),
+            if detail.deleted.is_some() {
+                NSColor::tertiaryLabelColor()
+            } else {
+                NSColor::labelColor()
+            },
+        ));
+        let place: Vec<&str> = [detail.folder.as_deref(), detail.branch.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut facts = vec![place.join("  ·  ")];
+        facts.push(match detail.turns {
+            Some(1) => format!("{}  ·  1 turn", detail.last_used),
+            Some(turns) => format!("{}  ·  {turns} turns", detail.last_used),
+            None => detail.last_used.clone(),
+        });
+        if let Some(prompt) = &detail.first_prompt {
+            let mut shown: String = prompt.chars().take(200).collect();
+            if prompt.chars().count() > 200 {
+                shown.push('…');
+            }
+            facts.push(format!("First prompt: “{shown}”"));
+        }
+        facts.retain(|line| !line.is_empty());
+        pane.addArrangedSubview(&wrapping(
+            &facts.join("\n"),
+            small(),
             NSColor::secondaryLabelColor(),
         ));
+        match detail.dot {
+            Some(RunningDot::Terminal) => pane.addArrangedSubview(&wrapping(
+                "● Running in Terminal now",
+                NSFont::boldSystemFontOfSize(11.0),
+                NSColor::systemGreenColor(),
+            )),
+            Some(RunningDot::Desktop) => pane.addArrangedSubview(&wrapping(
+                "● A desktop turn is running now",
+                NSFont::boldSystemFontOfSize(11.0),
+                NSColor::systemOrangeColor(),
+            )),
+            None => {}
+        }
+        pane.addArrangedSubview(&wrapping(
+            "Sidebar entries",
+            NSFont::boldSystemFontOfSize(11.0),
+            NSColor::secondaryLabelColor(),
+        ));
+        for sidebar in &detail.sidebars {
+            let mut line = format!(
+                "{}  {}",
+                if sidebar.has_entry { "✓" } else { "–" },
+                sidebar.profile
+            );
+            if sidebar.archived {
+                line.push_str("  (archived)");
+            }
+            if sidebar.desktop_now {
+                line.push_str("  (desktop now)");
+            }
+            let color = if sidebar.has_entry {
+                NSColor::labelColor()
+            } else {
+                NSColor::tertiaryLabelColor()
+            };
+            pane.addArrangedSubview(&wrapping(&line, small(), color));
+        }
+        if let Some(why) = &detail.deleted {
+            pane.addArrangedSubview(&wrapping(why, small(), NSColor::systemOrangeColor()));
+        }
+        if detail.open.is_empty() {
+            return;
+        }
+        pane.addArrangedSubview(&wrapping(
+            "Open",
+            NSFont::boldSystemFontOfSize(11.0),
+            NSColor::secondaryLabelColor(),
+        ));
+        let mut commands = self.ivars().open_commands.borrow_mut();
+        for choice in &detail.open {
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(&choice.title),
+                    Some(self),
+                    Some(sel!(openChoiceClicked:)),
+                    mtm,
+                )
+            };
+            button.setEnabled(choice.enabled);
+            button.setTag(commands.len() as isize);
+            commands.push(choice.command.clone());
+            pane.addArrangedSubview(&button);
+            if let Some(note) = &choice.note {
+                pane.addArrangedSubview(&wrapping(note, small(), NSColor::secondaryLabelColor()));
+            }
+        }
+    }
+}
+
+/// Opens a new Terminal window running `line` (already quoted for `sh`).
+/// The line is passed as an argument, so nothing is spliced into the script.
+fn run_in_terminal(line: &str) {
+    osascript(
+        &[
+            "on run argv",
+            "tell application \"Terminal\"",
+            "activate",
+            "do script (item 1 of argv)",
+            "end tell",
+            "end run",
+        ],
+        &[line],
+    );
+}
+
+/// Brings forward the Terminal tab on `/dev/<tty>`, else just Terminal.
+fn show_in_terminal(tty: Option<&str>) {
+    let Some(tty) = tty else {
+        osascript(&["tell application \"Terminal\" to activate"], &[]);
         return;
     };
-    let small = || NSFont::systemFontOfSize(11.0);
-    pane.addArrangedSubview(&wrapping(
-        &detail.title,
-        NSFont::systemFontOfSize(15.0),
-        if detail.deleted.is_some() {
-            NSColor::tertiaryLabelColor()
-        } else {
-            NSColor::labelColor()
-        },
-    ));
-    let place: Vec<&str> = [detail.folder.as_deref(), detail.branch.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect();
-    let mut facts = vec![place.join("  ·  ")];
-    facts.push(match detail.turns {
-        Some(1) => format!("{}  ·  1 turn", detail.last_used),
-        Some(turns) => format!("{}  ·  {turns} turns", detail.last_used),
-        None => detail.last_used.clone(),
-    });
-    if let Some(prompt) = &detail.first_prompt {
-        let mut shown: String = prompt.chars().take(200).collect();
-        if prompt.chars().count() > 200 {
-            shown.push('…');
-        }
-        facts.push(format!("First prompt: “{shown}”"));
+    let device = format!("/dev/{tty}");
+    osascript(
+        &[
+            "on run argv",
+            "tell application \"Terminal\"",
+            "activate",
+            "repeat with w in windows",
+            "repeat with t in tabs of w",
+            "if tty of t is (item 1 of argv) then",
+            "set selected of t to true",
+            "set index of w to 1",
+            "return",
+            "end if",
+            "end repeat",
+            "end repeat",
+            "end tell",
+            "end run",
+        ],
+        &[&device],
+    );
+}
+
+/// Runs an AppleScript with `osascript`, without waiting for it (the first
+/// run asks the user to let AccRoster control Terminal).
+fn osascript(lines: &[&str], args: &[&str]) {
+    let mut command = std::process::Command::new("/usr/bin/osascript");
+    for line in lines {
+        command.arg("-e").arg(line);
     }
-    facts.retain(|line| !line.is_empty());
-    pane.addArrangedSubview(&wrapping(
-        &facts.join("\n"),
-        small(),
-        NSColor::secondaryLabelColor(),
-    ));
-    match detail.dot {
-        Some(RunningDot::Terminal) => pane.addArrangedSubview(&wrapping(
-            "● Running in Terminal now",
-            NSFont::boldSystemFontOfSize(11.0),
-            NSColor::systemGreenColor(),
-        )),
-        Some(RunningDot::Desktop) => pane.addArrangedSubview(&wrapping(
-            "● A desktop turn is running now",
-            NSFont::boldSystemFontOfSize(11.0),
-            NSColor::systemOrangeColor(),
-        )),
-        None => {}
-    }
-    pane.addArrangedSubview(&wrapping(
-        "Sidebar entries",
-        NSFont::boldSystemFontOfSize(11.0),
-        NSColor::secondaryLabelColor(),
-    ));
-    for sidebar in &detail.sidebars {
-        let mut line = format!(
-            "{}  {}",
-            if sidebar.has_entry { "✓" } else { "–" },
-            sidebar.profile
-        );
-        if sidebar.archived {
-            line.push_str("  (archived)");
-        }
-        if sidebar.desktop_now {
-            line.push_str("  (desktop now)");
-        }
-        let color = if sidebar.has_entry {
-            NSColor::labelColor()
-        } else {
-            NSColor::tertiaryLabelColor()
-        };
-        pane.addArrangedSubview(&wrapping(&line, small(), color));
-    }
-    if let Some(why) = &detail.deleted {
-        pane.addArrangedSubview(&wrapping(why, small(), NSColor::systemOrangeColor()));
+    command.args(args);
+    if let Ok(mut child) = command.spawn() {
+        std::thread::spawn(move || child.wait());
     }
 }
 
