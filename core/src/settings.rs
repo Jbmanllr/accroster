@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::interface::SidebarSyncMode;
 use crate::storage::{self, ReadError, VersionedFile};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,9 @@ pub(crate) struct Settings {
     /// while the pair is off the Mac, so a returning pair stays hidden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_profiles: Vec<DiscoveredChoice>,
+    /// Sidebar sync's mode; Off until chosen.
+    #[serde(default)]
+    pub sidebar_sync: SidebarSyncMode,
 }
 
 /// The user's choices for one Discovered Profile.

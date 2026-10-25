@@ -41,10 +41,11 @@ pub(crate) enum CheckId {
     SidebarEntries,
     LiveProcesses,
     TranscriptRecords,
+    MultiAccountMode,
 }
 
 impl CheckId {
-    pub(crate) const ALL: [CheckId; 10] = [
+    pub(crate) const ALL: [CheckId; 11] = [
         CheckId::UsageResponse,
         CheckId::OauthAccount,
         CheckId::CachedUsage,
@@ -55,6 +56,7 @@ impl CheckId {
         CheckId::SidebarEntries,
         CheckId::LiveProcesses,
         CheckId::TranscriptRecords,
+        CheckId::MultiAccountMode,
     ];
 
     fn name(self) -> &'static str {
@@ -69,6 +71,7 @@ impl CheckId {
             CheckId::SidebarEntries => "Sidebar entries",
             CheckId::LiveProcesses => "Live-process files",
             CheckId::TranscriptRecords => "Transcript records",
+            CheckId::MultiAccountMode => "Dormant multi-account mode",
         }
     }
 }
@@ -124,6 +127,7 @@ fn feature_name(feature: SafetyFeature) -> &'static str {
     match feature {
         SafetyFeature::CliSwitching => "CLI switching",
         SafetyFeature::TranscriptSharing => "Transcript sharing",
+        SafetyFeature::SidebarSync => "Sidebar sync",
     }
 }
 
@@ -131,6 +135,7 @@ fn feature_key(feature: SafetyFeature) -> &'static str {
     match feature {
         SafetyFeature::CliSwitching => "cliSwitching",
         SafetyFeature::TranscriptSharing => "transcriptSharing",
+        SafetyFeature::SidebarSync => "sidebarSync",
     }
 }
 
@@ -138,6 +143,7 @@ fn feature_from_key(key: &str) -> Option<SafetyFeature> {
     [
         SafetyFeature::CliSwitching,
         SafetyFeature::TranscriptSharing,
+        SafetyFeature::SidebarSync,
     ]
     .into_iter()
     .find(|feature| feature_key(*feature) == key)

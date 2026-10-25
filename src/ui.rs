@@ -10,7 +10,7 @@ use std::ffi::{c_int, c_void};
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
     AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
-    LimitBar, MenuItem, ProfileRow, RunningDot, SessionRow, SettingsView, View,
+    LimitBar, MenuItem, ProfileRow, RunningDot, SessionRow, SettingsView, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -112,6 +112,9 @@ struct DiagnosticsWindow {
 
 struct SettingsWindow {
     window: Retained<NSWindow>,
+    sidebar_sync: Retained<NSButton>,
+    sync_now: Retained<NSButton>,
+    sidebar_sync_note: Retained<NSTextField>,
     cli_switching: Retained<NSButton>,
     cli_switching_note: Retained<NSTextField>,
     launch_at_login: Retained<NSButton>,
@@ -237,6 +240,22 @@ define_class!(
             if let Some(on) = on {
                 self.send(Command::SetLaunchAtLogin(on));
             }
+        }
+
+        /// The Sidebar sync checkbox: on is Manual ("Sync now").
+        #[unsafe(method(sidebarSyncClicked:))]
+        fn sidebar_sync_clicked(&self, sender: &NSButton) {
+            let mode = if sender.state() == NSControlStateValueOn {
+                SidebarSyncMode::Manual
+            } else {
+                SidebarSyncMode::Off
+            };
+            self.send(Command::SetSidebarSync(mode));
+        }
+
+        #[unsafe(method(syncNowClicked:))]
+        fn sync_now_clicked(&self, _sender: &NSButton) {
+            self.send(Command::SyncSidebarNow);
         }
 
         #[unsafe(method(cliSwitchingClicked:))]
@@ -865,7 +884,7 @@ impl Ui {
     /// a Resume button per resumable pause, and Copy report.
     fn make_diagnostics_window(&self) -> DiagnosticsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 440.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -886,7 +905,7 @@ impl Ui {
         )));
         text.setFrame(NSRect::new(
             NSPoint::new(20.0, 64.0),
-            NSSize::new(520.0, 360.0),
+            NSSize::new(680.0, 360.0),
         ));
         content.addSubview(&text);
 
@@ -901,7 +920,7 @@ impl Ui {
         copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
         content.addSubview(&copy);
 
-        let resume = [180.0, 360.0]
+        let resume = [140.0, 330.0, 530.0]
             .into_iter()
             .map(|x| {
                 let button = unsafe {
@@ -1004,7 +1023,7 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 340.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 420.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1018,6 +1037,38 @@ impl Ui {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("AccRoster Settings"));
         let content = window.contentView().expect("a window has a content view");
+
+        let sidebar_sync = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Sidebar sync: every Session in every Profile's desktop sidebar"),
+                Some(self),
+                Some(sel!(sidebarSyncClicked:)),
+                mtm,
+            )
+        };
+        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 386.0));
+        content.addSubview(&sidebar_sync);
+
+        let sync_now = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Sync now"),
+                Some(self),
+                Some(sel!(syncNowClicked:)),
+                mtm,
+            )
+        };
+        sync_now.setFrameOrigin(NSPoint::new(34.0, 352.0));
+        content.addSubview(&sync_now);
+
+        let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        sidebar_sync_note.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        sidebar_sync_note.setFrame(NSRect::new(
+            NSPoint::new(140.0, 340.0),
+            NSSize::new(260.0, 44.0),
+        ));
+        content.addSubview(&sidebar_sync_note);
 
         let cli_switching = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -1107,6 +1158,9 @@ impl Ui {
 
         SettingsWindow {
             window,
+            sidebar_sync,
+            sync_now,
+            sidebar_sync_note,
             cli_switching,
             cli_switching_note,
             launch_at_login,
@@ -1486,6 +1540,26 @@ fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
 }
 
 fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
+    let sync = &view.sidebar_sync;
+    settings
+        .sidebar_sync
+        .setState(if sync.mode == SidebarSyncMode::Off {
+            NSControlStateValueOff
+        } else {
+            NSControlStateValueOn
+        });
+    settings.sync_now.setEnabled(sync.sync_now.is_some());
+    let sync_text = match (&sync.note, sync.mode) {
+        (Some(note), _) => note.clone(),
+        (None, SidebarSyncMode::Off) => "Off: sidebars are left as they are.".to_owned(),
+        (None, SidebarSyncMode::Manual) => {
+            "Copies entries, never deletes. While Claude runs, its own Profile is left alone."
+                .to_owned()
+        }
+    };
+    settings
+        .sidebar_sync_note
+        .setStringValue(&NSString::from_str(&sync_text));
     let cli = &view.cli_switching;
     settings.cli_switching.setState(if cli.on {
         NSControlStateValueOn

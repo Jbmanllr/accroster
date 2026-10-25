@@ -157,6 +157,10 @@ pub trait OsFacts: Send {
     /// (`…/Application Support/Claude/claude-code/<ver>/…/claude`): its
     /// Sessions' children.
     fn desktop_claude_code_children(&self) -> Vec<u32>;
+    /// Whether the Claude desktop app (`/Applications/Claude.app`) is
+    /// running. When the process table can't be read, it counts as running:
+    /// that is the case in which fewer files get written.
+    fn desktop_app_running(&self) -> bool;
 }
 
 /// Where Claude Code reads managed (administrator) settings.
@@ -378,35 +382,50 @@ impl OsFacts for SystemOsFacts {
 
     fn desktop_claude_code_children(&self) -> Vec<u32> {
         const BUNDLED: &str = "/Library/Application Support/Claude/claude-code/";
-        // SAFETY: with a null buffer `proc_listallpids` returns the number of
-        // pids; with a buffer it writes at most `size` bytes of pids.
-        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        let Ok(count) = usize::try_from(count) else {
+        let Some(processes) = process_paths() else {
             return Vec::new();
         };
-        // Room for processes started in between.
-        let mut pids = vec![0 as libc::pid_t; count + 64];
-        let size = i32::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
-        let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
-        pids.truncate(usize::try_from(written).unwrap_or(0));
-        pids.into_iter()
-            .filter(|&pid| pid > 0)
-            .filter(|&pid| {
-                let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-                // SAFETY: `proc_pidpath` writes at most `buffer.len()` bytes
-                // and returns the path's length.
-                let len = unsafe {
-                    libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32)
-                };
-                let Ok(len) = usize::try_from(len) else {
-                    return false;
-                };
-                let path = String::from_utf8_lossy(&buffer[..len.min(buffer.len())]);
-                path.contains(BUNDLED) && path.ends_with("/claude")
-            })
-            .filter_map(|pid| u32::try_from(pid).ok())
+        processes
+            .into_iter()
+            .filter(|(_, path)| path.contains(BUNDLED) && path.ends_with("/claude"))
+            .map(|(pid, _)| pid)
             .collect()
     }
+
+    fn desktop_app_running(&self) -> bool {
+        const DESKTOP_APP: &str = "/Applications/Claude.app/Contents/MacOS/Claude";
+        process_paths()
+            .is_none_or(|processes| processes.iter().any(|(_, path)| path == DESKTOP_APP))
+    }
+}
+
+/// Every live process with its executable's path, or `None` when the process
+/// table can't be read.
+fn process_paths() -> Option<Vec<(u32, String)>> {
+    // SAFETY: with a null buffer `proc_listallpids` returns the number of
+    // pids; with a buffer it writes at most `size` bytes of pids.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let count = usize::try_from(count).ok().filter(|count| *count > 0)?;
+    // Room for processes started in between.
+    let mut pids = vec![0 as libc::pid_t; count + 64];
+    let size = i32::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
+    let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
+    pids.truncate(usize::try_from(written).ok().filter(|n| *n > 0)?);
+    let processes = pids
+        .into_iter()
+        .filter(|&pid| pid > 0)
+        .filter_map(|pid| {
+            let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: `proc_pidpath` writes at most `buffer.len()` bytes and
+            // returns the path's length.
+            let len =
+                unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+            let len = usize::try_from(len).ok()?;
+            let path = String::from_utf8_lossy(&buffer[..len.min(buffer.len())]).into_owned();
+            Some((u32::try_from(pid).ok()?, path))
+        })
+        .collect();
+    Some(processes)
 }
 
 /// Where the app stands in System Settings → Login Items, as
