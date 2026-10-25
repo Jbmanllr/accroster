@@ -1,0 +1,83 @@
+#!/bin/sh
+# Stub `claude` for the fake Mac. Written next to its state by
+# accroster-fake-mac; never installed anywhere else.
+#
+# 1. Classifies the call into a reply key (auth-login, auth-status,
+#    auth-logout, get-usage, slash-usage, other).
+# 2. Records the call under calls/<n>/: args and env (NUL-separated), the
+#    stdin it read, and the key.
+# 3. Answers from replies/<key>/<seq>/: copies files/ into $CLAUDE_CONFIG_DIR,
+#    prints stdout and stderr, exits with exit_code. Replies are consumed in
+#    order; the last one repeats. With no reply, exits 97.
+set -u
+state="$(cd "$(dirname "$0")/.." && pwd)"
+
+key=other
+case "${1:-} ${2:-}" in
+  "auth login") key=auth-login ;;
+  "auth status") key=auth-status ;;
+  "auth logout") key=auth-logout ;;
+esac
+
+stdin_line=""
+for arg in "$@"; do
+  # The usage read sends one control request line on stdin and keeps the
+  # pipe open, so read exactly one line rather than to EOF.
+  if [ "$arg" = "--input-format" ]; then
+    IFS= read -r stdin_line || true
+    break
+  fi
+done
+
+if [ "$key" = other ]; then
+  case "$stdin_line" in
+    *get_usage*) key=get-usage ;;
+  esac
+fi
+if [ "$key" = other ]; then
+  for arg in "$@"; do
+    [ "$arg" = "/usage" ] && key=slash-usage
+  done
+fi
+
+mkdir -p "$state/calls"
+n=$(( $(ls "$state/calls" | wc -l) + 1 ))
+call="$state/calls/$(printf '%04d' "$n")"
+mkdir -p "$call"
+printf '%s\0' "$@" > "$call/args"
+/usr/bin/env -0 > "$call/env"
+printf '%s' "$stdin_line" > "$call/stdin"
+printf '%s' "$key" > "$call/key"
+
+replies="$state/replies/$key"
+first=""
+count=0
+if [ -d "$replies" ]; then
+  for seq in $(ls "$replies" | sort -n); do
+    count=$((count + 1))
+    [ -z "$first" ] && first="$seq"
+  done
+fi
+if [ -z "$first" ]; then
+  echo "stub claude: no canned reply for $key" >&2
+  exit 97
+fi
+reply="$replies/$first"
+
+if [ -d "$reply/files" ]; then
+  if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then
+    echo "stub claude: reply writes files but CLAUDE_CONFIG_DIR is unset" >&2
+    exit 98
+  fi
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  cp -R "$reply/files/." "$CLAUDE_CONFIG_DIR/"
+fi
+cat "$reply/stdout"
+cat "$reply/stderr" >&2
+code=$(cat "$reply/exit_code")
+
+if [ "$count" -gt 1 ]; then
+  mkdir -p "$state/used/$key"
+  mv "$reply" "$state/used/$key/$first"
+fi
+exit "$code"
