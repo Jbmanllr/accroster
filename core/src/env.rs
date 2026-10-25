@@ -20,7 +20,8 @@
 //!   (`SMAppService.mainApp`), which the user can also change in System
 //!   Settings → Login Items.
 //! - [`OsFacts`]: facts about the rest of the Mac that are queried, not
-//!   pushed: process liveness and parentage, the desktop app's version.
+//!   pushed: process liveness and parentage, the desktop app's version and
+//!   its running Claude Code children.
 //!   Facts the OS pushes (sleep/wake, screen lock, network path changes, the
 //!   desktop app launching or quitting) arrive as [`crate::Event`]s instead.
 //!
@@ -123,7 +124,8 @@ pub trait RunningProcess: Send {
 pub trait Clock: Send {
     fn now(&self) -> Timestamp;
 
-    /// The time zone dates and times are shown in: the Mac's own.
+    /// The Mac's own time zone: dates and times are shown in it, and local
+    /// times other programs write (Claude Code's `procStart`) are read in it.
     fn time_zone(&self) -> jiff::tz::TimeZone {
         jiff::tz::TimeZone::system()
     }
@@ -148,6 +150,10 @@ pub trait OsFacts: Send {
     /// (`/Library/Application Support/ClaudeCode/managed-settings.json`), or
     /// `None` when there is none or it can't be read.
     fn managed_settings(&self) -> Option<Vec<u8>>;
+    /// The pids of running Claude Code processes bundled with the desktop app
+    /// (`…/Application Support/Claude/claude-code/<ver>/…/claude`): its
+    /// Sessions' children.
+    fn desktop_claude_code_children(&self) -> Vec<u32>;
 }
 
 /// Where Claude Code reads managed (administrator) settings.
@@ -348,24 +354,51 @@ impl OsFacts for SystemOsFacts {
         })
     }
 
+    /// Read in-process from the bundle's `Info.plist`; nothing is spawned.
     fn desktop_app_version(&self) -> Option<String> {
-        let output = Command::new("/usr/bin/plutil")
-            .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
-            .arg("/Applications/Claude.app/Contents/Info.plist")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let version = String::from_utf8(output.stdout).ok()?;
+        use objc2_foundation::{NSBundle, NSString};
+        let bundle = NSBundle::bundleWithPath(&NSString::from_str("/Applications/Claude.app"))?;
+        let value =
+            bundle.objectForInfoDictionaryKey(&NSString::from_str("CFBundleShortVersionString"))?;
+        let version = value.downcast::<NSString>().ok()?.to_string();
         let version = version.trim();
         (!version.is_empty()).then(|| version.to_owned())
     }
 
     fn managed_settings(&self) -> Option<Vec<u8>> {
         std::fs::read(MANAGED_SETTINGS).ok()
+    }
+
+    fn desktop_claude_code_children(&self) -> Vec<u32> {
+        const BUNDLED: &str = "/Library/Application Support/Claude/claude-code/";
+        // SAFETY: with a null buffer `proc_listallpids` returns the number of
+        // pids; with a buffer it writes at most `size` bytes of pids.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let Ok(count) = usize::try_from(count) else {
+            return Vec::new();
+        };
+        // Room for processes started in between.
+        let mut pids = vec![0 as libc::pid_t; count + 64];
+        let size = i32::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
+        let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
+        pids.truncate(usize::try_from(written).unwrap_or(0));
+        pids.into_iter()
+            .filter(|&pid| pid > 0)
+            .filter(|&pid| {
+                let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                // SAFETY: `proc_pidpath` writes at most `buffer.len()` bytes
+                // and returns the path's length.
+                let len = unsafe {
+                    libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+                };
+                let Ok(len) = usize::try_from(len) else {
+                    return false;
+                };
+                let path = String::from_utf8_lossy(&buffer[..len.min(buffer.len())]);
+                path.contains(BUNDLED) && path.ends_with("/claude")
+            })
+            .filter_map(|pid| u32::try_from(pid).ok())
+            .collect()
     }
 }
 

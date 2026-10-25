@@ -258,8 +258,8 @@ impl Safety {
     }
 
     /// Pauses every feature a current finding blocks and that isn't paused
-    /// yet, queueing one notification each, then saves. Returns whether
-    /// anything was newly paused.
+    /// yet, queueing one notification each, then saves. Returns the features
+    /// newly paused.
     pub(crate) fn settle(&mut self) -> Vec<SafetyFeature> {
         let mut paused = Vec::new();
         for (feature, reason) in self.blockers() {
@@ -589,40 +589,6 @@ fn env_names(bytes: &[u8]) -> Option<Vec<(String, String)>> {
 
 fn is_on(value: &str) -> bool {
     matches!(value.trim(), "1" | "true")
-}
-
-/// The installed Claude versions, from links, folder names and the app's
-/// `Info.plist`; nothing is spawned.
-// Same as the desktop bridge's (ticket #42); whoever merges second keeps
-// `desktop::versions` and deletes this one.
-pub(crate) fn versions(env: &Environment) -> ClaudeVersions {
-    let home = &env.home;
-    let claude_code = fs::read_link(home.join(".local/bin/claude"))
-        .ok()
-        .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
-        .filter(|name| version_key(name).is_some());
-    let mut desktop_claude_code: Vec<String> =
-        fs::read_dir(home.join("Library/Application Support/Claude/claude-code"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.path().is_dir())
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|name| version_key(name).is_some())
-                    .collect()
-            })
-            .unwrap_or_default();
-    desktop_claude_code.sort_by_key(|name| version_key(name));
-    ClaudeVersions {
-        claude_code,
-        desktop_claude_code,
-        desktop: env.os.desktop_app_version(),
-    }
-}
-
-/// `2.1.310` as numbers, for ordering; `None` for anything else.
-fn version_key(name: &str) -> Option<Vec<u64>> {
-    name.split('.').map(|part| part.parse().ok()).collect()
 }
 
 /// "Claude Code 2.1.310", or "Claude Code" when its version is unknown.

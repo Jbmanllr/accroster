@@ -8,7 +8,8 @@
 #    stdin it read, the key and its pid.
 # 3. Answers from replies/<key>/<seq>/: copies files/ into $CLAUDE_CONFIG_DIR,
 #    prints stdout and stderr, exits with exit_code. Replies are consumed in
-#    order; the last one repeats. With no reply, exits 97. A reply marked
+#    order; the last one repeats until another is queued after it. With no
+#    reply, exits 97. A reply marked
 #    hang never answers: it waits until killed.
 set -u
 state="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,11 +61,20 @@ if [ -d "$replies" ]; then
     [ -z "$first" ] && first="$seq"
   done
 fi
+# A last reply that already answered (and so repeated) gives way to replies
+# queued after it.
+if [ "$count" -gt 1 ] && [ -f "$replies/$first/answered" ]; then
+  mkdir -p "$state/used/$key"
+  mv "$replies/$first" "$state/used/$key/$first"
+  count=$((count - 1))
+  first=$(ls "$replies" | sort -n | head -n 1)
+fi
 if [ -z "$first" ]; then
   echo "stub claude: no canned reply for $key" >&2
   exit 97
 fi
 reply="$replies/$first"
+[ "$count" -eq 1 ] && : > "$reply/answered"
 
 # A hanging reply waits, like a sign-in nobody finishes, until killed. exec
 # keeps the pid, so killing the recorded pid kills the wait.

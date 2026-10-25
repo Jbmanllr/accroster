@@ -322,7 +322,7 @@ fn a_claude_code_update_that_ignores_profile_folders_pauses_cli_switching() {
     );
     assert_eq!(notifications(&effects).len(), 1);
     assert_eq!(core.view().menu_bar.label, "?");
-    click_row(&mut core, 0);
+    assert!(rows(&core).iter().all(|row| row.command.is_none()));
     assert_eq!(mac.read_file(POINTER).unwrap(), pointer);
 }
 
@@ -330,8 +330,16 @@ fn a_claude_code_update_that_ignores_profile_folders_pauses_cli_switching() {
 fn auth_status_disagreeing_with_one_folder_pauses_cli_switching() {
     let (mac, mut core) = cli_on_with_two_profiles();
     install_claude_code(&mac, "2.1.400");
-    // Work's folder (checked first) gets the last sign-in's answer, as
-    // perso; perso's folder answers honestly.
+    // Work's folder (checked first) answers as a third account; perso's
+    // honestly.
+    let stranger = FixtureLogin::new(
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "someone@else.example",
+        "Else Ltd",
+    );
+    mac.claude
+        .reply(StubCall::AuthStatus, auth_status(&stranger));
     honest_auth_status(&mac);
 
     core.event(Event::MenuOpened);
@@ -373,6 +381,23 @@ fn honest_answers_after_an_update_pause_nothing_and_auth_status_stays_rare() {
     assert_eq!(
         core.view().diagnostics.versions.claude_code.as_deref(),
         Some("2.1.400")
+    );
+}
+
+#[test]
+fn a_version_change_is_also_noticed_on_a_tick() {
+    let (mac, mut core) = cli_on_with_two_profiles();
+    mac.claude
+        .reply(StubCall::AuthStatus, auth_status(&FixtureLogin::perso()));
+    mac.os.set_desktop_app_version(Some("3.7000.0"));
+
+    let effects = core.event(Event::Tick);
+
+    assert_eq!(notifications(&effects).len(), 1);
+    assert!(is_paused(&core, SafetyFeature::CliSwitching));
+    assert_eq!(
+        core.view().diagnostics.versions.desktop.as_deref(),
+        Some("3.7000.0")
     );
 }
 
@@ -574,6 +599,7 @@ fn on_an_empty_mac_every_check_is_never_seen_except_the_settings_env() {
 fn copy_report_holds_check_names_field_names_and_versions_only() {
     let (mac, core) = cli_on_with_two_profiles();
     drop(core);
+    honest_auth_status(&mac);
     install_claude_code(&mac, "2.1.310");
     mac.os.set_desktop_app_version(Some("3.6556.2"));
     std::fs::create_dir_all(mac.path("Library/Application Support/Claude/claude-code/2.1.308"))
@@ -799,9 +825,15 @@ fn a_malformed_oauth_account_pauses_cli_switching_and_hides_only_that_profile() 
         warnings(&core),
         ["Claude Code changed .claude.json accounts · CLI switching paused"]
     );
-    let rows = rows(&core);
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].title.starts_with("me@example.com"));
+    let titles: Vec<String> = rows(&core).into_iter().map(|row| row.title).collect();
+    assert_eq!(
+        titles,
+        [
+            "Signed-out Profile",
+            "me@example.com · me@example.com's Organization"
+        ],
+        "the unreadable account degrades to its own row only"
+    );
     assert_eq!(
         diagnostics_check(&core, ".claude.json oauthAccount")
             .detail

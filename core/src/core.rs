@@ -10,6 +10,7 @@ use jiff::SignedDuration;
 use crate::backups;
 use crate::checks;
 use crate::cli_switcher::{self, TurnedOff};
+use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
@@ -77,6 +78,7 @@ pub struct Core {
     profiles: ProfileRegistry,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
+    desktop: DesktopBridge,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
     /// Format check results and Safety pauses.
@@ -95,6 +97,9 @@ struct ProfileLinks {
     /// Whether every shared-Transcript link is in place.
     transcripts_shared: bool,
 }
+
+/// An account as `(email, Organization uuid)`.
+type Account = (Option<String>, Option<String>);
 
 /// When a self-check runs Claude Code's `auth status` in every Profile.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,6 +132,7 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             cli_note: None,
+            desktop: DesktopBridge::default(),
             discovered: Vec::new(),
             safety: Safety::load(&paths_for_safety),
             versions: ClaudeVersions::default(),
@@ -201,7 +207,7 @@ impl Core {
     /// while a sign-in is waiting (so its end shows at once), otherwise
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
-        if self.profiles.signing_in() {
+        if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
@@ -310,6 +316,32 @@ impl Core {
                     ))]
                 })
                 .unwrap_or_default(),
+            Command::SwitchDesktopApp(id) => {
+                let target = self
+                    .profiles
+                    .signed_in()
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map(Target::of);
+                let Some(target) = target else {
+                    return Vec::new();
+                };
+                let (desktop, ctx) = self.desktop();
+                desktop.start(&ctx, target)
+            }
+            Command::ConfirmDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.confirm(&ctx)
+            }
+            Command::NotifyWhenDesktopIdle => {
+                self.desktop.notify_when_idle();
+                Vec::new()
+            }
+            Command::CancelDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.cancel(&ctx);
+                Vec::new()
+            }
             Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
             Command::OpenDiagnostics => vec![Effect::ShowDiagnostics],
             Command::CopyDiagnosticsReport => {
@@ -319,12 +351,62 @@ impl Core {
                 self.resume(feature);
                 Vec::new()
             }
+            Command::Rename(NicknameTarget::Profile(id)) => self
+                .profiles
+                .nickname_prompt(&id, &self.settings)
+                .into_iter()
+                .collect(),
+            Command::SetNickname {
+                target: NicknameTarget::Profile(id),
+                nickname,
+            } => {
+                self.set_nickname(id, nickname);
+                Vec::new()
+            }
+            Command::MoveProfile { id, to } => {
+                self.move_profile(&id, to);
+                Vec::new()
+            }
+            Command::SignInAgain(id) => {
+                let (profiles, ctx) = self.profiles();
+                profiles.sign_in_again(&ctx, &id);
+                Vec::new()
+            }
+            Command::AskRemoveProfile(id) => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfile(id.clone());
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfile(id) => {
+                self.remove_profile(&id);
+                Vec::new()
+            }
+            Command::AskRemoveProfileWithNextCli { id, next } => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfileWithNextCli {
+                    id: id.clone(),
+                    next,
+                };
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfileWithNextCli { id, next } => {
+                if self.point_cli_elsewhere(next.as_deref()) {
+                    self.remove_profile(&id);
+                }
+                Vec::new()
+            }
         }
     }
 
     /// Handles something that happened outside the core.
     pub fn event(&mut self, event: Event) -> Vec<Effect> {
-        match event {
+        let mut effects = match event {
             Event::Tick => {
                 if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
                     self.set_verbose_logging_until(None);
@@ -332,6 +414,7 @@ impl Core {
                 let was_signing_in = self.profiles.signing_in();
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
+                let mut effects = profiles.take_effects();
                 if self.profiles.take_auth_disagreement() {
                     let finding = self.config_dir_disagreement("in a new Profile");
                     self.safety.record(CheckId::ConfigDirHonoured, finding);
@@ -339,22 +422,26 @@ impl Core {
                 if was_signing_in && !self.profiles.signing_in() {
                     self.check_links();
                 }
-                self.safety.settle();
+                if !self.self_check_if_versions_changed() {
+                    self.settle();
+                }
+                let signed_in = self.profiles.signed_in();
+                let (desktop, ctx) = self.desktop();
+                effects.extend(desktop.poll(&ctx, &signed_in));
+                effects
             }
             Event::MenuOpened => {
                 self.rescan_discovered();
-                let versions = safety::versions(&self.env);
-                if self.safety.versions_changed(&versions) {
-                    self.log(Level::Info, "claude versions changed", &[]);
-                    self.self_check(AuthCheck::IfVersionsChanged);
-                } else {
+                if !self.self_check_if_versions_changed() {
                     self.safety.check_settings_env(&self.env, true);
                     self.check_links();
-                    self.safety.settle();
+                    self.settle();
                 }
+                Vec::new()
             }
-        }
-        self.take_effects()
+        };
+        effects.extend(self.take_effects());
+        effects
     }
 
     /// Everything the UI shows right now.
@@ -369,7 +456,9 @@ impl Core {
             .chain(self.profiles.notice())
             .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
-        let mut listed = self.profiles.listed(self.env.clock.as_ref());
+        let mut listed = self
+            .profiles
+            .listed(self.env.clock.as_ref(), &self.settings);
         for profile in &mut listed {
             self.annotate_links(profile.id, &mut profile.row);
         }
@@ -378,12 +467,38 @@ impl Core {
             &mut listed,
             self.safety.is_paused(SafetyFeature::CliSwitching),
         );
-        let header: Vec<String> = cli.header.into_iter().collect();
+        items.extend(self.desktop.menu_items());
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        let signed_in = self.profiles.signed_in();
+        let desktop_account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+        let desktop_profile = desktop_account
+            .as_ref()
+            .and_then(|account| account.profile(&signed_in));
+        // The CLI part comes first.
+        let mut header: Vec<String> = cli.header.into_iter().collect();
+        if desktop_account.is_some() {
+            let name = desktop_profile.map_or("another account", |profile| &profile.name);
+            header.push(format!("Desktop: {name}"));
+        }
         if !header.is_empty() {
             items.push(MenuItem::Detail(header.join("    ")));
         }
-        if !items.is_empty() {
-            items.push(MenuItem::Separator);
+        let desktop_installed = self.env.os.desktop_app_version().is_some();
+        for listed in listed.iter_mut() {
+            let Some(profile) = signed_in.iter().find(|profile| profile.id == listed.id) else {
+                continue;
+            };
+            let row = &mut listed.row;
+            if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
+                row.badges.push("Desktop".into());
+            } else if desktop_installed {
+                row.submenu.push(MenuItem::Action {
+                    title: "Switch desktop app to this Profile…".into(),
+                    command: Command::SwitchDesktopApp(profile.id.clone()),
+                });
+            }
         }
         let shown = self.shown_discovered();
         let tz = self.env.clock.time_zone();
@@ -526,11 +641,22 @@ impl Core {
         }
     }
 
+    /// Runs the full self-check when a Claude version changed since the last
+    /// one. Returns whether it ran.
+    fn self_check_if_versions_changed(&mut self) -> bool {
+        if !self.safety.versions_changed(&desktop::versions(&self.env)) {
+            return false;
+        }
+        self.log(Level::Info, "claude versions changed", &[]);
+        self.self_check(AuthCheck::IfVersionsChanged);
+        true
+    }
+
     /// The full self-check: settings `env`, accounts, links, Sidebar entries,
     /// live-process files and Transcript records, plus `auth status` per
     /// `auth`; then pauses whatever a failed check blocks.
     fn self_check(&mut self, auth: AuthCheck) {
-        let versions = safety::versions(&self.env);
+        let versions = desktop::versions(&self.env);
         let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
         self.versions = versions;
         self.safety.check_settings_env(&self.env, false);
@@ -558,6 +684,11 @@ impl Core {
             checks::transcript_records(&home),
         );
         self.safety.mark_checked(&self.versions);
+        self.settle();
+    }
+
+    /// Pauses whatever a current finding blocks, and logs each new pause.
+    fn settle(&mut self) {
         for feature in self.safety.settle() {
             self.log(
                 Level::Warn,
@@ -646,38 +777,37 @@ impl Core {
     /// nothing either way.
     fn check_config_dir_honoured(&mut self) {
         let runner = Runner::new(&self.env, &self.paths);
-        let answers: Vec<(String, String, Option<crate::runner::AuthStatus>)> = self
+        // Per signed-in Profile: the (email, Organization) its folder holds,
+        // and what a readable, logged-in `auth status` said, if anything.
+        let answers: Vec<(Account, Option<Account>)> = self
             .profiles
             .accounts()
             .into_iter()
             .map(|account| {
-                (
-                    account.email.to_owned(),
-                    account.organization_uuid.to_owned(),
-                    runner.auth_status(account.config_dir),
-                )
+                let said = runner
+                    .auth_status(account.config_dir)
+                    .filter(|status| status.logged_in)
+                    .map(|status| (status.email, status.org_id));
+                let held = (
+                    Some(account.email.to_owned()),
+                    Some(account.organization_uuid.to_owned()),
+                );
+                (held, said)
             })
             .collect();
-        let reported: Vec<(&str, &str, (Option<&str>, Option<&str>))> = answers
+        let said: Vec<&Account> = answers
             .iter()
-            .filter_map(|(email, org, status)| {
-                let status = status.as_ref().filter(|status| status.logged_in)?;
-                Some((
-                    email.as_str(),
-                    org.as_str(),
-                    (status.email.as_deref(), status.org_id.as_deref()),
-                ))
-            })
+            .filter_map(|(_, said)| said.as_ref())
             .collect();
-        if reported.is_empty() {
+        if said.is_empty() {
             return;
         }
         let one_identity = answers.len() > 1
-            && reported.len() == answers.len()
-            && reported.iter().all(|(_, _, said)| *said == reported[0].2);
-        let disagreeing = reported
+            && said.len() == answers.len()
+            && said.iter().all(|account| *account == said[0]);
+        let disagreeing = answers
             .iter()
-            .filter(|(email, org, said)| *said != (Some(*email), Some(*org)))
+            .filter(|(held, said)| said.as_ref().is_some_and(|said| said != held))
             .count();
         let finding = if one_identity {
             let reason = format!(
@@ -715,14 +845,14 @@ impl Core {
     fn resume(&mut self, feature: SafetyFeature) {
         match feature {
             SafetyFeature::CliSwitching => {
-                self.versions = safety::versions(&self.env);
+                self.versions = desktop::versions(&self.env);
                 self.safety.check_settings_env(&self.env, false);
                 self.check_accounts();
                 self.check_config_dir_honoured();
             }
             SafetyFeature::TranscriptSharing => self.check_links(),
         }
-        self.safety.settle();
+        self.settle();
         if !self.safety.resume(feature) {
             self.log(
                 Level::Info,
@@ -816,6 +946,95 @@ impl Core {
             "verbose logging",
             &[("state", Field::Word(state))],
         );
+    }
+
+    /// Sets or (when blank) clears a Profile's nickname.
+    fn set_nickname(&mut self, id: String, nickname: Option<String>) {
+        let mut updated = self.settings.clone();
+        match nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => updated.nicknames.insert(id.clone(), name.to_owned()),
+            None => updated.nicknames.remove(&id),
+        };
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "nickname changed",
+                &[("profile", Field::Profile(&id))],
+            );
+        }
+    }
+
+    /// Remove… confirmed: signs the Profile out and deletes its folder, then
+    /// forgets its nickname and place in the order.
+    fn remove_profile(&mut self, id: &str) {
+        let (profiles, ctx) = self.profiles();
+        if profiles.remove(&ctx, id) {
+            self.forget_profile_settings(id);
+        }
+    }
+
+    /// Points new CLI runs at Profile `next`, or at Default (`~/.claude`,
+    /// no pointer) for `None`, before the CLI's Active Profile is removed.
+    /// Returns whether that worked; the removal waits for it.
+    fn point_cli_elsewhere(&mut self, next: Option<&str>) -> bool {
+        let result = match next {
+            Some(next) => match self.profiles.config_dir(next) {
+                Some(config_dir) => cli_switcher::set_pointer(&self.paths, config_dir),
+                None => return false,
+            },
+            None => cli_switcher::clear_pointer(&self.paths),
+        };
+        match result {
+            Ok(()) => {
+                self.log(Level::Info, "cli profile moved before removal", &[]);
+                true
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not moved",
+                    &[("error", Field::Text(&error))],
+                );
+                false
+            }
+        }
+    }
+
+    /// Drops a removed Profile's nickname and place in the order.
+    fn forget_profile_settings(&mut self, id: &str) {
+        let mut updated = self.settings.clone();
+        updated.nicknames.remove(id);
+        updated.profile_order.retain(|known| known != id);
+        if updated != self.settings {
+            self.save_settings(updated);
+        }
+    }
+
+    /// Moves a Profile to position `to` (clamped) and saves the whole order.
+    fn move_profile(&mut self, id: &str, to: usize) {
+        let mut order = self.profiles.ordered_ids(&self.settings.profile_order);
+        let Some(from) = order.iter().position(|known| known == id) else {
+            return;
+        };
+        let moved = order.remove(from);
+        order.insert(to.min(order.len()), moved);
+        let mut updated = self.settings.clone();
+        updated.profile_order = order;
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "profile moved",
+                &[
+                    ("profile", Field::Profile(id)),
+                    ("to", Field::Number(to as i64)),
+                ],
+            );
+        }
     }
 
     /// Writes `settings.json` and keeps `updated` as the current settings.
@@ -933,7 +1152,7 @@ impl Core {
         }
         // The shared settings may have changed since the menu opened.
         if self.safety.check_settings_env(&self.env, true) {
-            self.safety.settle();
+            self.settle();
         }
         if self.safety.is_paused(SafetyFeature::CliSwitching) {
             self.log(Level::Info, "cli profile not chosen: paused", &[]);
@@ -960,6 +1179,19 @@ impl Core {
                 );
             }
         }
+    }
+
+    /// The Desktop bridge, with what it needs from the rest of the core.
+    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+        let verbose = self.verbose_logging();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose,
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        };
+        (&mut self.desktop, ctx)
     }
 
     /// The Profile registry, with what it needs from the rest of the core.

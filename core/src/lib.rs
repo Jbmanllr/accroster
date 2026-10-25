@@ -9,6 +9,7 @@ mod backups;
 mod checks;
 mod cli_switcher;
 mod core;
+mod desktop;
 mod discovered;
 pub mod driver;
 pub mod env;
@@ -32,12 +33,10 @@ pub use interface::{
     AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
     SettingsView, View,
 };
+pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
-    CheckRow, CheckStatus, ClaudeVersions, DiagnosticsView, PausedFeature, SafetyFeature,
-};
-pub use interface::{
-    CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView, HiddenDiscovered,
-    LaunchAtLoginView, NicknameTarget,
+    ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget,
 };
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

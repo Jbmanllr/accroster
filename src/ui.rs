@@ -8,12 +8,14 @@ use std::cell::{Cell, OnceCell, RefCell};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
-    Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
+    CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event, LimitBar, MenuItem,
+    ProfileRow, SettingsView, View,
 };
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
@@ -61,6 +63,9 @@ pub struct Ivars {
     /// The commands of the menu's clickable items (submenus included), by tag.
     actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
+    diagnostics: OnceCell<DiagnosticsWindow>,
+    /// The Diagnostics window's Resume buttons' commands, by tag.
+    resume_commands: RefCell<Vec<Command>>,
     /// The first-run offer, open while the view has one.
     first_run: RefCell<Option<FirstRunWindow>>,
     /// Whether the status item's menu is open. While it is, the menu (and its
@@ -74,6 +79,13 @@ pub struct Ivars {
 struct FirstRunWindow {
     window: Retained<NSWindow>,
     launch_at_login: Retained<NSButton>,
+}
+
+struct DiagnosticsWindow {
+    window: Retained<NSWindow>,
+    text: Retained<NSTextField>,
+    /// One Resume button per feature that can be paused, hidden when unused.
+    resume: Vec<Retained<NSButton>>,
 }
 
 struct SettingsWindow {
@@ -200,6 +212,21 @@ define_class!(
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
         }
+
+        #[unsafe(method(copyReportClicked:))]
+        fn copy_report_clicked(&self, _sender: &NSButton) {
+            self.send(Command::CopyDiagnosticsReport);
+        }
+
+        #[unsafe(method(resumeClicked:))]
+        fn resume_clicked(&self, sender: &NSButton) {
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().resume_commands.borrow().get(tag).cloned());
+            if let Some(command) = command {
+                self.send(command);
+            }
+        }
     }
 );
 
@@ -212,6 +239,8 @@ impl Ui {
             status_item,
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
+            diagnostics: OnceCell::new(),
+            resume_commands: RefCell::new(Vec::new()),
             first_run: RefCell::new(None),
             menu_open: Cell::new(false),
             pending_menu: RefCell::new(None),
@@ -258,6 +287,9 @@ impl Ui {
             .collect();
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
+        }
+        if let Some(diagnostics) = self.ivars().diagnostics.get() {
+            self.render_diagnostics(diagnostics, &view.diagnostics);
         }
         self.render_first_run(view);
     }
@@ -313,6 +345,11 @@ impl Ui {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
                 MenuItem::Warning(text) => disabled_item(mtm, &format!("⚠︎ {text}")),
                 MenuItem::Detail(text) => disabled_item(mtm, text),
+                MenuItem::Submenu { title, items } => {
+                    let row = menu_item(mtm, title);
+                    row.setSubmenu(Some(&self.build_menu(items, actions)));
+                    row
+                }
                 MenuItem::Action { title, command } => {
                     let row = menu_item(mtm, title);
                     unsafe {
@@ -400,6 +437,16 @@ impl Ui {
                 settings.window.makeKeyAndOrderFront(None);
                 app.activate();
             }
+            Effect::ShowDiagnostics => {
+                let diagnostics = self
+                    .ivars()
+                    .diagnostics
+                    .get_or_init(|| self.make_diagnostics_window());
+                self.render_diagnostics(diagnostics, &view.diagnostics);
+                diagnostics.window.center();
+                diagnostics.window.makeKeyAndOrderFront(None);
+                app.activate();
+            }
             Effect::ShowAbout => {
                 let about = &view.about;
                 let credits = NSAttributedString::from_nsstring(&NSString::from_str(&format!(
@@ -441,6 +488,8 @@ impl Ui {
                     NSPasteboardTypeString
                 });
             }
+            Effect::BringDesktopAppForward => bring_desktop_app_forward(),
+            Effect::Notify { title, body } => notify(&title, &body),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
                 name,
@@ -452,6 +501,24 @@ impl Ui {
                         target,
                         nickname: Some(nickname),
                     });
+                }
+            }
+            Effect::ConfirmRemoval {
+                title,
+                message,
+                confirm,
+            } => {
+                let alert = NSAlert::new(mtm);
+                alert.setAlertStyle(NSAlertStyle::Warning);
+                alert.setMessageText(&NSString::from_str(&title));
+                alert.setInformativeText(&NSString::from_str(&message));
+                alert
+                    .addButtonWithTitle(ns_string!("Remove"))
+                    .setHasDestructiveAction(true);
+                alert.addButtonWithTitle(ns_string!("Cancel"));
+                app.activate();
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.send(confirm);
                 }
             }
         }
@@ -517,6 +584,147 @@ impl Ui {
             window,
             launch_at_login: checkbox,
         }
+    }
+
+    /// The Diagnostics window: the checks and versions as selectable text,
+    /// a Resume button per resumable pause, and Copy report.
+    fn make_diagnostics_window(&self) -> DiagnosticsWindow {
+        let mtm = self.mtm();
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("AccRoster Diagnostics"));
+        let content = window.contentView().expect("a window has a content view");
+
+        let text = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        text.setSelectable(true);
+        text.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        text.setFrame(NSRect::new(
+            NSPoint::new(20.0, 64.0),
+            NSSize::new(520.0, 360.0),
+        ));
+        content.addSubview(&text);
+
+        let copy = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Copy report"),
+                Some(self),
+                Some(sel!(copyReportClicked:)),
+                mtm,
+            )
+        };
+        copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
+        content.addSubview(&copy);
+
+        let resume = [180.0, 360.0]
+            .into_iter()
+            .map(|x| {
+                let button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!("Resume"),
+                        Some(self),
+                        Some(sel!(resumeClicked:)),
+                        mtm,
+                    )
+                };
+                button.setFrameOrigin(NSPoint::new(x, 20.0));
+                button.setHidden(true);
+                content.addSubview(&button);
+                button
+            })
+            .collect();
+
+        DiagnosticsWindow {
+            window,
+            text,
+            resume,
+        }
+    }
+
+    fn render_diagnostics(&self, diagnostics: &DiagnosticsWindow, view: &DiagnosticsView) {
+        let mut lines = Vec::new();
+        for paused in &view.paused {
+            let state = if paused.resume.is_some() {
+                "checks pass again: Resume when ready"
+            } else {
+                "waiting for the checks to pass"
+            };
+            lines.push(format!("{}: {} ({state})", paused.title, paused.reason));
+        }
+        if !view.paused.is_empty() {
+            lines.push(String::new());
+        }
+        let versions = &view.versions;
+        let unknown = || "unknown".to_owned();
+        lines.push(format!(
+            "Claude Code: {}",
+            versions.claude_code.clone().unwrap_or_else(unknown)
+        ));
+        lines.push(format!(
+            "Desktop's Claude Code: {}",
+            if versions.desktop_claude_code.is_empty() {
+                unknown()
+            } else {
+                versions.desktop_claude_code.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "Claude desktop app: {}",
+            versions.desktop.clone().unwrap_or_else(unknown)
+        ));
+        lines.push(String::new());
+        for check in &view.checks {
+            let mark = match check.status {
+                CheckStatus::Pass => "✓",
+                CheckStatus::Fail => "✗",
+                CheckStatus::NeverSeen => "–",
+            };
+            let status = match check.status {
+                CheckStatus::Pass => "pass",
+                CheckStatus::Fail => "fail",
+                CheckStatus::NeverSeen => "never seen",
+            };
+            match &check.detail {
+                Some(detail) => lines.push(format!("{mark} {} · {status} · {detail}", check.name)),
+                None => lines.push(format!("{mark} {} · {status}", check.name)),
+            }
+        }
+        diagnostics
+            .text
+            .setStringValue(&NSString::from_str(&lines.join("\n")));
+
+        let resumable: Vec<(String, Command)> = view
+            .paused
+            .iter()
+            .filter_map(|paused| {
+                let command = paused.resume.clone()?;
+                let feature = paused.title.trim_end_matches(" paused");
+                Some((format!("Resume {feature}"), command))
+            })
+            .collect();
+        for (index, button) in diagnostics.resume.iter().enumerate() {
+            match resumable.get(index) {
+                Some((title, _)) => {
+                    button.setTitle(&NSString::from_str(title));
+                    button.sizeToFit();
+                    button.setTag(index as isize);
+                    button.setHidden(false);
+                }
+                None => button.setHidden(true),
+            }
+        }
+        *self.ivars().resume_commands.borrow_mut() =
+            resumable.into_iter().map(|(_, command)| command).collect();
     }
 
     fn make_settings_window(&self) -> SettingsWindow {
@@ -731,7 +939,13 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     name_line.extend(badges.iter().map(|badge| -> &NSView { badge }));
     name_line.extend([&*filler, &arrow]);
     let mut lines: Vec<Retained<NSView>> = vec![stack(mtm, false, 5.0, &name_line).into_super()];
-    lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    lines.extend(row.limits.iter().map(|bar| {
+        let line = limit_line(mtm, bar);
+        if row.dimmed {
+            line.setAlphaValue(0.45);
+        }
+        line
+    }));
     lines.extend(row.offers.iter().map(|offer| {
         label(mtm, offer, NSFont::systemFontOfSize(10.0), false)
             .into_super()
@@ -759,6 +973,70 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
             .setActive(true);
     }
     body.into_super()
+}
+
+/// The Claude desktop app's bundle id.
+const DESKTOP_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
+
+/// Opens Claude, or brings it forward when it runs. Never quits or relaunches
+/// it: `openApplicationAtURL` activates a running app in place.
+fn bring_desktop_app_forward() {
+    use objc2_app_kit::NSWorkspaceOpenConfiguration;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let Some(url) =
+        workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(DESKTOP_BUNDLE_ID))
+    else {
+        return;
+    };
+    let configuration = NSWorkspaceOpenConfiguration::configuration();
+    configuration.setActivates(true);
+    workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
+}
+
+#[link(name = "UserNotifications", kind = "framework")]
+unsafe extern "C" {}
+
+/// Posts a notification through `UNUserNotificationCenter`, asking for
+/// permission the first time. Only a bundled app may use it (outside a bundle
+/// the center throws), so an unbundled run skips notifications.
+fn notify(title: &str, body: &str) {
+    use block2::RcBlock;
+    use objc2::runtime::{AnyClass, Bool};
+    use objc2_foundation::{NSBundle, NSUUID};
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        return;
+    }
+    let (Some(center_class), Some(content_class), Some(request_class)) = (
+        AnyClass::get(c"UNUserNotificationCenter"),
+        AnyClass::get(c"UNMutableNotificationContent"),
+        AnyClass::get(c"UNNotificationRequest"),
+    ) else {
+        return;
+    };
+    // SAFETY: documented UserNotifications selectors with their documented
+    // argument types; nil completion handlers are allowed.
+    unsafe {
+        let center: Retained<AnyObject> = msg_send![center_class, currentNotificationCenter];
+        // UNAuthorizationOptionSound | UNAuthorizationOptionAlert.
+        let options: usize = (1 << 1) | (1 << 2);
+        let asked = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
+        let _: () = msg_send![&center, requestAuthorizationWithOptions: options, completionHandler: &*asked];
+        let content: Retained<AnyObject> = msg_send![content_class, new];
+        let _: () = msg_send![&content, setTitle: &*NSString::from_str(title)];
+        let _: () = msg_send![&content, setBody: &*NSString::from_str(body)];
+        let id = NSUUID::UUID().UUIDString();
+        let request: Retained<AnyObject> = msg_send![
+            request_class,
+            requestWithIdentifier: &*id,
+            content: &*content,
+            trigger: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![
+            &center,
+            addNotificationRequest: &*request,
+            withCompletionHandler: std::ptr::null::<AnyObject>()
+        ];
+    }
 }
 
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the

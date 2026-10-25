@@ -564,3 +564,116 @@ fn with_no_other_claude_on_path_the_shim_says_so() {
     assert_eq!(out.status.code(), Some(127));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no claude"));
 }
+
+#[test]
+fn a_nickname_is_the_clis_short_label() {
+    let (_mac, mut core) = two_profiles();
+    click_row(&mut core, 0);
+    let rename = submenu_command(&core, 0, "Rename…");
+    let Some(Effect::AskNickname { target, .. }) = core.command(rename).pop() else {
+        panic!("Rename… asks for a nickname");
+    };
+
+    core.command(Command::SetNickname {
+        target,
+        nickname: Some("Work".into()),
+    });
+
+    assert_eq!(core.view().menu_bar.label, "Work 92%");
+    assert_eq!(header(&core).as_deref(), Some("CLI: Work"));
+}
+
+/// The choices under the CLI's Active Profile's "Remove…" submenu.
+fn removal_choices(core: &Core, row: usize) -> Vec<(String, Command)> {
+    rows(core)[row]
+        .submenu
+        .iter()
+        .find_map(|item| match item {
+            MenuItem::Submenu { title, items } if title == "Remove…" => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action { title, command } => {
+                            Some((title.clone(), command.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("Remove… is a submenu: {:?}", rows(core)[row].submenu))
+}
+
+fn confirm(core: &mut Core, command: Command) {
+    let Some(Effect::ConfirmRemoval { confirm, .. }) = core.command(command).pop() else {
+        panic!("the removal is confirmed first");
+    };
+    core.command(confirm);
+}
+
+#[test]
+fn removing_the_clis_active_profile_asks_which_profile_is_next_and_moves_the_pointer_first() {
+    let (mac, mut core) = two_profiles();
+    mac.claude.reply(StubCall::AuthLogout, signed_out());
+    click_row(&mut core, 0);
+    let perso_dir = profile_dir(&mac, &core, 1);
+    assert!(
+        !rows(&core)[1]
+            .submenu
+            .iter()
+            .any(|item| matches!(item, MenuItem::Submenu { .. })),
+        "only the CLI's Active Profile asks"
+    );
+    let choices = removal_choices(&core, 0);
+    let titles: Vec<&str> = choices.iter().map(|(title, _)| title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "me@example.com · me@example.com's Organization",
+            "Default (~/.claude)"
+        ]
+    );
+
+    confirm(&mut core, choices[0].1.clone());
+
+    assert_eq!(mac.read_file(POINTER).unwrap(), perso_dir);
+    assert_eq!(mac.list(PROFILES).len(), 1);
+    assert_eq!(rows(&core).len(), 1);
+    assert_eq!(rows(&core)[0].badges, ["CLI"]);
+}
+
+#[test]
+fn removing_the_clis_active_profile_with_default_next_deletes_the_pointer() {
+    let (mac, mut core) = two_profiles();
+    mac.claude.reply(StubCall::AuthLogout, signed_out());
+    click_row(&mut core, 0);
+
+    let default = removal_choices(&core, 0).pop().unwrap().1;
+    confirm(&mut core, default);
+
+    assert!(mac.read_file(POINTER).is_none());
+    assert_eq!(header(&core).as_deref(), Some("CLI: Default"));
+    assert_eq!(mac.list(PROFILES).len(), 1);
+}
+
+#[test]
+fn the_pointer_moves_before_the_sign_out_so_a_failed_sign_out_keeps_the_folder_but_not_the_cli() {
+    let (mac, mut core) = two_profiles();
+    mac.claude.reply(
+        StubCall::AuthLogout,
+        Reply::fail(1, "Logout failed: offline\n"),
+    );
+    click_row(&mut core, 0);
+    let perso_dir = profile_dir(&mac, &core, 1);
+
+    let next_perso = removal_choices(&core, 0)[0].1.clone();
+    confirm(&mut core, next_perso);
+
+    assert_eq!(
+        mac.read_file(POINTER).unwrap(),
+        perso_dir,
+        "rewritten first"
+    );
+    assert_eq!(mac.list(PROFILES).len(), 2, "the folder is kept");
+}
