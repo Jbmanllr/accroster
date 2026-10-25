@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use crate::env::OsFacts;
-use crate::interface::{Command, DiscoveredPair, Effect, OpenChoice, RunningDot};
+use crate::interface::{Command, Effect, OpenChoice, ProfileKey, RunningDot};
 use crate::sessions::{EntryFacts, SessionFacts};
 
 /// The desktop app's `entrypoint` in Transcripts.
@@ -43,7 +43,7 @@ pub(crate) struct Clients {
 /// The desktop app's side.
 pub(crate) struct DesktopClient {
     /// Its Active Profile's account and Organization, when its files tell.
-    pub pair: Option<DiscoveredPair>,
+    pub pair: Option<ProfileKey>,
     /// That Profile's name ("Work"), when it is one AccRoster knows.
     pub name: Option<String>,
 }
@@ -60,7 +60,7 @@ impl DesktopClient {
 /// A signed-in Profile with the name the Open section shows.
 pub(crate) struct NamedProfile {
     pub id: String,
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     pub name: String,
 }
 
@@ -153,7 +153,7 @@ pub(crate) fn resume_blocked(facts: &SessionFacts, clients: &Clients) -> Option<
 /// The entry a Guided switch to `pair` would open afterwards.
 pub(crate) fn switch_entry<'a>(
     facts: &'a SessionFacts,
-    pair: &DiscoveredPair,
+    pair: &ProfileKey,
 ) -> Option<&'a EntryFacts> {
     open_entry(facts, Some(pair))
 }
@@ -248,10 +248,7 @@ fn archived_resumable(facts: &SessionFacts, desktop: &DesktopClient) -> bool {
 
 /// The newest entry of `pair` the continue link can open: not archived (the
 /// link skips archived entries) and with an id it accepts.
-fn open_entry<'a>(
-    facts: &'a SessionFacts,
-    pair: Option<&DiscoveredPair>,
-) -> Option<&'a EntryFacts> {
+fn open_entry<'a>(facts: &'a SessionFacts, pair: Option<&ProfileKey>) -> Option<&'a EntryFacts> {
     let pair = pair?;
     facts
         .entries

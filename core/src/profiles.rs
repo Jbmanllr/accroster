@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
+use crate::claude_json;
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
 use crate::interface::{
-    Command, DiscoveredPair, Effect, MenuItem, NicknameTarget, ProfileRow, SafetyFeature,
+    Command, Effect, MenuItem, NicknameTarget, ProfileKey, ProfileRow, SafetyFeature,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{Completed, LimitsView, Watched};
@@ -65,8 +66,7 @@ impl Context<'_> {
 /// folder's `.claude.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
-    account_uuid: String,
-    organization_uuid: String,
+    key: ProfileKey,
     email: String,
     organization_name: String,
     /// For example `claude_max`; the plan when no usage read has said.
@@ -77,25 +77,13 @@ impl Identity {
     /// `oauthAccount` of `<config_dir>/.claude.json`, or `None` when the
     /// folder holds no sign-in.
     fn read(config_dir: &Path) -> Option<Identity> {
-        let bytes = fs::read(config_dir.join(".claude.json")).ok()?;
-        let body: Value = serde_json::from_slice(&bytes).ok()?;
-        let account = body.get("oauthAccount")?;
-        let text = |key: &str| account.get(key).and_then(Value::as_str).map(str::to_owned);
+        let account = claude_json::read_account(&config_dir.join(".claude.json"))?;
         Some(Identity {
-            account_uuid: text("accountUuid")?,
-            organization_uuid: text("organizationUuid")?,
-            email: text("emailAddress").unwrap_or_default(),
-            organization_name: text("organizationName").unwrap_or_default(),
-            organization_type: text("organizationType"),
+            key: account.key,
+            email: account.email,
+            organization_name: account.organization_name,
+            organization_type: account.organization_type,
         })
-    }
-
-    fn same_profile(&self, other: &Identity) -> bool {
-        self.account_uuid == other.account_uuid && self.organization_uuid == other.organization_uuid
-    }
-
-    fn is(&self, pair: &DiscoveredPair) -> bool {
-        self.account_uuid == pair.account_uuid && self.organization_uuid == pair.organization_uuid
     }
 
     /// `email · Organization`.
@@ -130,8 +118,7 @@ pub(crate) struct Listed<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignedInProfile {
     pub id: String,
-    pub account_uuid: String,
-    pub organization_uuid: String,
+    pub key: ProfileKey,
     /// `email · Organization`.
     pub name: String,
 }
@@ -258,7 +245,7 @@ fn capitalized(word: &str) -> String {
 
 /// The account a sign-in started from a Discovered Profile is meant to add.
 pub(crate) struct SignInTarget {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// Passed as `--email` when known.
     pub email: Option<String>,
     /// How the menu names it ("X" in "Signed in as Y, not X").
@@ -494,7 +481,7 @@ impl ProfileRegistry {
             };
             let held = Account {
                 email: Some(identity.email.clone()),
-                organization_uuid: Some(identity.organization_uuid.clone()),
+                organization_uuid: Some(identity.key.organization_uuid.clone()),
             };
             let tag = Tag {
                 id: profile.id.clone(),
@@ -700,7 +687,7 @@ impl ProfileRegistry {
         let confirmed = status.as_ref().is_some_and(|status| {
             status.logged_in
                 && status.email.as_deref() == Some(identity.email.as_str())
-                && status.org_id.as_deref() == Some(identity.organization_uuid.as_str())
+                && status.org_id.as_deref() == Some(identity.key.organization_uuid.as_str())
         });
         if confirmed {
             return;
@@ -884,12 +871,12 @@ impl ProfileRegistry {
     }
 
     /// Whether a signed-in Profile has this (account, Organization) pair.
-    pub(crate) fn has_signed_in(&self, pair: &DiscoveredPair) -> bool {
+    pub(crate) fn has_signed_in(&self, pair: &ProfileKey) -> bool {
         self.profiles.iter().any(|profile| {
             profile
                 .identity
                 .as_ref()
-                .is_some_and(|identity| identity.is(pair))
+                .is_some_and(|identity| identity.key == *pair)
         })
     }
 
@@ -958,7 +945,7 @@ impl ProfileRegistry {
                 Some(Watched {
                     id: profile.id.clone(),
                     config_dir: profile.config_dir.clone(),
-                    account_uuid: identity.account_uuid.clone(),
+                    account_uuid: identity.key.account_uuid.clone(),
                     active: active(&profile.id, &profile.config_dir),
                 })
             })
@@ -1098,8 +1085,7 @@ impl ProfileRegistry {
                 let identity = profile.identity.as_ref()?;
                 Some(SignedInProfile {
                     id: profile.id.clone(),
-                    account_uuid: identity.account_uuid.clone(),
-                    organization_uuid: identity.organization_uuid.clone(),
+                    key: identity.key.clone(),
                     name: identity.name(),
                 })
             })
@@ -1146,7 +1132,7 @@ impl ProfileRegistry {
         }
         let mismatched = target
             .as_ref()
-            .is_some_and(|target| !identity.is(&target.pair));
+            .is_some_and(|target| identity.key != target.pair);
         // Cross-checked before the Limit monitor reads it.
         let tag = Tag {
             id: id.clone(),
@@ -1208,7 +1194,7 @@ impl ProfileRegistry {
             return;
         };
         let accepted = match &expected {
-            Some(expected) => expected.same_profile(&identity),
+            Some(expected) => expected.key == identity.key,
             None => self
                 .find(&identity)
                 .is_none_or(|existing| existing.id == id),
@@ -1381,7 +1367,7 @@ impl ProfileRegistry {
             profile
                 .identity
                 .as_ref()
-                .is_some_and(|known| known.same_profile(identity))
+                .is_some_and(|known| known.key == identity.key)
         })
     }
 

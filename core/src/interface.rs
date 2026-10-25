@@ -61,11 +61,11 @@ pub enum Command {
     OpenLimitResets,
     /// A Discovered Profile's row: Add Profile… aimed at that pair (passing
     /// its email to the sign-in when known).
-    SignInDiscovered(DiscoveredPair),
+    SignInDiscovered(ProfileKey),
     /// Hide in a Discovered Profile's submenu.
-    HideDiscovered(DiscoveredPair),
+    HideDiscovered(ProfileKey),
     /// Restore in Settings > Hidden (n)….
-    UnhideDiscovered(DiscoveredPair),
+    UnhideDiscovered(ProfileKey),
     /// Rename… in a submenu: asks the UI for a nickname
     /// ([`Effect::AskNickname`]).
     Rename(NicknameTarget),
@@ -209,9 +209,11 @@ impl SafetyFeature {
     }
 }
 
-/// A Discovered Profile's identity: an account uuid and an Organization uuid.
+/// What tells Profiles apart: a Login's account uuid and an Organization
+/// uuid. A Discovered Profile is known by its key alone; a Sidebar folder is
+/// `claude-code-sessions/<account>/<org>/`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DiscoveredPair {
+pub struct ProfileKey {
     pub account_uuid: String,
     pub organization_uuid: String,
 }
@@ -221,7 +223,7 @@ pub struct DiscoveredPair {
 pub enum NicknameTarget {
     /// A Profile, by id.
     Profile(String),
-    Discovered(DiscoveredPair),
+    Discovered(ProfileKey),
 }
 
 impl Command {
@@ -697,7 +699,7 @@ pub enum SessionFilter {
     /// Sessions whose working folder is this absolute path.
     Project(String),
     /// Sessions with an entry in this Profile's Sidebar (archived or not).
-    Sidebar(DiscoveredPair),
+    Sidebar(ProfileKey),
     /// Sessions with no Sidebar entry in any Profile.
     CliOnly,
 }

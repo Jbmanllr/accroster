@@ -8,8 +8,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use accroster_core::{
-    Command, Core, DiscoveredPair, Effect, Event, OpenChoice, RunningDot, SessionDetail,
-    SessionFilter, SessionRow, SidebarPresence,
+    Command, Core, Effect, Event, OpenChoice, ProfileKey, RunningDot, SessionDetail, SessionFilter,
+    SessionRow, SidebarPresence,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin};
 use common::*;
@@ -683,8 +683,8 @@ fn archived(mut entry: Value) -> Value {
     entry
 }
 
-fn pair(account: &str, org: &str) -> DiscoveredPair {
-    DiscoveredPair {
+fn pair(account: &str, org: &str) -> ProfileKey {
+    ProfileKey {
         account_uuid: account.into(),
         organization_uuid: org.into(),
     }

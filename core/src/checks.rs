@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::claude_json;
 use crate::interface::{ClaudeVersions, SafetyFeature};
 use crate::profiles::{Account, CrossCheckAnswer};
 use crate::safety::{Finding, claude_code_name, reportable};
@@ -27,19 +28,12 @@ pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Findin
     let mut caches_seen = 0;
     let mut bad_caches = BTreeSet::new();
     for folder in folders {
-        let Some(body) = fs::read(folder.join(".claude.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
+        let Some(body) = claude_json::read(&folder.join(".claude.json")) else {
             continue;
         };
-        if let Some(account) = body.get("oauthAccount").filter(|v| !v.is_null()) {
+        if let Some(account) = claude_json::oauth_account(&body) {
             accounts_seen += 1;
-            for key in ["accountUuid", "organizationUuid", "emailAddress"] {
-                if !account.get(key).is_some_and(Value::is_string) {
-                    bad_accounts.insert(key);
-                }
-            }
+            bad_accounts.extend(account.bad_keys);
         }
         if let Some(cache) = body.get("cachedUsageUtilization").filter(|v| !v.is_null()) {
             caches_seen += 1;

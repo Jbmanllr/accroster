@@ -7,8 +7,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use accroster_core::{
-    Command, Core, DiscoveredPair, Effect, Event, MenuItem, NicknameTarget, OpenChoice,
-    SessionDetail, SessionFilter,
+    Command, Core, Effect, Event, MenuItem, NicknameTarget, OpenChoice, ProfileKey, SessionDetail,
+    SessionFilter,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
@@ -451,7 +451,7 @@ fn an_archived_entry_in_claudes_profile_doesnt_count_as_one() {
     transcript(&mac, S1, "Fix the login bug", "claude-desktop");
     transcript(&mac, S2, "Other work", "claude-desktop");
     core.command(Command::FilterSessions(SessionFilter::Sidebar(
-        DiscoveredPair {
+        ProfileKey {
             account_uuid: work().account_uuid,
             organization_uuid: work().organization_uuid,
         },
@@ -489,7 +489,7 @@ fn a_profile_whose_entry_is_archived_gets_no_switch() {
     // Archived in Perso too: the link couldn't open it after the switch.
     entry(&mac, &FixtureLogin::perso(), "p2", S1, true);
     core.command(Command::FilterSessions(SessionFilter::Sidebar(
-        DiscoveredPair {
+        ProfileKey {
             account_uuid: FixtureLogin::perso().account_uuid,
             organization_uuid: FixtureLogin::perso().organization_uuid,
         },

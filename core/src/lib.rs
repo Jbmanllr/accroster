@@ -7,6 +7,7 @@
 
 mod backups;
 mod checks;
+mod claude_json;
 mod cli_switcher;
 mod core;
 mod desktop;
@@ -46,9 +47,8 @@ pub use interface::{
 };
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
-    ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView, ProfileSettings,
-    Toggle,
+    ClaudeVersions, CliSwitchingView, DiscoveredRow, FirstRunView, HiddenDiscovered,
+    LaunchAtLoginView, NicknameTarget, NotificationsView, ProfileKey, ProfileSettings, Toggle,
 };
 pub use interface::{SidebarSyncMode, SidebarSyncView, UninstallView};
 pub use logging::install_panic_hook;

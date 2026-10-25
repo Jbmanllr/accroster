@@ -21,7 +21,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::interface::{Command, DiscoveredPair, DiscoveredRow, MenuItem, NicknameTarget};
+use crate::claude_json;
+use crate::desktop::{self, DesktopPaths};
+use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 
 /// The desktop loader skips Sidebar entries over this size.
 const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
@@ -29,7 +31,7 @@ const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Evidence {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// Names from an `oauthAccount` for this exact pair, if any.
     login: Option<Login>,
     /// Readable Sidebar entries in the pair's folder.
@@ -147,8 +149,8 @@ impl Evidence {
 /// then the most recently active.
 pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
     let desktop = home.join("Library/Application Support/Claude");
-    let desktop_last = last_known_account(&desktop.join("config.json"));
-    let mut found: BTreeMap<DiscoveredPair, Evidence> = BTreeMap::new();
+    let desktop_last = desktop::last_known_account(&DesktopPaths::new(home));
+    let mut found: BTreeMap<ProfileKey, Evidence> = BTreeMap::new();
     for (pair, sessions, last_activity) in sidebar_pairs(&desktop.join("claude-code-sessions")) {
         found.insert(
             pair.clone(),
@@ -188,7 +190,7 @@ pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
 
 /// `<account>/<org>/` folders holding at least one readable Sidebar entry,
 /// with their entry count and newest activity.
-fn sidebar_pairs(root: &Path) -> Vec<(DiscoveredPair, usize, Option<Timestamp>)> {
+fn sidebar_pairs(root: &Path) -> Vec<(ProfileKey, usize, Option<Timestamp>)> {
     let mut pairs = Vec::new();
     for account in subfolders(root) {
         for org in subfolders(&root.join(&account)) {
@@ -223,7 +225,7 @@ fn sidebar_pairs(root: &Path) -> Vec<(DiscoveredPair, usize, Option<Timestamp>)>
                 .filter_map(|ms| Timestamp::from_millisecond(ms).ok())
                 .max();
             pairs.push((
-                DiscoveredPair {
+                ProfileKey {
                     account_uuid: account.clone(),
                     organization_uuid: org,
                 },
@@ -246,39 +248,20 @@ fn subfolders(path: &Path) -> Vec<String> {
 }
 
 /// `oauthAccount` in `~/.claude.json`.
-fn cli_login(path: &Path) -> Option<(DiscoveredPair, Login)> {
-    let bytes = fs::read(path).ok()?;
-    let body: Value = serde_json::from_slice(&bytes).ok()?;
-    let account = body.get("oauthAccount")?;
-    let text = |key: &str| account.get(key).and_then(Value::as_str).map(str::to_owned);
-    let as_of = account
-        .get("profileFetchedAt")
-        .and_then(Value::as_i64)
-        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-        .or_else(|| {
-            let modified = fs::metadata(path).ok()?.modified().ok()?;
-            Timestamp::try_from(modified).ok()
-        });
+fn cli_login(path: &Path) -> Option<(ProfileKey, Login)> {
+    let account = claude_json::read_account(path)?;
+    let as_of = account.profile_fetched_at.or_else(|| {
+        let modified = fs::metadata(path).ok()?.modified().ok()?;
+        Timestamp::try_from(modified).ok()
+    });
     Some((
-        DiscoveredPair {
-            account_uuid: text("accountUuid")?,
-            organization_uuid: text("organizationUuid")?,
-        },
+        account.key,
         Login {
-            email: text("emailAddress").unwrap_or_default(),
-            organization_name: text("organizationName").unwrap_or_default(),
+            email: account.email,
+            organization_name: account.organization_name,
             as_of,
         },
     ))
-}
-
-/// `lastKnownAccountUuid` from the desktop's `config.json`. Only that key is
-/// read; the file also holds tokens.
-fn last_known_account(path: &Path) -> Option<String> {
-    let body: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    body.get("lastKnownAccountUuid")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 /// The first 8 characters of a uuid.

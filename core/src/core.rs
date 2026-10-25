@@ -14,9 +14,9 @@ use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
-    Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationsView, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
+    AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
     SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
@@ -1073,10 +1073,7 @@ impl Core {
                 Some(NamedProfile {
                     name: (self.settings.nicknames.get(&id).cloned())
                         .unwrap_or_else(|| profile.name.clone()),
-                    pair: DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    },
+                    pair: profile.key.clone(),
                     id,
                 })
             })
@@ -1086,14 +1083,8 @@ impl Core {
             let pair = account
                 .as_ref()
                 .and_then(|account| match account.profile(&signed_in) {
-                    Some(profile) => Some(DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    }),
-                    None => Some(DiscoveredPair {
-                        account_uuid: account.account_uuid.clone(),
-                        organization_uuid: account.organization_uuid.clone()?,
-                    }),
+                    Some(profile) => Some(profile.key.clone()),
+                    None => account.key(),
                 });
             let name = pair.as_ref().and_then(|pair| {
                 self.sidebar_profiles()
@@ -1280,10 +1271,7 @@ impl Core {
         else {
             return Vec::new();
         };
-        let pair = DiscoveredPair {
-            account_uuid: profile.account_uuid.clone(),
-            organization_uuid: profile.organization_uuid.clone(),
-        };
+        let pair = profile.key.clone();
         let Some(entry) = opening::switch_entry(&facts, &pair) else {
             return Vec::new();
         };
@@ -1741,10 +1729,7 @@ impl Core {
             .filter_map(|id| {
                 let profile = signed_in.iter().find(|profile| profile.id == id)?;
                 Some(SidebarProfile {
-                    pair: DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    },
+                    pair: profile.key.clone(),
                     name: (self.settings.nicknames.get(&id).cloned())
                         .unwrap_or_else(|| profile.name.clone()),
                     signed_in: true,
@@ -1789,11 +1774,11 @@ impl Core {
             .collect()
     }
 
-    fn choice(&self, pair: &DiscoveredPair) -> Option<&DiscoveredChoice> {
-        self.settings.discovered_profiles.iter().find(|choice| {
-            choice.account_uuid == pair.account_uuid
-                && choice.organization_uuid == pair.organization_uuid
-        })
+    fn choice(&self, pair: &ProfileKey) -> Option<&DiscoveredChoice> {
+        self.settings
+            .discovered_profiles
+            .iter()
+            .find(|choice| choice.is(pair))
     }
 
     /// A Discovered Profile that became a Profile (the exact pair signed
@@ -1802,10 +1787,7 @@ impl Core {
         let signed_in = self.profiles.signed_in();
         let mut updated = self.settings.clone();
         for choice in &mut updated.discovered_profiles {
-            let Some(profile) = signed_in.iter().find(|profile| {
-                profile.account_uuid == choice.account_uuid
-                    && profile.organization_uuid == choice.organization_uuid
-            }) else {
+            let Some(profile) = signed_in.iter().find(|profile| choice.is(&profile.key)) else {
                 continue;
             };
             if let Some(nickname) = choice.nickname.take() {
@@ -1825,13 +1807,10 @@ impl Core {
 
     /// Changes the saved choice for `pair` (creating it), dropping choices
     /// that no longer say anything.
-    fn update_choice(&mut self, pair: &DiscoveredPair, change: impl FnOnce(&mut DiscoveredChoice)) {
+    fn update_choice(&mut self, pair: &ProfileKey, change: impl FnOnce(&mut DiscoveredChoice)) {
         let mut updated = self.settings.clone();
         let choices = &mut updated.discovered_profiles;
-        let index = match choices.iter().position(|choice| {
-            choice.account_uuid == pair.account_uuid
-                && choice.organization_uuid == pair.organization_uuid
-        }) {
+        let index = match choices.iter().position(|choice| choice.is(pair)) {
             Some(index) => index,
             None => {
                 choices.push(DiscoveredChoice {

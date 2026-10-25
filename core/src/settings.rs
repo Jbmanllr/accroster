@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::interface::SidebarSyncMode;
+use crate::interface::{ProfileKey, SidebarSyncMode};
 use crate::storage::{self, ReadError, VersionedFile};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +88,13 @@ pub(crate) struct DiscoveredChoice {
     pub nickname: Option<String>,
     #[serde(default)]
     pub hidden: bool,
+}
+
+impl DiscoveredChoice {
+    /// Whether these are the choices for the Profile `key`.
+    pub(crate) fn is(&self, key: &ProfileKey) -> bool {
+        self.account_uuid == key.account_uuid && self.organization_uuid == key.organization_uuid
+    }
 }
 
 impl VersionedFile for Settings {

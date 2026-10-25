@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::desktop::{self, DesktopAccount, DesktopPaths};
 use crate::env::Environment;
 use crate::interface::{
-    AllSessionsView, DiscoveredPair, RunningDot, SessionDetail, SessionFilter, SessionRow,
+    AllSessionsView, ProfileKey, RunningDot, SessionDetail, SessionFilter, SessionRow,
     SidebarGroup, SidebarItem, SidebarPresence,
 };
 use crate::storage::{self, AppPaths, VersionedFile};
@@ -244,7 +244,7 @@ impl EntryFile {
 /// One Sidebar entry, in one Profile's folder.
 #[derive(Debug, Clone)]
 struct SidebarEntry {
-    pair: DiscoveredPair,
+    pair: ProfileKey,
     /// The entry's `local_…` id (its file name, which is always its
     /// `sessionId`).
     entry_id: String,
@@ -284,7 +284,7 @@ pub(crate) struct Built {
 
 /// A Profile's Sidebar as the All Sessions window names it.
 pub(crate) struct SidebarProfile {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// The nickname, else `email · Organization`, else "Unknown Login …".
     pub name: String,
     /// It is a signed-in Profile in AccRoster.
@@ -526,7 +526,7 @@ impl SessionIndex {
             };
             let entry = read_entry(path)?;
             Some(SidebarEntry {
-                pair: DiscoveredPair {
+                pair: ProfileKey {
                     account_uuid: account.clone(),
                     organization_uuid: org.clone(),
                 },
@@ -682,8 +682,8 @@ impl SessionIndex {
 
     /// The Sidebars to list: `known` (each marked when not signed in), then
     /// any other account/Organization folder holding an entry.
-    fn sidebar_profiles(&self, known: &[SidebarProfile]) -> Vec<(DiscoveredPair, String)> {
-        let mut listed: Vec<(DiscoveredPair, String)> = known
+    fn sidebar_profiles(&self, known: &[SidebarProfile]) -> Vec<(ProfileKey, String)> {
+        let mut listed: Vec<(ProfileKey, String)> = known
             .iter()
             .map(|profile| {
                 let name = if profile.signed_in {
@@ -712,7 +712,7 @@ impl SessionIndex {
         &self,
         session: &Session,
         now: Timestamp,
-        profiles: &[(DiscoveredPair, String)],
+        profiles: &[(ProfileKey, String)],
     ) -> SessionDetail {
         let transcript = session.transcript;
         let client = transcript
@@ -735,11 +735,10 @@ impl SessionIndex {
                     profile: name.clone(),
                     has_entry: entry.is_some(),
                     archived: entry.is_some_and(|entry| entry.archived),
-                    desktop_now: self.desktop.as_ref().is_some_and(|desktop| {
-                        desktop.account_uuid == pair.account_uuid
-                            && desktop.organization_uuid.as_deref()
-                                == Some(pair.organization_uuid.as_str())
-                    }),
+                    desktop_now: self
+                        .desktop
+                        .as_ref()
+                        .is_some_and(|desktop| desktop.is(pair)),
                 }
             })
             .collect();
@@ -835,11 +834,9 @@ impl SessionIndex {
     }
 
     fn is_desktop(&self, entry: &SidebarEntry) -> bool {
-        self.desktop.as_ref().is_some_and(|desktop| {
-            desktop.account_uuid == entry.pair.account_uuid
-                && desktop.organization_uuid.as_deref()
-                    == Some(entry.pair.organization_uuid.as_str())
-        })
+        self.desktop
+            .as_ref()
+            .is_some_and(|desktop| desktop.is(&entry.pair))
     }
 }
 
@@ -888,7 +885,7 @@ impl Session<'_> {
 
 /// The sidebar: All Sessions and Running; each working folder; each
 /// Profile's Sidebar, then CLI only.
-fn sidebar(sessions: &[Session], profiles: &[(DiscoveredPair, String)]) -> Vec<SidebarGroup> {
+fn sidebar(sessions: &[Session], profiles: &[(ProfileKey, String)]) -> Vec<SidebarGroup> {
     let item = |title: &str, filter| SidebarItem {
         title: title.to_owned(),
         filter,
@@ -1142,7 +1139,7 @@ pub(crate) struct SessionFacts {
 /// One Profile's Sidebar entry for a Session.
 #[derive(Debug, Clone)]
 pub(crate) struct EntryFacts {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// `local_…`.
     pub entry_id: String,
     pub archived: bool,
