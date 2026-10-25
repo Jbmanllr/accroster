@@ -38,6 +38,9 @@ pub enum Command {
     CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
+    /// "Limit resets → claude.ai" in a Profile's hover submenu: open
+    /// claude.ai Settings > Usage, where the user checks resets by hand.
+    OpenLimitResets,
 }
 
 impl Command {
@@ -52,6 +55,7 @@ impl Command {
             Command::AddProfile => "add_profile",
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
+            Command::OpenLimitResets => "open_limit_resets",
         }
     }
 }
@@ -74,6 +78,8 @@ pub enum Effect {
     ShowAbout,
     /// Select this path in a Finder window.
     RevealInFinder(PathBuf),
+    /// Open this URL in the default browser.
+    OpenUrl(String),
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
@@ -153,6 +159,9 @@ pub struct ProfileRow {
     pub limits: Vec<LimitBar>,
     /// A short line under the bars (for example "Couldn't read limits").
     pub note: Option<String>,
+    /// Banked reset and Session refill lines, when Claude Code reports them
+    /// (for example "Session refill available"). Never redeemable from here.
+    pub offers: Vec<String>,
     /// The hover submenu.
     pub submenu: Vec<MenuItem>,
 }
