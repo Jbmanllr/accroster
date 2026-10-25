@@ -2109,15 +2109,19 @@ define_class!(
 
     impl RowView {
         /// A custom view gets the click instead of the menu: close the menu,
-        /// then send the item's action as a plain item would.
+        /// then send the item's action as a plain item would. Only the
+        /// rows' own action is sent: a row with a submenu and no command
+        /// reports AppKit's `submenuAction:`, aimed at the submenu, which
+        /// NSMenu doesn't answer through `sendAction:` (it throws).
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
             let Some(item) = self.enclosingMenuItem() else {
                 return;
             };
-            let Some(action) = item.action() else {
+            let action = sel!(menuItemClicked:);
+            if item.action() != Some(action) {
                 return;
-            };
+            }
             // SAFETY: the item belongs to the open menu; reading its menu
             // has no other precondition.
             if let Some(menu) = unsafe { item.menu() } {
