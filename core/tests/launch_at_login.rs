@@ -120,8 +120,8 @@ fn when_macos_cant_find_this_copy_the_toggle_is_unavailable_and_nothing_is_offer
     assert_eq!(
         toggle.note.as_deref(),
         Some(
-            "macOS can't offer this for this copy of AccRoster: it needs a signed copy, \
-             run from its app bundle."
+            "Launch at login needs a copy of AccRoster signed with an Apple Developer ID, \
+             like the downloadable releases. This copy can't offer it."
         ),
         "true for an ad-hoc signed bundle as much as for a bare binary"
     );
