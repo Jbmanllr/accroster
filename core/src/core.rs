@@ -16,8 +16,8 @@ use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
-    SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
+    NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature,
+    SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
@@ -695,6 +695,14 @@ impl Core {
             }
             Event::NetworkChanged { online } => {
                 self.monitor.set_online(online);
+                Vec::new()
+            }
+            Event::NotificationActionClicked(NotificationAction::SwitchCli { profile }) => {
+                // The notification may predate a relaunch: only a Profile
+                // still signed in, and only while CLI switching may change.
+                if self.profiles.signed_in().iter().any(|p| p.id == profile) {
+                    self.use_for_new_cli_runs(&profile);
+                }
                 Vec::new()
             }
         };

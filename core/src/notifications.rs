@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::interface::{Command, Effect};
+use crate::interface::{Effect, NotificationAction};
 use crate::limit_offers;
 use crate::logging::{Field, Level};
 use crate::profiles::Context;
@@ -302,7 +302,9 @@ fn warning(
                 headroom.name, headroom.tightest
             ),
             action: "Switch CLI".to_owned(),
-            command: Command::UseForNewCliRuns(headroom.id.clone()),
+            on_click: NotificationAction::SwitchCli {
+                profile: headroom.id.clone(),
+            },
         },
         None => Effect::Notify {
             title,

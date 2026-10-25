@@ -73,10 +73,10 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
         });
     });
     ui.ivars().core.set(handle).expect("the core starts once");
-    notifications::start(|command| {
+    notifications::start(|action| {
         UI.with(|cell| {
             if let Some(ui) = cell.get() {
-                ui.send(command);
+                ui.event(Event::NotificationActionClicked(action));
             }
         });
     });
@@ -919,8 +919,8 @@ impl Ui {
                 title,
                 body,
                 action,
-                command,
-            } => notifications::post(&title, &body, Some((&action, command))),
+                on_click,
+            } => notifications::post(&title, &body, Some((&action, &on_click))),
             Effect::Terminate => app.terminate(None),
             Effect::ConfirmUninstall {
                 title,
