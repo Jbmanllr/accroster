@@ -1,4 +1,4 @@
-# claude-account-manager
+# AccRoster
 
 Notes and tooling for using several Claude accounts on one Mac with the Claude desktop app and Claude Code CLI.
 

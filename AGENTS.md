@@ -4,7 +4,7 @@
 
 ### Issue tracker
 
-Issues live in GitHub Issues on Jbmanllr/claude-account-manager (gh CLI). See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues on Jbmanllr/accroster (gh CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
