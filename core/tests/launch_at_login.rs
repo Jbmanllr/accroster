@@ -108,7 +108,7 @@ fn a_first_run_after_the_user_turned_it_off_in_system_settings_offers_nothing() 
 }
 
 #[test]
-fn outside_its_app_bundle_the_toggle_is_unavailable_and_nothing_is_offered() {
+fn when_macos_cant_find_this_copy_the_toggle_is_unavailable_and_nothing_is_offered() {
     let mac = FakeMac::new();
     mac.login_item.set_status(LoginItemStatus::NotFound);
 
@@ -117,7 +117,14 @@ fn outside_its_app_bundle_the_toggle_is_unavailable_and_nothing_is_offered() {
     assert_eq!(core.view().first_run, None);
     let toggle = core.view().settings.launch_at_login;
     assert!(!toggle.on && !toggle.enabled);
-    assert!(toggle.note.is_some());
+    assert_eq!(
+        toggle.note.as_deref(),
+        Some(
+            "macOS can't offer this for this copy of AccRoster: it needs a signed copy, \
+             run from its app bundle."
+        ),
+        "true for an ad-hoc signed bundle as much as for a bare binary"
+    );
 }
 
 #[test]

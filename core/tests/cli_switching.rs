@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Command, Core, Effect, MenuItem};
+use accroster_core::{Badge, Command, Core, Effect, MenuItem};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 
@@ -314,10 +314,14 @@ fn the_menu_shows_the_clis_active_profile_and_its_tightest_limit() {
     click_row(&mut core, 0);
 
     let view = core.view();
-    assert_eq!(view.menu_bar.label, "me 92%", "Fable 92% is the tightest");
+    assert_eq!(
+        view.menu_bar.label.as_deref(),
+        Some("me · Work Inc 92%"),
+        "Fable 92% is the tightest"
+    );
     assert!(!view.menu_bar.dimmed);
-    assert_eq!(header(&core).as_deref(), Some("CLI: me"));
-    assert_eq!(rows(&core)[0].badges, ["CLI"]);
+    assert_eq!(header(&core).as_deref(), Some("CLI: me · Work Inc"));
+    assert_eq!(rows(&core)[0].badges, [Badge::Cli]);
     assert!(rows(&core)[1].badges.is_empty());
     assert!(checked(&core, 0));
     assert!(!checked(&core, 1));
@@ -325,7 +329,7 @@ fn the_menu_shows_the_clis_active_profile_and_its_tightest_limit() {
     let use_second = submenu_command(&core, 1, "Use for new CLI runs");
     core.command(use_second);
 
-    assert_eq!(rows(&core)[1].badges, ["CLI"]);
+    assert_eq!(rows(&core)[1].badges, [Badge::Cli]);
     assert!(rows(&core)[0].badges.is_empty());
     assert!(checked(&core, 1));
 }
@@ -353,13 +357,13 @@ fn copy_shell_override_copies_an_export_line_for_that_profile() {
 }
 
 #[test]
-fn with_cli_switching_off_rows_dont_switch_and_the_menu_bar_shows_the_app_name() {
+fn with_cli_switching_off_rows_dont_switch_and_the_menu_bar_shows_the_icon_alone() {
     let mac = mac_signing_in_as(&work(), limits_body());
     let mut core = mac.launch();
     add_profile(&mut core);
 
     assert_eq!(rows(&core)[0].command, None);
-    assert_eq!(core.view().menu_bar.label, "AccRoster");
+    assert_eq!(core.view().menu_bar.label, None, "no Profile to show");
     assert_eq!(header(&core), None);
     assert!(rows(&core)[0].submenu.iter().any(
         |item| matches!(item, MenuItem::Action { title, .. } if title == "Copy shell override")
@@ -374,7 +378,7 @@ fn the_cli_choice_survives_a_relaunch() {
 
     let core = mac.launch();
 
-    assert_eq!(rows(&core)[1].badges, ["CLI"]);
+    assert_eq!(rows(&core)[1].badges, [Badge::Cli]);
     assert!(core.view().settings.cli_switching.on);
 }
 
@@ -579,8 +583,62 @@ fn a_nickname_is_the_clis_short_label() {
         nickname: Some("Work".into()),
     });
 
-    assert_eq!(core.view().menu_bar.label, "Work 92%");
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("Work 92%"));
     assert_eq!(header(&core).as_deref(), Some("CLI: Work"));
+}
+
+#[test]
+fn short_names_stay_unique_adding_the_organization_then_the_whole_email() {
+    let logins = [
+        work(),
+        FixtureLogin::new(
+            &work().account_uuid,
+            "55555555-5555-4555-8555-555555555555",
+            "me@work.example",
+            "Research Lab",
+        ),
+        FixtureLogin::new(
+            "66666666-6666-4666-8666-666666666666",
+            "77777777-7777-4777-8777-777777777777",
+            "me@side.example",
+            "Research Lab",
+        ),
+        FixtureLogin::new(
+            "88888888-8888-4888-8888-888888888888",
+            "99999999-9999-4999-8999-999999999999",
+            "jb@perso.example",
+            "Personal",
+        ),
+    ];
+    let mac = FakeMac::new();
+    mac.with_claude_home(&FixtureLogin::perso());
+    for login in &logins {
+        mac.claude
+            .reply(StubCall::AuthLogin, sign_in_as(login))
+            .reply(StubCall::AuthStatus, auth_status(login))
+            .reply(StubCall::GetUsage, usage_reply(limits_body()));
+    }
+    let mut core = mac.launch();
+    for _ in &logins {
+        add_profile(&mut core);
+    }
+    turn_on(&mut core);
+
+    let mut names = Vec::new();
+    for row in 0..logins.len() {
+        click_row(&mut core, row);
+        names.push(header(&core).expect("a CLI part"));
+    }
+
+    assert_eq!(
+        names,
+        [
+            "CLI: me · Work Inc",
+            "CLI: me@work.example · Research Lab",
+            "CLI: me@side.example · Research Lab",
+            "CLI: jb",
+        ]
+    );
 }
 
 /// The choices under the CLI's Active Profile's "Remove…" submenu.
@@ -641,7 +699,7 @@ fn removing_the_clis_active_profile_asks_which_profile_is_next_and_moves_the_poi
     assert_eq!(mac.read_file(POINTER).unwrap(), perso_dir);
     assert_eq!(mac.list(PROFILES).len(), 1);
     assert_eq!(rows(&core).len(), 1);
-    assert_eq!(rows(&core)[0].badges, ["CLI"]);
+    assert_eq!(rows(&core)[0].badges, [Badge::Cli]);
 }
 
 #[test]

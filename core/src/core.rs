@@ -14,7 +14,7 @@ use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
+    AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
     NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature,
     SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
@@ -807,7 +807,7 @@ impl Core {
         });
         if let Some(headroom) = most_headroom(&listed, &watched) {
             for listed in listed.iter_mut() {
-                listed.row.most_headroom = listed.id == headroom.id;
+                listed.row.marker = (listed.id == headroom.id).then(|| "most headroom".to_owned());
             }
         }
         for profile in &mut listed {
@@ -843,6 +843,7 @@ impl Core {
         let header: Vec<String> = cli_part.into_iter().chain(desktop_part).collect();
         if !header.is_empty() {
             items.push(MenuItem::Detail(header.join("    ")));
+            items.push(MenuItem::Separator);
         }
         let desktop_installed = self.env.os.desktop_app_version().is_some();
         for listed in listed.iter_mut() {
@@ -871,7 +872,7 @@ impl Core {
                 },
             );
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
-                row.badges.push("Desktop".into());
+                row.badges.push(Badge::Desktop);
             } else if desktop_installed {
                 row.submenu.push(MenuItem::Action {
                     title: "Switch desktop app to this Profile…".into(),
@@ -948,7 +949,7 @@ impl Core {
         ]);
         View {
             menu_bar: MenuBarView {
-                label: cli.label.unwrap_or_else(|| "AccRoster".into()),
+                label: cli.label,
                 dimmed: menu_bar_dimmed,
             },
             menu: MenuView { items },
@@ -1399,7 +1400,11 @@ fn launch_at_login_view(status: LoginItemStatus) -> LaunchAtLoginView {
         LoginItemStatus::NotFound => LaunchAtLoginView {
             on: false,
             enabled: false,
-            note: Some("Available when AccRoster runs from its app bundle.".into()),
+            note: Some(
+                "macOS can't offer this for this copy of AccRoster: it needs a signed copy, \
+                 run from its app bundle."
+                    .into(),
+            ),
         },
     }
 }

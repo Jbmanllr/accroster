@@ -37,8 +37,8 @@ pub use env::{
 };
 pub use env::{LoginItem, LoginItemStatus, SystemLoginItem};
 pub use interface::{
-    AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
-    SettingsView, View,
+    AboutView, Badge, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView,
+    ProfileRow, SettingsView, View,
 };
 pub use interface::{
     AllSessionsView, OpenChoice, RunningDot, SessionDetail, SessionFilter, SessionRow,

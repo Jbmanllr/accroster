@@ -476,7 +476,7 @@ fn sign_in_again_in_the_same_folder_with_the_email_fixes_an_expired_login() {
     assert!(!rows[0].dimmed);
     assert_eq!(rows[0].note, None);
     assert_eq!(
-        rows[0].limits,
+        ignoring_reset_times(&rows[0].limits),
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
     assert!(
