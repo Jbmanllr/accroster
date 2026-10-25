@@ -27,7 +27,6 @@ mod sessions;
 mod settings;
 mod sidebar_sync;
 mod storage;
-mod uninstaller;
 mod usage;
 pub mod watcher;
 
