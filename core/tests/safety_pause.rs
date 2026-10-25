@@ -457,6 +457,94 @@ fn diagnostics_check(core: &Core, name: &str) -> CheckRow {
         .unwrap_or_else(|| panic!("Diagnostics lists {name}"))
 }
 
+/// Relaunches after a Claude Code update, with `auth status` never
+/// answering: the launch self-check stays out until each run times out.
+fn relaunch_while_auth_status_hangs(mac: &FakeMac) -> Core {
+    install_claude_code(mac, "2.1.400");
+    mac.claude.reply(StubCall::AuthStatus, Reply::hanging());
+    let before = auth_status_calls(mac);
+    let core = mac.launch();
+    wait_for_calls(mac, StubCall::AuthStatus, before + 1);
+    core
+}
+
+/// Lets both hanging `auth status` runs time out (30 s each, one at a time).
+fn let_the_self_check_time_out(mac: &FakeMac, core: &mut Core) {
+    let before = auth_status_calls(mac);
+    mac.clock.advance(jiff::SignedDuration::from_secs(30));
+    core.event(Event::Tick);
+    wait_for_calls(mac, StubCall::AuthStatus, before + 1);
+    pass(mac, core, jiff::SignedDuration::from_secs(30));
+}
+
+fn menu_header(core: &Core) -> Option<String> {
+    core.view()
+        .menu
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            accroster_core::MenuItem::Detail(text) if text.starts_with("CLI: ") => Some(text),
+            _ => None,
+        })
+}
+
+#[test]
+fn cli_switching_waits_while_the_launch_self_check_is_out() {
+    let (mac, core) = cli_on_with_two_profiles();
+    drop(core);
+    let pointer = mac.read_file(POINTER).unwrap();
+    let mut core = relaunch_while_auth_status_hangs(&mac);
+
+    assert_eq!(core.view().menu_bar.label, "?");
+    assert_eq!(menu_header(&core).as_deref(), Some("CLI: me · checking…"));
+    assert!(
+        rows(&core).iter().all(|row| row.command.is_none()
+            && !row_actions(row).iter().any(|t| t == "Use for new CLI runs")),
+        "rows don't switch yet"
+    );
+    for id in mac.list(PROFILES) {
+        core.command(Command::UseForNewCliRuns(id));
+    }
+    assert_eq!(
+        mac.read_file(POINTER).unwrap(),
+        pointer,
+        "pointer untouched"
+    );
+    assert_eq!(
+        core.view().settings.cli_switching.note.as_deref(),
+        Some("Checking Claude Code in each Profile · CLI switching waits until that's done")
+    );
+
+    let_the_self_check_time_out(&mac, &mut core);
+
+    assert!(!is_paused(&core, SafetyFeature::CliSwitching));
+    assert_eq!(menu_header(&core).as_deref(), Some("CLI: me"));
+    assert_eq!(core.view().settings.cli_switching.note, None);
+    click_row(&mut core, 1);
+    assert_ne!(mac.read_file(POINTER).unwrap(), pointer, "switches again");
+}
+
+#[test]
+fn turning_cli_switching_on_waits_for_the_launch_self_check() {
+    let (mac, mut core) = cli_on_with_two_profiles();
+    core.command(Command::SetCliSwitching(false));
+    drop(core);
+    let mut core = relaunch_while_auth_status_hangs(&mac);
+
+    core.command(Command::SetCliSwitching(true));
+
+    assert!(!core.view().settings.cli_switching.on, "refused for now");
+    assert_eq!(
+        core.view().settings.cli_switching.note.as_deref(),
+        Some("Checking Claude Code in each Profile · CLI switching waits until that's done")
+    );
+
+    let_the_self_check_time_out(&mac, &mut core);
+    core.command(Command::SetCliSwitching(true));
+
+    assert!(core.view().settings.cli_switching.on);
+}
+
 // ----- Profile links -------------------------------------------------------------------
 
 /// Replaces `name`'s link in the Profile signed in as `email` by a real

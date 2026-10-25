@@ -304,6 +304,37 @@ pub enum Event {
     /// Files changed under the folders of [`Effect::WatchSidebarFolders`]
     /// (already debounced, about a second): the paths FSEvents reported.
     SidebarFilesChanged(Vec<PathBuf>),
+    /// A notification's action button was clicked, maybe one posted before
+    /// a relaunch: the core checks it still applies.
+    NotificationActionClicked(NotificationAction),
+}
+
+/// What a notification's action button does, as the notification carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationAction {
+    /// Make this Profile the CLI's Active Profile, if it still exists and
+    /// CLI switching is on and free to change.
+    SwitchCli { profile: String },
+}
+
+const SWITCH_CLI: &str = "switch-cli:";
+
+impl NotificationAction {
+    /// The text the UI stores in the notification.
+    pub fn encode(&self) -> String {
+        match self {
+            NotificationAction::SwitchCli { profile } => format!("{SWITCH_CLI}{profile}"),
+        }
+    }
+
+    /// Reads back [`NotificationAction::encode`]'s text; `None` for anything
+    /// else (a notification from another version).
+    pub fn decode(text: &str) -> Option<NotificationAction> {
+        let profile = text.strip_prefix(SWITCH_CLI)?;
+        (!profile.is_empty()).then(|| NotificationAction::SwitchCli {
+            profile: profile.to_owned(),
+        })
+    }
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -332,12 +363,15 @@ pub enum Effect {
     /// Post a user notification.
     Notify { title: String, body: String },
     /// Post a user notification with one action button titled `action`;
-    /// clicking it sends `command`. Nothing happens unless it is clicked.
+    /// clicking it sends [`Event::NotificationActionClicked`] with
+    /// `on_click`. Nothing happens unless it is clicked. The UI keeps
+    /// [`NotificationAction::encode`] in the notification itself, so a click
+    /// after a relaunch still arrives.
     NotifyWithAction {
         title: String,
         body: String,
         action: String,
-        command: Command,
+        on_click: NotificationAction,
     },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,

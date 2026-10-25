@@ -141,11 +141,22 @@ pub(crate) struct CliMenu {
     pub header: Option<String>,
 }
 
+/// What stops the CLI's Active Profile from changing for now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hold {
+    Free,
+    /// The self-check's `auth status` answers are still coming in.
+    Checking,
+    /// A Safety pause.
+    Paused,
+}
+
 /// Adds CLI switching to the listed Profiles' rows (the `CLI` badge, the row
 /// click, "Use for new CLI runs" and "Copy shell override"), and says what
-/// the menu bar and the header show. Under a Safety pause (`paused`), rows
-/// don't switch and the menu bar shows `?`.
-pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], paused: bool) -> CliMenu {
+/// the menu bar and the header show. Under a `hold`, rows don't switch and
+/// the menu bar shows `?`; while checking, the header says so.
+pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -> CliMenu {
+    let paused = hold != Hold::Free;
     let on = is_on(paths);
     let pointer = if on { pointer(paths) } else { None };
     let mut active = None;
@@ -196,9 +207,14 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], paused: bool)
         (Some(_), None) => ("unknown Profile".to_owned(), "?".to_owned()),
     };
     let label = if paused { "?".to_owned() } else { label };
+    let checking = if hold == Hold::Checking {
+        " · checking…"
+    } else {
+        ""
+    };
     CliMenu {
         label: Some(label),
-        header: Some(format!("CLI: {name}")),
+        header: Some(format!("CLI: {name}{checking}")),
     }
 }
 

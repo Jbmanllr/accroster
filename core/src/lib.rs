@@ -49,6 +49,6 @@ pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredRow, FirstRunView, HiddenDiscovered,
     LaunchAtLoginView, NicknameTarget, NotificationsView, ProfileKey, ProfileSettings, Toggle,
 };
-pub use interface::{SidebarSyncMode, SidebarSyncView, UninstallView};
+pub use interface::{NotificationAction, SidebarSyncMode, SidebarSyncView, UninstallView};
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

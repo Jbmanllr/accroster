@@ -16,8 +16,8 @@ use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
-    SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
+    NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature,
+    SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
@@ -697,6 +697,14 @@ impl Core {
                 self.monitor.set_online(online);
                 Vec::new()
             }
+            Event::NotificationActionClicked(NotificationAction::SwitchCli { profile }) => {
+                // The notification may predate a relaunch: only a Profile
+                // still signed in, and only while CLI switching may change.
+                if self.profiles.signed_in().iter().any(|p| p.id == profile) {
+                    self.use_for_new_cli_runs(&profile);
+                }
+                Vec::new()
+            }
         };
         effects.extend(self.run_monitor());
         effects.extend(self.take_effects());
@@ -806,11 +814,7 @@ impl Core {
             self.annotate_links(profile.id, &mut profile.row);
         }
         let profile_settings = self.profile_settings(&listed);
-        let cli = cli_switcher::present(
-            &self.paths,
-            &mut listed,
-            self.safety.is_paused(SafetyFeature::CliSwitching),
-        );
+        let cli = cli_switcher::present(&self.paths, &mut listed, self.cli_hold());
         let pointer = cli_switcher::pointer(&self.paths);
         // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
         let menu_bar_dimmed = listed
@@ -955,7 +959,7 @@ impl Core {
                 cli_switching: CliSwitchingView {
                     on: cli_switcher::is_on(&self.paths),
                     line: cli_switcher::path_line(&self.paths),
-                    note: self.cli_note.clone(),
+                    note: self.cli_switching_note(),
                 },
                 sidebar_sync: SidebarSyncView {
                     mode: self.settings.sidebar_sync,

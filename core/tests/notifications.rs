@@ -4,7 +4,7 @@
 
 mod common;
 
-use accroster_core::{Command, Core, Effect, Event, MenuItem};
+use accroster_core::{Command, Core, Effect, Event, MenuItem, NotificationAction};
 use std::path::PathBuf;
 
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
@@ -337,7 +337,7 @@ fn the_clis_active_profile_suggests_the_most_headroom_and_switches_only_on_click
             title,
             body,
             action,
-            command,
+            on_click,
         },
     ] = effects.as_slice()
     else {
@@ -348,12 +348,81 @@ fn the_clis_active_profile_suggests_the_most_headroom_and_switches_only_on_click
     assert_eq!(action, "Switch CLI");
     assert_eq!(pointer(&mac), perso, "nothing switches on its own");
 
-    core.command(command.clone());
+    core.event(Event::NotificationActionClicked(on_click.clone()));
     assert_eq!(
         PathBuf::from(pointer(&mac)),
         folder_of(&mac, &team()),
         "Switch CLI rewrites the pointer"
     );
+}
+
+/// The Switch CLI action of the suggestion Perso's 96% Session limit makes.
+fn switch_cli_suggestion(mac: &FakeMac, core: &mut Core) -> NotificationAction {
+    let effects = after(mac, core, NEXT_ACTIVE_READ);
+    match effects.as_slice() {
+        [Effect::NotifyWithAction { on_click, .. }] => on_click.clone(),
+        _ => panic!("one notification with an action: {effects:?}"),
+    }
+}
+
+/// A Mac whose CLI uses Perso and whose last notification suggests Pro.
+fn suggested_switch_to_pro() -> (FakeMac, Core, NotificationAction) {
+    let (mac, mut core) = mac_with_perso_and_pro(
+        body(50, SESSION_RESETS, 41),
+        body(12, SESSION_RESETS, 5),
+        &[body(96, SESSION_RESETS, 41)],
+    );
+    cli_uses(&mac, &mut core, &work());
+    let on_click = switch_cli_suggestion(&mac, &mut core);
+    (mac, core, on_click)
+}
+
+/// The click arrives as the notification encoded it: what the UI reads back
+/// from the notification's userInfo after a relaunch.
+fn clicked_after_relaunch(on_click: &NotificationAction) -> Event {
+    let decoded = NotificationAction::decode(&on_click.encode()).expect("it decodes");
+    Event::NotificationActionClicked(decoded)
+}
+
+#[test]
+fn switch_cli_on_a_notification_from_before_a_relaunch_still_switches() {
+    let (mac, core, on_click) = suggested_switch_to_pro();
+    drop(core);
+    let mut core = mac.launch();
+
+    core.event(clicked_after_relaunch(&on_click));
+
+    assert_eq!(PathBuf::from(pointer(&mac)), folder_of(&mac, &team()));
+}
+
+#[test]
+fn switch_cli_on_an_old_notification_does_nothing_once_its_profile_is_gone() {
+    let (mac, core, on_click) = suggested_switch_to_pro();
+    let perso = pointer(&mac);
+    drop(core);
+    std::fs::remove_dir_all(folder_of(&mac, &team())).unwrap();
+    let mut core = mac.launch();
+
+    core.event(clicked_after_relaunch(&on_click));
+
+    assert_eq!(pointer(&mac), perso);
+}
+
+#[test]
+fn switch_cli_on_an_old_notification_does_nothing_while_cli_switching_is_paused() {
+    let (mac, core, on_click) = suggested_switch_to_pro();
+    let perso = pointer(&mac);
+    drop(core);
+    mac.write_json(
+        ".claude/settings.json",
+        &json!({ "env": { "CLAUDE_CONFIG_DIR": "/somewhere/else" } }),
+    );
+    let mut core = mac.launch();
+
+    core.event(clicked_after_relaunch(&on_click));
+
+    assert_eq!(core.view().menu_bar.label, "?", "paused");
+    assert_eq!(pointer(&mac), perso);
 }
 
 #[test]
