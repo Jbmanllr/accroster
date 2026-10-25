@@ -102,7 +102,7 @@ open target/release/AccRoster.app
 
 The stable identity keeps Keychain approvals and notification permission across rebuilds; `scripts/bundle.sh --ad-hoc` builds without it. This is local signing only; the app is not notarized, and launch at login is not available in a local build. Releases are built by `scripts/release.sh`; see [Releasing](#releasing).
 
-Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI (`.github/workflows/ci.yml`) runs the same three on `macos-latest` for every pull request and push to `main`; bundling and signing stay local.
+Checks: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI (`.github/workflows/ci.yml`) runs the same three on `macos-latest` for every pull request and push to `main`, then a release dry run (see [Releasing](#releasing)); Developer ID signing and notarization run only for releases.
 
 ### Layout
 

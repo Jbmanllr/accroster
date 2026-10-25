@@ -2,7 +2,7 @@
 
 For the maintainer. A release is a notarized `AccRoster-<version>.dmg` on the repository's GitHub Releases page, built by `scripts/release.sh` and published by pushing a `vX.Y.Z` tag. Users never see any of this; their steps are in the README's [Install](../README.md#install).
 
-> **Status.** `scripts/release.sh` and the pull request dry run (`release-dry-run` in `.github/workflows/ci.yml`) exist. The release workflow, `.github/workflows/release.yml`, is not written yet (ticket #56). Anything below marked **(intended)** is the planned flow, and the secret names are the ones the workflow will read. Update this page when the workflow lands.
+> **Status.** `scripts/release.sh` and the dry run (`release-dry-run` in `.github/workflows/ci.yml`) exist. The release workflow, `.github/workflows/release.yml`, is not written yet (ticket #56). Anything below marked **(intended)** is the planned flow, and the secret names are the ones the workflow will read. Update this page when the workflow lands.
 
 ## One-time setup
 
@@ -65,7 +65,7 @@ Before it builds anything, the script exits non-zero if the tag and `Cargo.toml`
 
 ## Try the release build without secrets
 
-`scripts/release.sh --dry-run [--version X.Y.Z]` does the same build with an ad-hoc signature and no notarization, and runs the checks that need no Apple account. Every pull request runs it as `release-dry-run`. To run it locally:
+`scripts/release.sh --dry-run [--version X.Y.Z]` does the same build with an ad-hoc signature and no notarization, and runs the checks that need no Apple account. Every pull request and push to `main` runs it as `release-dry-run`, after the `check` job passes. To run it locally:
 
 ```sh
 brew install librsvg   # once: the icon needs rsvg-convert
