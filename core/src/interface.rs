@@ -38,6 +38,31 @@ pub enum Command {
     CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
+    /// Rename… in a row's hover submenu: asks for a nickname
+    /// ([`Effect::AskNickname`]).
+    AskNickname(NicknameTarget),
+    /// The nickname prompt's answer. `None`, empty or blank clears it.
+    SetNickname {
+        target: NicknameTarget,
+        nickname: Option<String>,
+    },
+    /// Moves a Profile (by id) to position `to` in the Profile order.
+    MoveProfile { id: String, to: usize },
+    /// "Sign in again…" on an expired or signed-out Profile (by id): Claude
+    /// Code's browser sign-in in that same folder.
+    SignInAgain(String),
+    /// Remove… in a row's hover submenu: asks first
+    /// ([`Effect::ConfirmRemoval`]).
+    AskRemoveProfile(String),
+    /// The removal confirmed: sign the Profile out, then delete its folder.
+    RemoveProfile(String),
+}
+
+/// Whose nickname a prompt sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicknameTarget {
+    /// A Profile, by id.
+    Profile(String),
 }
 
 impl Command {
@@ -52,6 +77,12 @@ impl Command {
             Command::AddProfile => "add_profile",
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
+            Command::AskNickname(_) => "ask_nickname",
+            Command::SetNickname { .. } => "set_nickname",
+            Command::MoveProfile { .. } => "move_profile",
+            Command::SignInAgain(_) => "sign_in_again",
+            Command::AskRemoveProfile(_) => "ask_remove_profile",
+            Command::RemoveProfile(_) => "remove_profile",
         }
     }
 }
@@ -79,6 +110,23 @@ pub enum Effect {
     OpenLoginItemsSettings,
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
+    /// Ask for a nickname (a text field prefilled with `current`, `name` as
+    /// the placeholder), then send [`Command::SetNickname`] for `target`.
+    AskNickname {
+        name: String,
+        current: Option<String>,
+        target: NicknameTarget,
+    },
+    /// Ask before an irreversible action: an alert with `title` and
+    /// `message`, a destructive confirm button and Cancel. Confirming sends
+    /// `confirm`; Cancel sends nothing.
+    ConfirmRemoval {
+        title: String,
+        message: String,
+        confirm: Command,
+    },
+    /// Post a user notification.
+    Notify { title: String, body: String },
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -153,6 +201,9 @@ pub struct ProfileRow {
     pub limits: Vec<LimitBar>,
     /// A short line under the bars (for example "Couldn't read limits").
     pub note: Option<String>,
+    /// Draw the bars and title dimmed: the reading is not current (for
+    /// example the Login expired).
+    pub dimmed: bool,
     /// The hover submenu.
     pub submenu: Vec<MenuItem>,
 }

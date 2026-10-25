@@ -11,7 +11,7 @@ use crate::backups;
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Command, Effect, Event, FirstRunView, LaunchAtLoginView, MenuBarView, MenuItem,
-    MenuView, SettingsView, View,
+    MenuView, NicknameTarget, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::profiles::{self, ProfileRegistry};
@@ -177,6 +177,42 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::AskNickname(NicknameTarget::Profile(id)) => self
+                .profiles
+                .nickname_prompt(&id, &self.settings)
+                .into_iter()
+                .collect(),
+            Command::SetNickname {
+                target: NicknameTarget::Profile(id),
+                nickname,
+            } => {
+                self.set_nickname(id, nickname);
+                Vec::new()
+            }
+            Command::MoveProfile { id, to } => {
+                self.move_profile(&id, to);
+                Vec::new()
+            }
+            Command::SignInAgain(id) => {
+                let (profiles, ctx) = self.profiles();
+                profiles.sign_in_again(&ctx, &id);
+                Vec::new()
+            }
+            Command::AskRemoveProfile(id) => {
+                let (profiles, ctx) = self.profiles();
+                let confirm = Command::RemoveProfile(id.clone());
+                profiles
+                    .removal_confirmation(&ctx, &id, confirm)
+                    .into_iter()
+                    .collect()
+            }
+            Command::RemoveProfile(id) => {
+                let (profiles, ctx) = self.profiles();
+                if profiles.remove(&ctx, &id) {
+                    self.forget_profile_settings(&id);
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -189,7 +225,7 @@ impl Core {
                 }
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
-                Vec::new()
+                profiles.take_effects()
             }
         }
     }
@@ -207,7 +243,7 @@ impl Core {
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let rows = self.profiles.rows();
+        let rows = self.profiles.rows(&self.settings);
         if !rows.is_empty() {
             items.extend(rows.into_iter().map(MenuItem::Profile));
             items.push(MenuItem::Separator);
@@ -282,6 +318,58 @@ impl Core {
             "verbose logging",
             &[("state", Field::Word(state))],
         );
+    }
+
+    /// Sets or (when blank) clears a Profile's nickname.
+    fn set_nickname(&mut self, id: String, nickname: Option<String>) {
+        let mut updated = self.settings.clone();
+        match nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => updated.nicknames.insert(id.clone(), name.to_owned()),
+            None => updated.nicknames.remove(&id),
+        };
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "nickname changed",
+                &[("profile", Field::Profile(&id))],
+            );
+        }
+    }
+
+    /// Drops a removed Profile's nickname and place in the order.
+    fn forget_profile_settings(&mut self, id: &str) {
+        let mut updated = self.settings.clone();
+        updated.nicknames.remove(id);
+        updated.profile_order.retain(|known| known != id);
+        if updated != self.settings {
+            self.save_settings(updated);
+        }
+    }
+
+    /// Moves a Profile to position `to` (clamped) and saves the whole order.
+    fn move_profile(&mut self, id: &str, to: usize) {
+        let mut order = self.profiles.ordered_ids(&self.settings.profile_order);
+        let Some(from) = order.iter().position(|known| known == id) else {
+            return;
+        };
+        let moved = order.remove(from);
+        order.insert(to.min(order.len()), moved);
+        let mut updated = self.settings.clone();
+        updated.profile_order = order;
+        if self.save_settings(updated) {
+            self.log(
+                Level::Info,
+                "profile moved",
+                &[
+                    ("profile", Field::Profile(id)),
+                    ("to", Field::Number(to as i64)),
+                ],
+            );
+        }
     }
 
     /// Writes `settings.json` and keeps `updated` as the current settings.

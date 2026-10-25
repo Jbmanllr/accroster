@@ -15,11 +15,13 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::backups;
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
-use crate::interface::{LimitBar, MenuItem, ProfileRow};
+use crate::interface::{Command, Effect, LimitBar, MenuItem, NicknameTarget, ProfileRow};
 use crate::logging::{Field, Level, Logger};
 use crate::runner::Runner;
+use crate::settings::Settings;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
 use crate::usage::UsageReply;
 
@@ -97,6 +99,9 @@ struct Entry {
     /// The folder's absolute path as first created; every spawn uses it
     /// byte for byte.
     config_dir: PathBuf,
+    /// The Login expired (and was notified); cleared by Sign in again….
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 impl VersionedFile for RegistryFile {
@@ -113,58 +118,117 @@ enum Reading {
 struct Profile {
     id: String,
     config_dir: PathBuf,
+    /// `None` when the folder holds no `oauthAccount`: signed out.
     identity: Option<Identity>,
     reading: Option<Reading>,
+    /// Login expired: `rate_limits_available: false`, or `loggedIn: false`
+    /// while `oauthAccount` remains. Not polled until signed in again.
+    expired: bool,
 }
 
 impl Profile {
-    fn row(&self, identity: &Identity) -> ProfileRow {
+    /// The menu row: `title` is the nickname, else `email · Organization`;
+    /// `position` and `count` decide which Move items the submenu offers.
+    fn row(&self, title: String, position: usize, count: usize) -> ProfileRow {
         let mut limits = Vec::new();
         let mut note = None;
-        let mut plan = identity
-            .organization_type
-            .as_deref()
-            .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned());
-        match &self.reading {
-            None => {}
-            Some(Reading::Read(reply)) => {
-                if let Some(kind) = &reply.subscription_type {
-                    plan = Some(kind.clone());
-                }
-                match &reply.limits {
-                    Some(read) => {
-                        let mut bar = |label: &str, percent: f64| {
-                            limits.push(LimitBar {
-                                label: label.to_owned(),
-                                percent: percent.max(0.0).floor() as u32,
-                            });
-                        };
-                        if let Some(percent) = read.session {
-                            bar("Session", percent);
-                        }
-                        if let Some(percent) = read.weekly {
-                            bar("Weekly", percent);
-                        }
-                        for (name, percent) in &read.models {
-                            bar(name, *percent);
-                        }
+        let mut submenu = Vec::new();
+        if let Some(identity) = &self.identity {
+            let mut plan = identity
+                .organization_type
+                .as_deref()
+                .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned());
+            match &self.reading {
+                None => {}
+                Some(Reading::Read(reply)) => {
+                    if let Some(kind) = &reply.subscription_type {
+                        plan = Some(kind.clone());
                     }
-                    None => note = Some("Couldn't read limits".to_owned()),
+                    match &reply.limits {
+                        Some(read) => {
+                            let mut bar = |label: &str, percent: f64| {
+                                limits.push(LimitBar {
+                                    label: label.to_owned(),
+                                    percent: percent.max(0.0).floor() as u32,
+                                });
+                            };
+                            if let Some(percent) = read.session {
+                                bar("Session", percent);
+                            }
+                            if let Some(percent) = read.weekly {
+                                bar("Weekly", percent);
+                            }
+                            for (name, percent) in &read.models {
+                                bar(name, *percent);
+                            }
+                        }
+                        None => note = Some("Couldn't read limits".to_owned()),
+                    }
                 }
+                Some(Reading::Failed) => note = Some("Couldn't read limits".to_owned()),
             }
-            Some(Reading::Failed) => note = Some("Couldn't read limits".to_owned()),
+            let mut detail = identity.name();
+            if let Some(plan) = plan.filter(|plan| !plan.is_empty()) {
+                detail.push_str(" · ");
+                detail.push_str(&capitalized(&plan));
+            }
+            submenu.push(MenuItem::Detail(detail));
         }
-        let mut detail = identity.name();
-        if let Some(plan) = plan.filter(|plan| !plan.is_empty()) {
-            detail.push_str(" · ");
-            detail.push_str(&capitalized(&plan));
+        let action = |title: &str, command: Command| MenuItem::Action {
+            title: title.to_owned(),
+            command,
+        };
+        if self.identity.is_none() {
+            note = Some("Signed out".to_owned());
+        } else if self.expired {
+            note = Some("Login expired".to_owned());
         }
+        if self.identity.is_none() || self.expired {
+            submenu.push(action(
+                "Sign in again…",
+                Command::SignInAgain(self.id.clone()),
+            ));
+        }
+        if position > 0 {
+            submenu.push(action(
+                "Move Up",
+                Command::MoveProfile {
+                    id: self.id.clone(),
+                    to: position - 1,
+                },
+            ));
+        }
+        if position + 1 < count {
+            submenu.push(action(
+                "Move Down",
+                Command::MoveProfile {
+                    id: self.id.clone(),
+                    to: position + 1,
+                },
+            ));
+        }
+        submenu.push(action(
+            "Rename…",
+            Command::AskNickname(NicknameTarget::Profile(self.id.clone())),
+        ));
+        submenu.push(action(
+            "Remove…",
+            Command::AskRemoveProfile(self.id.clone()),
+        ));
         ProfileRow {
-            title: identity.name(),
+            title,
             limits,
             note,
-            submenu: vec![MenuItem::Detail(detail)],
+            dimmed: self.expired,
+            submenu,
         }
+    }
+
+    /// `email · Organization`, or what the row says when no Login is known.
+    fn name(&self) -> String {
+        self.identity
+            .as_ref()
+            .map_or_else(|| "Signed-out Profile".to_owned(), Identity::name)
     }
 }
 
@@ -182,6 +246,17 @@ struct SignIn {
     config_dir: PathBuf,
     process: Box<dyn RunningProcess>,
     started_at: Timestamp,
+    /// Set for "Sign in again…" in an existing Profile's folder.
+    again: Option<Again>,
+}
+
+/// What a sign-in in an existing Profile's folder must match or put back.
+struct Again {
+    /// The Login the Profile had; `None` for a signed-out Profile.
+    expected: Option<Identity>,
+    /// Its `oauthAccount`, restored when another Login's sign-in is undone
+    /// so the Profile stays expired rather than signed out.
+    previous_account: Option<Value>,
 }
 
 /// Every Profile, plus the sign-in in progress, if any.
@@ -191,6 +266,8 @@ pub(crate) struct ProfileRegistry {
     sign_in: Option<SignIn>,
     /// The outcome of the last sign-in, shown as a menu line until the next.
     notice: Option<String>,
+    /// Effects (notifications) waiting for the core to hand to the UI.
+    effects: Vec<Effect>,
 }
 
 impl ProfileRegistry {
@@ -228,6 +305,7 @@ impl ProfileRegistry {
                     id: entry.id,
                     config_dir: entry.config_dir,
                     reading: None,
+                    expired: entry.expired,
                 });
             }
         }
@@ -268,6 +346,7 @@ impl ProfileRegistry {
                         config_dir,
                         identity: Some(identity),
                         reading: None,
+                        expired: false,
                     });
                     changed = true;
                 }
@@ -334,6 +413,7 @@ impl ProfileRegistry {
                     config_dir,
                     process,
                     started_at: ctx.env.clock.now(),
+                    again: None,
                 })
             }
             Err(error) => {
@@ -377,8 +457,13 @@ impl ProfileRegistry {
                 "sign-in timed out",
                 &[("profile", Field::Profile(&sign_in.id))],
             );
+            let again = sign_in.again.is_some();
             abandon(ctx, sign_in);
-            self.notice = Some("Sign-in timed out after 10 minutes · nothing was added".into());
+            self.notice = Some(if again {
+                "Sign-in timed out after 10 minutes · nothing changed".into()
+            } else {
+                "Sign-in timed out after 10 minutes · nothing was added".into()
+            });
             return;
         }
         match sign_in.process.try_wait() {
@@ -394,11 +479,17 @@ impl ProfileRegistry {
                         ("exit_code", Field::Number(code)),
                     ],
                 );
-                if output.succeeded() {
-                    self.finish(ctx, sign_in);
+                if !output.succeeded() {
+                    self.notice = Some(if sign_in.again.is_some() {
+                        "Sign-in didn't complete · nothing changed".into()
+                    } else {
+                        discard(ctx, &sign_in.id, &sign_in.config_dir);
+                        "Sign-in didn't complete · nothing was added".into()
+                    });
+                } else if sign_in.again.is_some() {
+                    self.finish_again(ctx, sign_in);
                 } else {
-                    discard(ctx, &sign_in.id, &sign_in.config_dir);
-                    self.notice = Some("Sign-in didn't complete · nothing was added".into());
+                    self.finish(ctx, sign_in);
                 }
             }
             Err(error) => {
@@ -428,12 +519,130 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
-    /// One row per signed-in Profile, in order.
-    pub(crate) fn rows(&self) -> Vec<ProfileRow> {
-        self.profiles
+    /// One row per Profile (signed in, expired or signed out), in the
+    /// user's order, titled by nickname when there is one.
+    pub(crate) fn rows(&self, settings: &Settings) -> Vec<ProfileRow> {
+        let listed = self.ordered(&settings.profile_order);
+        listed
             .iter()
-            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?)))
+            .enumerate()
+            .map(|(position, profile)| {
+                let title = settings
+                    .nicknames
+                    .get(&profile.id)
+                    .cloned()
+                    .unwrap_or_else(|| profile.name());
+                profile.row(title, position, listed.len())
+            })
             .collect()
+    }
+
+    /// Every Profile id, in the user's order: `order` first (ids it names
+    /// that no longer exist are skipped), then the rest in add order.
+    pub(crate) fn ordered_ids(&self, order: &[String]) -> Vec<String> {
+        self.ordered(order)
+            .into_iter()
+            .map(|profile| profile.id.clone())
+            .collect()
+    }
+
+    /// The prompt for Rename…, or `None` for an unknown Profile.
+    pub(crate) fn nickname_prompt(&self, id: &str, settings: &Settings) -> Option<Effect> {
+        let profile = self.profile(id)?;
+        Some(Effect::AskNickname {
+            name: profile.name(),
+            current: settings.nicknames.get(id).cloned(),
+            target: NicknameTarget::Profile(id.to_owned()),
+        })
+    }
+
+    /// The confirmation Remove… shows before `confirm` removes Profile `id`.
+    /// It warns when `~/.config/anthropic/configs/` exists, because Claude
+    /// Code's sign-out also deletes credentials there.
+    pub(crate) fn removal_confirmation(
+        &self,
+        ctx: &Context,
+        id: &str,
+        confirm: Command,
+    ) -> Option<Effect> {
+        let profile = self.profile(id)?;
+        let mut message = "AccRoster signs it out with Claude Code, then deletes its folder. \
+                           Shared Transcripts and settings in ~/.claude stay."
+            .to_owned();
+        if ctx.env.home.join(".config/anthropic/configs").is_dir() {
+            message.push_str(
+                "\n\n~/.config/anthropic/configs/ exists: Claude Code's sign-out also \
+                 revokes and deletes the credential files kept there, which other tools may use.",
+            );
+        }
+        Some(Effect::ConfirmRemoval {
+            title: format!("Remove {}?", profile.name()),
+            message,
+            confirm,
+        })
+    }
+
+    /// Removes Profile `id`: `claude auth logout` first, then its folder
+    /// (links are deleted, never followed, so shared Transcripts stay). A
+    /// failed sign-out keeps the folder and the Profile. Returns whether it
+    /// was removed.
+    pub(crate) fn remove(&mut self, ctx: &Context, id: &str) -> bool {
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            return false;
+        };
+        if self
+            .sign_in
+            .as_ref()
+            .is_some_and(|sign_in| sign_in.id == id)
+        {
+            return false;
+        }
+        self.notice = None;
+        let profile = &self.profiles[index];
+        let signed_out = matches!(ctx.runner().sign_out(&profile.config_dir), Ok(true));
+        if !signed_out {
+            ctx.log(
+                Level::Warn,
+                "sign-out failed, profile kept",
+                &[("profile", Field::Profile(id))],
+            );
+            self.notice = Some(format!(
+                "Couldn't sign out {} · nothing was removed",
+                profile.name()
+            ));
+            return false;
+        }
+        if !remove_folder(ctx, id, &profile.config_dir) {
+            self.notice = Some(format!(
+                "Signed out {}, but its folder couldn't be deleted",
+                profile.name()
+            ));
+        }
+        self.profiles.remove(index);
+        self.save(ctx);
+        ctx.log(
+            Level::Info,
+            "profile removed",
+            &[("profile", Field::Profile(id))],
+        );
+        true
+    }
+
+    fn profile(&self, id: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    fn ordered(&self, order: &[String]) -> Vec<&Profile> {
+        let mut ordered: Vec<&Profile> = order
+            .iter()
+            .filter_map(|id| self.profiles.iter().find(|profile| &profile.id == id))
+            .collect();
+        for profile in &self.profiles {
+            if !order.contains(&profile.id) {
+                ordered.push(profile);
+            }
+        }
+        ordered
     }
 
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
@@ -488,27 +697,204 @@ impl ProfileRegistry {
                 ));
             }
         }
-        let reading = match ctx.runner().read_usage(&config_dir) {
-            Some(reply) => Reading::Read(reply),
-            None => {
-                ctx.log(
-                    Level::Warn,
-                    "limits unreadable",
-                    &[("profile", Field::Profile(&id))],
-                );
-                Reading::Failed
-            }
-        };
         ctx.log(
             Level::Info,
             "profile added",
             &[("profile", Field::Profile(&id))],
         );
+        let reply = ctx.runner().read_usage(&config_dir);
         self.profiles.push(Profile {
-            id,
+            id: id.clone(),
             config_dir,
             identity: Some(identity),
-            reading: Some(reading),
+            reading: None,
+            expired: false,
+        });
+        self.save(ctx);
+        self.record_reading(ctx, &id, reply);
+    }
+
+    /// "Sign in again…" exited successfully. The same Login and Organization
+    /// (or, for a signed-out Profile, any Login not already listed) brings
+    /// the Profile back; any other is undone like a duplicate, and the
+    /// Profile keeps its Login and stays expired.
+    fn finish_again(&mut self, ctx: &Context, sign_in: SignIn) {
+        let SignIn {
+            id,
+            config_dir,
+            again,
+            ..
+        } = sign_in;
+        let Again {
+            expected,
+            previous_account,
+        } = again.expect("only called for a sign-in again");
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            return;
+        };
+        let Some(identity) = Identity::read(&config_dir) else {
+            self.notice = Some("Sign-in didn't complete · nothing changed".into());
+            return;
+        };
+        let accepted = match &expected {
+            Some(expected) => expected.same_profile(&identity),
+            None => self
+                .find(&identity)
+                .is_none_or(|existing| existing.id == id),
+        };
+        if !accepted {
+            let used = identity.name();
+            let wanted = expected.as_ref().map_or_else(
+                || self.find(&identity).map(Profile::name).unwrap_or_default(),
+                Identity::name,
+            );
+            ctx.log(
+                Level::Info,
+                "sign-in again as another login undone",
+                &[("profile", Field::Profile(&id))],
+            );
+            let undone = matches!(ctx.runner().sign_out(&config_dir), Ok(true));
+            if undone && let Some(account) = &previous_account {
+                restore_account(ctx, &id, &config_dir, account);
+            }
+            self.notice = Some(match (expected.is_some(), undone) {
+                (true, true) => {
+                    format!("Signed in as {used}, not {wanted} · that sign-in was undone")
+                }
+                (true, false) => {
+                    format!("Signed in as {used}, not {wanted} · that sign-in couldn't be undone")
+                }
+                (false, true) => format!("Already added: {wanted}"),
+                (false, false) => {
+                    format!("Already added: {wanted} · the new sign-in couldn't be undone")
+                }
+            });
+            return;
+        }
+        ctx.log(
+            Level::Info,
+            "signed in again",
+            &[("profile", Field::Profile(&id))],
+        );
+        let profile = &mut self.profiles[index];
+        profile.identity = Some(identity);
+        profile.expired = false;
+        self.save(ctx);
+        let reply = ctx.runner().read_usage(&config_dir);
+        self.record_reading(ctx, &id, reply);
+    }
+
+    /// "Sign in again…": Claude Code's browser sign-in in the Profile's own
+    /// folder (its Keychain slot is tied to that path), with `--email` when
+    /// the Login is known. Ignored while another sign-in is running.
+    pub(crate) fn sign_in_again(&mut self, ctx: &Context, id: &str) {
+        if self.sign_in.is_some() {
+            return;
+        }
+        let Some(profile) = self.profile(id) else {
+            return;
+        };
+        let expected = profile.identity.clone();
+        let config_dir = profile.config_dir.clone();
+        self.notice = None;
+        let previous_account = fs::read(config_dir.join(".claude.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|body| body.get("oauthAccount").cloned());
+        let email = expected.as_ref().map(|identity| identity.email.clone());
+        ctx.log(
+            Level::Info,
+            "sign-in again started",
+            &[("profile", Field::Profile(id))],
+        );
+        match ctx.runner().start_sign_in(
+            &config_dir,
+            email.as_deref().filter(|email| !email.is_empty()),
+        ) {
+            Ok(process) => {
+                self.sign_in = Some(SignIn {
+                    id: id.to_owned(),
+                    config_dir,
+                    process,
+                    started_at: ctx.env.clock.now(),
+                    again: Some(Again {
+                        expected,
+                        previous_account,
+                    }),
+                })
+            }
+            Err(error) => {
+                let error = error.to_string();
+                ctx.log(
+                    Level::Error,
+                    "sign-in not started",
+                    &[
+                        ("profile", Field::Profile(id)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+                self.notice = Some("Couldn't start Claude Code to sign in".into());
+            }
+        }
+    }
+
+    /// Takes in one usage read of Profile `id` (`None` when it failed). A
+    /// read saying `rate_limits_available: false`, or a failed read after
+    /// which `claude auth status` says `loggedIn: false` while the folder
+    /// still holds its `oauthAccount`, means the Login expired: the last
+    /// reading is kept (dimmed), polling stops and one notification goes
+    /// out per expiry.
+    pub(crate) fn record_reading(&mut self, ctx: &Context, id: &str, reply: Option<UsageReply>) {
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            return;
+        };
+        let profile = &self.profiles[index];
+        if profile.identity.is_none() {
+            return;
+        }
+        let expired = match &reply {
+            Some(reply) => reply.rate_limits_available == Some(false),
+            None => ctx
+                .runner()
+                .auth_status(&profile.config_dir)
+                .is_some_and(|status| !status.logged_in),
+        };
+        if expired {
+            self.expire(ctx, index);
+            return;
+        }
+        if reply.is_none() {
+            ctx.log(
+                Level::Warn,
+                "limits unreadable",
+                &[("profile", Field::Profile(id))],
+            );
+        }
+        self.profiles[index].reading = Some(reply.map_or(Reading::Failed, Reading::Read));
+    }
+
+    /// Effects produced since the last call (notifications).
+    pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
+    fn expire(&mut self, ctx: &Context, index: usize) {
+        let profile = &mut self.profiles[index];
+        if profile.expired {
+            return;
+        }
+        profile.expired = true;
+        ctx.log(
+            Level::Warn,
+            "login expired",
+            &[("profile", Field::Profile(&profile.id))],
+        );
+        self.effects.push(Effect::Notify {
+            title: "Login expired".into(),
+            body: format!(
+                "{} needs signing in again. Choose Sign in again… in its menu.",
+                profile.name()
+            ),
         });
         self.save(ctx);
     }
@@ -535,6 +921,7 @@ impl ProfileRegistry {
                 .map(|profile| Entry {
                     id: profile.id.clone(),
                     config_dir: profile.config_dir.clone(),
+                    expired: profile.expired,
                 })
                 .collect(),
         };
@@ -596,7 +983,7 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
     }
 }
 
-/// Kills an unfinished sign-in and removes what it left.
+/// Kills an unfinished sign-in and, for Add Profile…, removes what it left.
 fn abandon(ctx: &Context, mut sign_in: SignIn) {
     if let Err(error) = sign_in.process.kill() {
         let error = error.to_string();
@@ -609,7 +996,44 @@ fn abandon(ctx: &Context, mut sign_in: SignIn) {
             ],
         );
     }
-    discard(ctx, &sign_in.id, &sign_in.config_dir);
+    if sign_in.again.is_none() {
+        discard(ctx, &sign_in.id, &sign_in.config_dir);
+    }
+}
+
+/// Puts a Profile's `oauthAccount` back into its `.claude.json` after another
+/// Login's sign-in there was undone (sign-out deletes it), so the Profile
+/// keeps its Login. Backed up first, written atomically.
+fn restore_account(ctx: &Context, id: &str, config_dir: &Path, account: &Value) {
+    let path = config_dir.join(".claude.json");
+    let result = (|| -> io::Result<()> {
+        let mut body = match fs::read(&path) {
+            Ok(bytes) => {
+                backups::back_up(&ctx.paths.backups(), &path, ctx.env.clock.now())?;
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
+            Err(error) => return Err(error),
+        };
+        if !body.is_object() {
+            body = Value::Object(serde_json::Map::new());
+        }
+        body.as_object_mut()
+            .expect("made an object above")
+            .insert("oauthAccount".into(), account.clone());
+        storage::write_atomically(&path, &serde_json::to_vec_pretty(&body)?)
+    })();
+    if let Err(error) = result {
+        let error = error.to_string();
+        ctx.log(
+            Level::Error,
+            "account not restored",
+            &[
+                ("profile", Field::Profile(id)),
+                ("error", Field::Text(&error)),
+            ],
+        );
+    }
 }
 
 /// Removes a Profile folder that must not stay: signs it out first if a

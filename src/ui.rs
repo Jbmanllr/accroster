@@ -8,8 +8,10 @@ use std::cell::{OnceCell, RefCell};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{Command, Core, Effect, LimitBar, MenuItem, ProfileRow, SettingsView, View};
+use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
+use objc2::runtime::Bool;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
@@ -21,9 +23,14 @@ use objc2_app_kit::{
     NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
     NSWindowStyleMask, NSWorkspace,
 };
+use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSBundle, NSDictionary, NSEdgeInsets, NSError, NSObjectProtocol,
+    NSPoint, NSRect, NSSize, NSString, NSURL, NSUUID, ns_string,
+};
+use objc2_user_notifications::{
+    UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+    UNUserNotificationCenter,
 };
 
 /// Width of a Profile row in the menu.
@@ -278,6 +285,56 @@ impl Ui {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
             },
             Effect::Terminate => app.terminate(None),
+            Effect::AskNickname {
+                name,
+                current,
+                target,
+            } => {
+                let alert = NSAlert::new(mtm);
+                alert.setMessageText(&NSString::from_str(&format!("Rename {name}")));
+                alert.setInformativeText(ns_string!(
+                    "Leave it empty to show the Login and Organization again."
+                ));
+                let field = NSTextField::textFieldWithString(
+                    &NSString::from_str(current.as_deref().unwrap_or_default()),
+                    mtm,
+                );
+                field.setPlaceholderString(Some(&NSString::from_str(&name)));
+                field.setFrame(NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(260.0, 24.0),
+                ));
+                alert.setAccessoryView(Some(&field));
+                alert.addButtonWithTitle(ns_string!("Save"));
+                alert.addButtonWithTitle(ns_string!("Cancel"));
+                alert.window().setInitialFirstResponder(Some(&field));
+                app.activate();
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.send(Command::SetNickname {
+                        target,
+                        nickname: Some(field.stringValue().to_string()),
+                    });
+                }
+            }
+            Effect::ConfirmRemoval {
+                title,
+                message,
+                confirm,
+            } => {
+                let alert = NSAlert::new(mtm);
+                alert.setAlertStyle(NSAlertStyle::Warning);
+                alert.setMessageText(&NSString::from_str(&title));
+                alert.setInformativeText(&NSString::from_str(&message));
+                alert
+                    .addButtonWithTitle(ns_string!("Remove"))
+                    .setHasDestructiveAction(true);
+                alert.addButtonWithTitle(ns_string!("Cancel"));
+                app.activate();
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.send(confirm);
+                }
+            }
+            Effect::Notify { title, body } => notify(&title, &body),
         }
     }
 
@@ -486,7 +543,13 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     let arrow = label(mtm, "›", NSFont::systemFontOfSize(13.0), true);
     let mut lines: Vec<Retained<NSView>> =
         vec![stack(mtm, false, 5.0, &[&name, &filler, &arrow]).into_super()];
-    lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    lines.extend(row.limits.iter().map(|bar| {
+        let line = limit_line(mtm, bar);
+        if row.dimmed {
+            line.setAlphaValue(0.45);
+        }
+        line
+    }));
     if let Some(note) = &row.note {
         lines.push(
             label(mtm, note, NSFont::systemFontOfSize(10.0), true)
@@ -618,6 +681,27 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
     settings
         .verbose_logging_note
         .setStringValue(&NSString::from_str(&view.verbose_logging_note));
+}
+
+/// Posts a user notification. Asks for permission the first time (macOS
+/// remembers the answer). Only an app bundle can post: run unbundled (for
+/// example `cargo run`), the notification is skipped.
+fn notify(title: &str, body: &str) {
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        return;
+    }
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.requestAuthorizationWithOptions_completionHandler(
+        UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+        &RcBlock::new(|_granted: Bool, _error: *mut NSError| {}),
+    );
+    let content = UNMutableNotificationContent::new();
+    content.setTitle(&NSString::from_str(title));
+    content.setBody(&NSString::from_str(body));
+    let identifier = NSUUID::UUID().UUIDString();
+    let request =
+        UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
+    center.addNotificationRequest_withCompletionHandler(&request, None);
 }
 
 /// Shows a launch failure before the app exits.
