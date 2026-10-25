@@ -40,6 +40,38 @@ On every run the shim silently unsets the variables that would put another accou
 - If the chosen Profile's folder is missing, the shim prints an error and exits with status 1. It never falls back to `~/.claude`.
 - The IDE extensions, the Claude desktop app and anything not started from your shell don't go through the shim, so they use `~/.claude`.
 
+## Uninstall
+
+Use Settings → Uninstall…. It lists what it removes and what stays, then runs these steps in order. Each step is skipped when it is already done, so if it stops or is interrupted, run it again to finish; `claude` keeps working at every point.
+
+1. Unhook the CLI, as turning CLI switching off does: the `~/.zshrc` block goes first, then the shim and the pointer. New and open terminals then run the real `claude` with `~/.claude`.
+2. Remove each Profile: sign it out with Claude Code, then delete its folder. That deletes the Profile's own prompt history, and the MCP servers and folder trust added after it was set up. Signing out asks Anthropic to revoke the login; offline, that revoke may not have happened, though the login is deleted from your Mac. If a sign-out fails, that folder is kept so its login can still be revoked, and Uninstall stops with Retry.
+3. Unregister launch at login.
+4. Delete `~/Library/Application Support/io.github.jbmanllr.accroster/` permanently.
+5. Move the app to the Trash.
+
+Sidebar entries that Sidebar sync copied into other Profiles' sidebars, folders AccRoster created in `~/.claude`, and the notification permission (System Settings → Notifications) stay.
+
+By hand, the same steps:
+
+1. Remove the `# >>> accroster >>>` … `# <<< accroster <<<` block from `~/.zshrc` (and any `PATH` line you added for bash or fish), then open a new terminal.
+2. For each folder in `~/Library/Application Support/io.github.jbmanllr.accroster/profiles/`, sign it out, then delete it:
+
+   ```sh
+   cd ~/Library/Application\ Support/io.github.jbmanllr.accroster/profiles
+   for dir in "$PWD"/*/; do
+     dir="${dir%/}"
+     CLAUDE_CONFIG_DIR="$dir" ~/.local/bin/claude auth logout && rm -rf "$dir"
+   done
+   ```
+
+   Pass the folder's path exactly as above, with no trailing slash: Claude Code names each Profile's Keychain item after that exact string.
+3. Remove AccRoster in System Settings → General → Login Items.
+4. Delete `~/Library/Application Support/io.github.jbmanllr.accroster/`.
+5. Move `AccRoster.app` to the Trash.
+
+Trashing the app without uninstalling is harmless: the shim and the `~/.zshrc` block stay, and `claude` keeps routing through the shim to the Profile it last pointed at, because the shim is a plain shell script that doesn't need the app. Run steps 1–4 above whenever you want the rest gone.
+
 ## Build
 
 Requires macOS 14 or later and Rust 1.93 or later.

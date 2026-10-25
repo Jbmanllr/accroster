@@ -137,6 +137,13 @@ pub enum Command {
     /// "Sync now" in Settings: copy every Session's Sidebar entry into every
     /// other Profile's sidebar.
     SyncSidebarNow,
+    /// "Uninstall…" in Settings: asks first ([`Effect::ConfirmUninstall`]).
+    AskUninstall,
+    /// The uninstall confirmed, or its Retry: unhook the CLI, remove every
+    /// Profile, unregister launch at login, delete the app's folder, then
+    /// [`Effect::TrashAppAndQuit`]. Each step is skipped when already done;
+    /// a failed sign-out stops it before the app's folder.
+    Uninstall,
 }
 
 /// How Sidebar sync runs (ADR 0003). Saved in `settings.json` as
@@ -212,6 +219,8 @@ impl Command {
             Command::ResumeFeature(_) => "resume_feature",
             Command::SetSidebarSync(_) => "set_sidebar_sync",
             Command::SyncSidebarNow => "sync_sidebar_now",
+            Command::AskUninstall => "ask_uninstall",
+            Command::Uninstall => "uninstall",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
             Command::FilterSessions(_) => "filter_sessions",
@@ -333,6 +342,17 @@ pub enum Effect {
         message: String,
         confirm: Command,
     },
+    /// Ask before uninstalling: an alert with `title` and `message`, a
+    /// destructive "Uninstall" button and Cancel. Confirming sends
+    /// `confirm`; Cancel sends nothing.
+    ConfirmUninstall {
+        title: String,
+        message: String,
+        confirm: Command,
+    },
+    /// The last uninstall step: move the running app's bundle to the Trash,
+    /// then quit. The core has already removed everything else it owns.
+    TrashAppAndQuit,
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -542,6 +562,16 @@ pub struct SettingsView {
     pub hidden_discovered: Vec<HiddenDiscovered>,
     pub sidebar_sync: SidebarSyncView,
     pub notifications: NotificationsView,
+    pub uninstall: UninstallView,
+}
+
+/// "Uninstall…" in Settings, and why the last uninstall stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UninstallView {
+    /// Why the last uninstall stopped and what is left, when it did.
+    pub note: Option<String>,
+    /// "Retry", present after a stopped uninstall: [`Command::Uninstall`].
+    pub retry: Option<Command>,
 }
 
 /// Settings > Notifications.
