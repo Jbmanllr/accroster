@@ -10,10 +10,9 @@ use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
     Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
 };
-use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool, NSObject, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
@@ -27,12 +26,8 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSBundle, NSDictionary, NSEdgeInsets, NSError, NSObjectProtocol,
-    NSPoint, NSRect, NSSize, NSString, NSURL, NSUUID, ns_string,
-};
-use objc2_user_notifications::{
-    UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
-    UNUserNotificationCenter,
+    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString, NSURL, ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -452,6 +447,8 @@ impl Ui {
                     NSPasteboardTypeString
                 });
             }
+            Effect::BringDesktopAppForward => bring_desktop_app_forward(),
+            Effect::Notify { title, body } => notify(&title, &body),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
                 name,
@@ -483,7 +480,6 @@ impl Ui {
                     self.send(confirm);
                 }
             }
-            Effect::Notify { title, body } => notify(&title, &body),
         }
     }
 
@@ -797,6 +793,70 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     body.into_super()
 }
 
+/// The Claude desktop app's bundle id.
+const DESKTOP_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
+
+/// Opens Claude, or brings it forward when it runs. Never quits or relaunches
+/// it: `openApplicationAtURL` activates a running app in place.
+fn bring_desktop_app_forward() {
+    use objc2_app_kit::NSWorkspaceOpenConfiguration;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let Some(url) =
+        workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(DESKTOP_BUNDLE_ID))
+    else {
+        return;
+    };
+    let configuration = NSWorkspaceOpenConfiguration::configuration();
+    configuration.setActivates(true);
+    workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
+}
+
+#[link(name = "UserNotifications", kind = "framework")]
+unsafe extern "C" {}
+
+/// Posts a notification through `UNUserNotificationCenter`, asking for
+/// permission the first time. Only a bundled app may use it (outside a bundle
+/// the center throws), so an unbundled run skips notifications.
+fn notify(title: &str, body: &str) {
+    use block2::RcBlock;
+    use objc2::runtime::{AnyClass, Bool};
+    use objc2_foundation::{NSBundle, NSUUID};
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        return;
+    }
+    let (Some(center_class), Some(content_class), Some(request_class)) = (
+        AnyClass::get(c"UNUserNotificationCenter"),
+        AnyClass::get(c"UNMutableNotificationContent"),
+        AnyClass::get(c"UNNotificationRequest"),
+    ) else {
+        return;
+    };
+    // SAFETY: documented UserNotifications selectors with their documented
+    // argument types; nil completion handlers are allowed.
+    unsafe {
+        let center: Retained<AnyObject> = msg_send![center_class, currentNotificationCenter];
+        // UNAuthorizationOptionSound | UNAuthorizationOptionAlert.
+        let options: usize = (1 << 1) | (1 << 2);
+        let asked = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
+        let _: () = msg_send![&center, requestAuthorizationWithOptions: options, completionHandler: &*asked];
+        let content: Retained<AnyObject> = msg_send![content_class, new];
+        let _: () = msg_send![&content, setTitle: &*NSString::from_str(title)];
+        let _: () = msg_send![&content, setBody: &*NSString::from_str(body)];
+        let id = NSUUID::UUID().UUIDString();
+        let request: Retained<AnyObject> = msg_send![
+            request_class,
+            requestWithIdentifier: &*id,
+            content: &*content,
+            trigger: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![
+            &center,
+            addNotificationRequest: &*request,
+            withCompletionHandler: std::ptr::null::<AnyObject>()
+        ];
+    }
+}
+
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
 /// Unknown Login line.
 fn discovered_row_content(mtm: MainThreadMarker, row: &DiscoveredRow) -> Retained<NSView> {
@@ -973,27 +1033,6 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
     settings
         .verbose_logging_note
         .setStringValue(&NSString::from_str(&view.verbose_logging_note));
-}
-
-/// Posts a user notification. Asks for permission the first time (macOS
-/// remembers the answer). Only an app bundle can post: run unbundled (for
-/// example `cargo run`), the notification is skipped.
-fn notify(title: &str, body: &str) {
-    if NSBundle::mainBundle().bundleIdentifier().is_none() {
-        return;
-    }
-    let center = UNUserNotificationCenter::currentNotificationCenter();
-    center.requestAuthorizationWithOptions_completionHandler(
-        UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
-        &RcBlock::new(|_granted: Bool, _error: *mut NSError| {}),
-    );
-    let content = UNMutableNotificationContent::new();
-    content.setTitle(&NSString::from_str(title));
-    content.setBody(&NSString::from_str(body));
-    let identifier = NSUUID::UUID().UUIDString();
-    let request =
-        UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
-    center.addNotificationRequest_withCompletionHandler(&request, None);
 }
 
 /// Shows a launch failure before the app exits.

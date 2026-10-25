@@ -47,6 +47,15 @@ pub enum Command {
     UseForNewCliRuns(String),
     /// "Copy shell override" in a Profile's submenu (by id).
     CopyShellOverride(String),
+    /// "Switch desktop app to this Profile…" in a Profile's submenu, with
+    /// that Profile's id: the Guided switch.
+    SwitchDesktopApp(String),
+    /// "Switch anyway", when the busy guard couldn't tell.
+    ConfirmDesktopSwitch,
+    /// "Notify me when idle", when a desktop turn blocked the switch.
+    NotifyWhenDesktopIdle,
+    /// "Cancel switch".
+    CancelDesktopSwitch,
     /// "Limit resets → claude.ai" in a Profile's hover submenu: open
     /// claude.ai Settings > Usage, where the user checks resets by hand.
     OpenLimitResets,
@@ -114,6 +123,10 @@ impl Command {
             Command::SetCliSwitching(_) => "set_cli_switching",
             Command::UseForNewCliRuns(_) => "use_for_new_cli_runs",
             Command::CopyShellOverride(_) => "copy_shell_override",
+            Command::SwitchDesktopApp(_) => "switch_desktop_app",
+            Command::ConfirmDesktopSwitch => "confirm_desktop_switch",
+            Command::NotifyWhenDesktopIdle => "notify_when_desktop_idle",
+            Command::CancelDesktopSwitch => "cancel_desktop_switch",
             Command::OpenLimitResets => "open_limit_resets",
             Command::SignInDiscovered(_) => "sign_in_discovered",
             Command::HideDiscovered(_) => "hide_discovered",
@@ -157,6 +170,12 @@ pub enum Effect {
     OpenLoginItemsSettings,
     /// Put this text on the general pasteboard.
     CopyToClipboard(String),
+    /// Bring the Claude desktop app (`com.anthropic.claudefordesktop`)
+    /// forward, opening it if it isn't running. Nothing ever quits or
+    /// relaunches it.
+    BringDesktopAppForward,
+    /// Post a user notification.
+    Notify { title: String, body: String },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
     /// Ask for a nickname for `name` (prefilled with `current`), then send
@@ -175,8 +194,6 @@ pub enum Effect {
         message: String,
         confirm: Command,
     },
-    /// Post a user notification.
-    Notify { title: String, body: String },
 }
 
 /// Everything the UI shows, recomputed after every command and event.
@@ -188,6 +205,19 @@ pub struct View {
     pub about: AboutView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
+    /// The installed Claude versions, for Diagnostics.
+    pub versions: ClaudeVersions,
+}
+
+/// The installed Claude versions, read from files (nothing is spawned).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeVersions {
+    /// The Terminal's Claude Code: where `~/.local/bin/claude` links to.
+    pub claude_code: Option<String>,
+    /// The Claude Code versions bundled with the desktop app, oldest first.
+    pub desktop_claude_code: Vec<String>,
+    /// The desktop app's `CFBundleShortVersionString`.
+    pub desktop: Option<String>,
 }
 
 /// The first-run window: the one-time launch-at-login offer.
@@ -279,7 +309,8 @@ pub struct DiscoveredRow {
 pub struct ProfileRow {
     /// The nickname, else `email · Organization`.
     pub title: String,
-    /// Badges after the name: `CLI` when it is the CLI's Active Profile.
+    /// Badges after the name, "CLI" first, then "Desktop": which clients use
+    /// this Profile.
     pub badges: Vec<String>,
     /// What clicking the row sends, if it does anything.
     pub command: Option<Command>,

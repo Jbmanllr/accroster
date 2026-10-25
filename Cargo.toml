@@ -36,13 +36,12 @@ publish.workspace = true
 
 [dependencies]
 accroster-core.workspace = true
+block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-app-kit = "0.3.2"
 objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService"] }
-objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "bitflags", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
-block2 = "0.6.2"
 
 [profile.release]
 lto = true

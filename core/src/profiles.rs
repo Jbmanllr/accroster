@@ -112,6 +112,16 @@ pub(crate) struct Listed<'a> {
     pub row: ProfileRow,
 }
 
+/// A signed-in Profile as other modules see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignedInProfile {
+    pub id: String,
+    pub account_uuid: String,
+    pub organization_uuid: String,
+    /// `email · Organization`.
+    pub name: String,
+}
+
 /// `state/profiles.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryFile {
@@ -722,6 +732,22 @@ impl ProfileRegistry {
             }
         }
         ordered
+    }
+
+    /// Who each signed-in Profile is, in add order.
+    pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInProfile {
+                    id: profile.id.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    organization_uuid: identity.organization_uuid.clone(),
+                    name: identity.name(),
+                })
+            })
+            .collect()
     }
 
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
