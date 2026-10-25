@@ -8,8 +8,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use accroster_core::{
-    Command, Core, DiscoveredPair, Effect, Event, RunningDot, SessionDetail, SessionFilter,
-    SessionRow, SidebarPresence,
+    Command, Core, DiscoveredPair, Effect, Event, OpenChoice, RunningDot, SessionDetail,
+    SessionFilter, SessionRow, SidebarPresence,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin};
 use common::*;
@@ -938,6 +938,13 @@ fn the_detail_pane_shows_where_a_session_lives() {
                 },
             ],
             deleted: None,
+            // Claude isn't installed, and `~/Dev/app` was never created.
+            open: vec![OpenChoice {
+                title: "Resume in Terminal".into(),
+                note: Some("Its folder no longer exists".into()),
+                command: Command::ResumeInTerminal(S1.into()),
+                enabled: false,
+            }],
         }
     );
 }

@@ -20,12 +20,13 @@ use crate::interface::{
     SidebarSyncView, View,
 };
 use crate::logging::{Field, Level, Logger};
-use crate::monitor::{LimitMonitor, Watched};
+use crate::monitor::{LimitMonitor, LimitsView, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
+use crate::opening::{self, Clients, DefaultOpen, DesktopClient, InClaude, NamedProfile};
 use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
 use crate::runner::Runner;
 use crate::safety::{self, CheckId, Finding, Safety};
-use crate::sessions::{SessionIndex, SidebarProfile};
+use crate::sessions::{SessionFacts, SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
 use crate::sidebar_sync::{self, Run};
 use crate::storage::{self, AppPaths};
@@ -39,6 +40,9 @@ pub const DISCLAIMER: &str = "AccRoster is an independent open-source project. I
 
 /// How long Verbose logging stays on once turned on.
 const VERBOSE_LOGGING_LASTS: SignedDuration = SignedDuration::from_hours(24);
+
+/// How many Sessions the menu's Recent Sessions submenu lists.
+const RECENT_SESSIONS: usize = 10;
 
 /// claude.ai Settings > Usage, where Banked resets can be checked by hand.
 const LIMIT_RESETS_URL: &str = "https://claude.ai/settings/usage";
@@ -218,6 +222,8 @@ impl Core {
         core.rescan_discovered();
         core.monitor = LimitMonitor::load(&core.context());
         core.notifier = Notifier::load(&core.context());
+        // Recent Sessions in the first menu: the index fills in by ticks.
+        core.sessions.warm_up(&core.env, &core.paths);
         Ok(core)
     }
 
@@ -462,6 +468,12 @@ impl Core {
                     );
                 }
                 vec![Effect::StopWatchingSessionFiles]
+            }
+            Command::OpenSession(id) => self.open_session(id),
+            Command::ResumeInTerminal(id) => self.open_in_terminal(&id),
+            Command::OpenInClaude(id) => self.open_in_claude(&id),
+            Command::SwitchClaudeThenOpen { profile, session } => {
+                self.switch_claude_then_open(&profile, &session)
             }
             Command::SetMuted { id, muted } => {
                 let mut updated = self.settings.clone();
@@ -753,6 +765,21 @@ impl Core {
         if items.len() > before {
             items.push(MenuItem::Separator);
         }
+        let recent: Vec<MenuItem> = self
+            .sessions
+            .recent(RECENT_SESSIONS)
+            .into_iter()
+            .map(|(id, title)| MenuItem::Action {
+                title,
+                command: Command::OpenSession(id),
+            })
+            .collect();
+        if !recent.is_empty() {
+            items.push(MenuItem::Submenu {
+                title: "Recent Sessions".into(),
+                items: recent,
+            });
+        }
         items.push(MenuItem::Action {
             title: "All Sessions…".into(),
             command: Command::OpenAllSessions,
@@ -827,9 +854,7 @@ impl Core {
                 tagline: TAGLINE.into(),
                 disclaimer: DISCLAIMER.into(),
             },
-            all_sessions: self
-                .sessions
-                .view(self.env.clock.now(), &self.sidebar_profiles()),
+            all_sessions: self.all_sessions(),
             // Offered once: only until answered, and only while it's ours to
             // offer (not already on, not turned off in System Settings).
             first_run: (self.settings.launch_at_login.is_none()
@@ -839,6 +864,248 @@ impl Core {
                 }),
             diagnostics: self.diagnostics(),
         }
+    }
+
+    /// The All Sessions window, with the selected Session's Open section.
+    fn all_sessions(&self) -> crate::interface::AllSessionsView {
+        let mut view = self
+            .sessions
+            .view(self.env.clock.now(), &self.sidebar_profiles());
+        if let Some(detail) = &mut view.detail
+            && let Some(facts) = self.sessions.facts(&detail.id)
+        {
+            detail.open = opening::choices(&facts, &self.clients());
+        }
+        view
+    }
+
+    /// Who could open a Session right now: the CLI's and the desktop's
+    /// Active Profiles, and the signed-in Profiles.
+    fn clients(&self) -> Clients {
+        let signed_in = self.profiles.signed_in();
+        let profiles: Vec<NamedProfile> = self
+            .profiles
+            .ordered_ids(&self.settings.profile_order)
+            .into_iter()
+            .filter_map(|id| {
+                let profile = signed_in.iter().find(|profile| profile.id == id)?;
+                Some(NamedProfile {
+                    name: (self.settings.nicknames.get(&id).cloned())
+                        .unwrap_or_else(|| profile.name.clone()),
+                    pair: DiscoveredPair {
+                        account_uuid: profile.account_uuid.clone(),
+                        organization_uuid: profile.organization_uuid.clone(),
+                    },
+                    id,
+                })
+            })
+            .collect();
+        let desktop = self.env.os.desktop_app_version().map(|_| {
+            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+            let pair = account
+                .as_ref()
+                .and_then(|account| match account.profile(&signed_in) {
+                    Some(profile) => Some(DiscoveredPair {
+                        account_uuid: profile.account_uuid.clone(),
+                        organization_uuid: profile.organization_uuid.clone(),
+                    }),
+                    None => Some(DiscoveredPair {
+                        account_uuid: account.account_uuid.clone(),
+                        organization_uuid: account.organization_uuid.clone()?,
+                    }),
+                });
+            let name = pair.as_ref().and_then(|pair| {
+                self.sidebar_profiles()
+                    .into_iter()
+                    .find(|sidebar| sidebar.pair == *pair)
+                    .map(|sidebar| sidebar.name)
+            });
+            DesktopClient { pair, name }
+        });
+        let desktop_turn_running = desktop.is_some()
+            && matches!(
+                desktop::guard(&self.env, &DesktopPaths::new(&self.env.home)),
+                desktop::Guard::Busy(_)
+            );
+        Clients {
+            cli: self.cli_profile_name(),
+            desktop,
+            profiles,
+            desktop_turn_running,
+            can_run_claude_code: self.claude_code_folder().is_some(),
+        }
+    }
+
+    /// The CLI's pointer while CLI switching is on.
+    fn cli_pointer(&self) -> Option<PathBuf> {
+        cli_switcher::is_on(&self.paths)
+            .then(|| cli_switcher::pointer(&self.paths))
+            .flatten()
+    }
+
+    /// The CLI's Active Profile as the menu header names it: the pointer's
+    /// Profile, or Default (`~/.claude`) without one.
+    fn cli_profile_name(&self) -> String {
+        let Some(pointer) = self.cli_pointer() else {
+            return "Default".into();
+        };
+        self.profiles
+            .listed(&self.settings, |_| LimitsView::default())
+            .into_iter()
+            .find(|profile| profile.config_dir == pointer)
+            .map_or_else(
+                || "an unknown Profile".into(),
+                |profile| profile.short_label,
+            )
+    }
+
+    /// Where `claude --desktop --resume` runs (any subscription login will
+    /// do, never `~/.claude`): the CLI's Active Profile, else the desktop's,
+    /// else the first signed-in Profile.
+    fn claude_code_folder(&self) -> Option<PathBuf> {
+        let ordered = self.profiles.ordered_ids(&self.settings.profile_order);
+        let folders: Vec<(&str, &Path)> = ordered
+            .iter()
+            .filter_map(|id| Some((id.as_str(), self.profiles.config_dir(id)?)))
+            .collect();
+        let cli = self
+            .cli_pointer()
+            .filter(|pointer| folders.iter().any(|(_, dir)| *dir == pointer.as_path()));
+        let desktop = || {
+            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home))?;
+            let profile = account.profile(&self.profiles.signed_in())?.id.clone();
+            let (_, dir) = folders.iter().find(|(id, _)| *id == profile)?;
+            Some(dir.to_path_buf())
+        };
+        let first = || folders.first().map(|(_, dir)| dir.to_path_buf());
+        cli.or_else(desktop).or_else(first)
+    }
+
+    /// A double-click or a Recent Sessions item: the client the Session was
+    /// last used in. When Claude's Active Profile has no entry for it, the
+    /// Session is shown in All Sessions, where the choices are spelled out.
+    fn open_session(&mut self, id: String) -> Vec<Effect> {
+        let Some(facts) = self.sessions.facts(&id) else {
+            return Vec::new();
+        };
+        match opening::default_open(&facts, &self.clients()) {
+            None => Vec::new(),
+            Some(DefaultOpen::Terminal) => self.open_in_terminal(&id),
+            Some(DefaultOpen::Claude) => self.open_in_claude(&id),
+            Some(DefaultOpen::Choose) => {
+                let effects = self.handle(Command::OpenAllSessions);
+                self.sessions.set_filter(Default::default());
+                self.sessions.set_search(String::new());
+                self.sessions.select(Some(id));
+                effects
+            }
+        }
+    }
+
+    /// Resume in Terminal, or Show in Terminal when it already runs there.
+    fn open_in_terminal(&mut self, id: &str) -> Vec<Effect> {
+        let Some(effect) = self
+            .sessions
+            .facts(id)
+            .and_then(|facts| opening::terminal(&facts, &*self.env.os))
+        else {
+            return Vec::new();
+        };
+        let how = match effect {
+            Effect::ShowInTerminal { .. } => "show_in_terminal",
+            _ => "resume_in_terminal",
+        };
+        self.log_opened(id, how);
+        vec![effect]
+    }
+
+    /// Open in Claude: its entry in the desktop's Active Profile, else
+    /// `claude --desktop --resume`.
+    fn open_in_claude(&mut self, id: &str) -> Vec<Effect> {
+        let Some(facts) = self.sessions.facts(id) else {
+            return Vec::new();
+        };
+        let clients = self.clients();
+        match opening::in_claude(&facts, &clients) {
+            None => Vec::new(),
+            Some(InClaude::Entry(entry)) => {
+                self.log_opened(id, "claude_entry");
+                vec![Effect::OpenUrl(opening::continue_url(&entry))]
+            }
+            Some(InClaude::Resume) => {
+                if opening::resume_blocked(&facts, &clients).is_some() {
+                    return Vec::new();
+                }
+                self.resume_in_claude(&facts)
+            }
+        }
+    }
+
+    /// `claude --desktop --resume <id>` in a Profile folder.
+    fn resume_in_claude(&mut self, facts: &SessionFacts) -> Vec<Effect> {
+        let Some(folder) = self.claude_code_folder() else {
+            return Vec::new();
+        };
+        let runner = Runner::new(&self.env, &self.paths);
+        let error = match runner.open_in_desktop(&folder, &facts.id, facts.cwd.as_deref()) {
+            Ok(true) => {
+                self.log_opened(&facts.id, "claude_resume");
+                return Vec::new();
+            }
+            Ok(false) => "claude exited with an error".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        self.log(
+            Level::Warn,
+            "session not opened in claude",
+            &[
+                ("session", Field::SessionId(&facts.id)),
+                ("error", Field::Text(&error)),
+            ],
+        );
+        vec![Effect::Notify {
+            title: "Couldn't open the Session in Claude".into(),
+            body:
+                "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
+                    .into(),
+        }]
+    }
+
+    /// "Switch Claude to <Profile>, then open…": a Guided switch that opens
+    /// the Profile's entry once confirmed.
+    fn switch_claude_then_open(&mut self, profile_id: &str, session: &str) -> Vec<Effect> {
+        let Some(facts) = self.sessions.facts(session) else {
+            return Vec::new();
+        };
+        let Some(profile) = self
+            .profiles
+            .signed_in()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return Vec::new();
+        };
+        let pair = DiscoveredPair {
+            account_uuid: profile.account_uuid.clone(),
+            organization_uuid: profile.organization_uuid.clone(),
+        };
+        let Some(entry) = opening::switch_entry(&facts, &pair) else {
+            return Vec::new();
+        };
+        let target = Target {
+            then_open: Some(entry.entry_id.clone()),
+            ..Target::of(&profile)
+        };
+        let (desktop, ctx) = self.desktop();
+        desktop.start(&ctx, target)
+    }
+
+    fn log_opened(&self, id: &str, how: &'static str) {
+        self.log(
+            Level::Info,
+            "session opened",
+            &[("session", Field::SessionId(id)), ("how", Field::Word(how))],
+        );
     }
 
     /// The Diagnostics window: every check, the versions, the pauses.
