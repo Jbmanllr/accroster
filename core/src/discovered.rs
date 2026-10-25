@@ -83,8 +83,8 @@ impl Evidence {
         }
     }
 
-    /// The menu row.
-    pub fn row(&self, nickname: Option<&str>) -> DiscoveredRow {
+    /// The menu row, with dates in `tz`.
+    pub fn row(&self, nickname: Option<&str>, tz: &TimeZone) -> DiscoveredRow {
         let name = self.name(nickname);
         let title = match (nickname, &self.login) {
             (Some(_), Some(login)) => format!(
@@ -99,7 +99,7 @@ impl Evidence {
                 n => format!("{n} Sessions"),
             }];
             if let Some(last) = self.last_activity {
-                parts.push(format!("last active {}", local(last, "%b %-d")));
+                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
             }
             if self.desktop_last {
                 parts.push("Desktop's last account".to_owned());
@@ -110,7 +110,7 @@ impl Evidence {
         if let Some(as_of) = self.login.as_ref().and_then(|login| login.as_of) {
             submenu.push(MenuItem::Detail(format!(
                 "as of {}",
-                local(as_of, "%b %-d, %H:%M")
+                local(as_of, tz, "%b %-d, %H:%M")
             )));
         }
         submenu.push(MenuItem::Detail(format!(
@@ -281,9 +281,6 @@ fn short(uuid: &str) -> &str {
     uuid.get(..8).unwrap_or(uuid)
 }
 
-/// A time in the Mac's own time zone.
-fn local(time: Timestamp, format: &str) -> String {
-    time.to_zoned(TimeZone::system())
-        .strftime(format)
-        .to_string()
+fn local(time: Timestamp, tz: &TimeZone, format: &str) -> String {
+    time.to_zoned(tz.clone()).strftime(format).to_string()
 }

@@ -11,13 +11,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli_switcher;
-use crate::env::{Environment, RunningProcess};
-use crate::interface::{DiscoveredPair, LimitBar, MenuItem, ProfileRow};
+use crate::env::{Clock, Environment, RunningProcess};
+use crate::interface::{Command, DiscoveredPair, LimitBar, MenuItem, ProfileRow};
+use crate::limit_offers;
 use crate::logging::{Field, Level, Logger};
 use crate::runner::Runner;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
@@ -122,9 +124,10 @@ struct Profile {
 }
 
 impl Profile {
-    fn row(&self, identity: &Identity) -> ProfileRow {
+    fn row(&self, identity: &Identity, now: Timestamp, tz: &TimeZone) -> ProfileRow {
         let mut limits = Vec::new();
         let mut note = None;
+        let mut offers = Vec::new();
         let mut plan = identity
             .organization_type
             .as_deref()
@@ -132,26 +135,21 @@ impl Profile {
         match &self.reading {
             None => {}
             Some(Reading::Read(reply)) => {
+                offers = limit_offers::lines(
+                    reply.banked_reset.as_ref(),
+                    reply.session_refill.as_ref(),
+                    now,
+                    tz,
+                );
                 if let Some(kind) = &reply.subscription_type {
                     plan = Some(kind.clone());
                 }
                 match &reply.limits {
                     Some(read) => {
-                        let mut bar = |label: &str, percent: f64| {
-                            limits.push(LimitBar {
-                                label: label.to_owned(),
-                                percent: percent.max(0.0).floor() as u32,
-                            });
-                        };
-                        if let Some(percent) = read.session {
-                            bar("Session", percent);
-                        }
-                        if let Some(percent) = read.weekly {
-                            bar("Weekly", percent);
-                        }
-                        for (name, percent) in &read.models {
-                            bar(name, *percent);
-                        }
+                        limits.extend(read.all().map(|(label, percent)| LimitBar {
+                            label: label.to_owned(),
+                            percent: percent.max(0.0).floor() as u32,
+                        }));
                     }
                     None => note = Some("Couldn't read limits".to_owned()),
                 }
@@ -167,7 +165,14 @@ impl Profile {
             title: identity.name(),
             limits,
             note,
-            submenu: vec![MenuItem::Detail(detail)],
+            offers,
+            submenu: vec![
+                MenuItem::Detail(detail),
+                MenuItem::Action {
+                    title: "Limit resets → claude.ai".to_owned(),
+                    command: Command::OpenLimitResets,
+                },
+            ],
         }
     }
 }
@@ -457,10 +462,11 @@ impl ProfileRegistry {
     }
 
     /// One row per signed-in Profile, in order.
-    pub(crate) fn rows(&self) -> Vec<ProfileRow> {
+    pub(crate) fn rows(&self, clock: &dyn Clock) -> Vec<ProfileRow> {
+        let (now, tz) = (clock.now(), clock.time_zone());
         self.profiles
             .iter()
-            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?)))
+            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?, now, &tz)))
             .collect()
     }
 

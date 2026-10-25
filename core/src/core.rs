@@ -29,6 +29,9 @@ pub const DISCLAIMER: &str = "AccRoster is an independent open-source project. I
 /// How long Verbose logging stays on once turned on.
 const VERBOSE_LOGGING_LASTS: SignedDuration = SignedDuration::from_hours(24);
 
+/// claude.ai Settings > Usage, where Banked resets can be checked by hand.
+const LIMIT_RESETS_URL: &str = "https://claude.ai/settings/usage";
+
 /// Why the core couldn't start. The UI shows it and quits.
 #[derive(Debug)]
 pub struct LaunchError {
@@ -223,6 +226,7 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
         }
     }
 
@@ -257,13 +261,14 @@ impl Core {
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let rows = self.profiles.rows();
+        let rows = self.profiles.rows(self.env.clock.as_ref());
         let shown = self.shown_discovered();
+        let tz = self.env.clock.time_zone();
         let discovered_rows = shown
             .iter()
             .filter(|(_, choice)| !choice.is_some_and(|c| c.hidden))
             .map(|(evidence, choice)| {
-                MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref())))
+                MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref()), &tz))
             });
         let before = items.len();
         items.extend(rows.into_iter().map(MenuItem::Profile));

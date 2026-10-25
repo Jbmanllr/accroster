@@ -7,14 +7,13 @@ mod common;
 use accroster_core::{Command, Core, DiscoveredRow, Effect, Event, MenuItem};
 use accroster_fake_mac::{FakeMac, FixtureLogin};
 use common::*;
-use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use serde_json::json;
 
 const WORK_ACCOUNT: &str = "55555555-5555-4555-8555-555555555555";
 const WORK_ORG: &str = "66666666-6666-4666-8666-666666666666";
 
-/// 2026-10-24T09:30:00Z and 2026-10-23T09:30:00Z, in epoch ms.
+/// 2026-10-24T09:30:00Z and 2026-10-23T09:30:00Z, in epoch ms (the fake
+/// Mac shows times in UTC).
 const OCT_24: i64 = 1_761_298_200_000;
 const OCT_23: i64 = OCT_24 - 86_400_000;
 
@@ -65,15 +64,6 @@ fn entry(last_activity_ms: i64) -> serde_json::Value {
     })
 }
 
-/// How the menu prints a day (the Mac's own time zone).
-fn day(ms: i64) -> String {
-    Timestamp::from_millisecond(ms)
-        .unwrap()
-        .to_zoned(TimeZone::system())
-        .strftime("%b %-d")
-        .to_string()
-}
-
 /// A Mac with no `~/.claude.json` login, so only Sidebar folders count.
 fn mac_without_cli_login() -> FakeMac {
     let mac = FakeMac::new();
@@ -95,13 +85,7 @@ fn a_sidebar_folder_with_entries_is_an_unknown_login_with_its_sessions() {
     assert_eq!(rows[0].title, "Sign in to Unknown Login…");
     assert_eq!(
         rows[0].subtitle.as_deref(),
-        Some(
-            format!(
-                "2 Sessions · last active {} · Desktop's last account",
-                day(OCT_24)
-            )
-            .as_str()
-        )
+        Some("2 Sessions · last active Oct 24 · Desktop's last account")
     );
     assert_eq!(
         details(&rows[0]),
@@ -134,15 +118,10 @@ fn todays_cli_login_is_named_by_its_email_and_organization() {
         "Sign in to me@example.com · me@example.com's Organization…"
     );
     assert_eq!(rows[0].subtitle, None);
-    let as_of = Timestamp::from_millisecond(OCT_24)
-        .unwrap()
-        .to_zoned(TimeZone::system())
-        .strftime("%b %-d, %H:%M")
-        .to_string();
     assert_eq!(
         details(&rows[0]),
         [
-            format!("as of {as_of}"),
+            "as of Oct 24, 09:30".to_string(),
             "Account 11111111 · Organization 22222222".to_string()
         ]
     );
