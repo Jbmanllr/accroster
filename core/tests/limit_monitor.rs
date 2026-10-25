@@ -674,3 +674,18 @@ fn the_menu_bar_figure_dims_with_the_clis_active_profiles_reading() {
     assert_eq!(menu_bar.label, "me 92%");
     assert!(menu_bar.dimmed);
 }
+
+#[test]
+fn the_desktop_apps_active_profile_is_read_every_3_minutes_too() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    mac.write_desktop_config(&serde_json::json!({
+        "lastKnownAccountUuid": work().account_uuid,
+    }));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+
+    pass(&mac, &mut core, SignedDuration::from_secs(2 * 60 + 59));
+    assert_eq!(usage_reads(&mac), 1);
+    pass(&mac, &mut core, SignedDuration::from_secs(1));
+    assert_eq!(usage_reads(&mac), 2);
+}

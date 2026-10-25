@@ -108,6 +108,16 @@ pub(crate) struct Listed<'a> {
     pub row: ProfileRow,
 }
 
+/// A signed-in Profile as other modules see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignedInProfile {
+    pub id: String,
+    pub account_uuid: String,
+    pub organization_uuid: String,
+    /// `email · Organization`.
+    pub name: String,
+}
+
 /// `state/profiles.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryFile {
@@ -473,8 +483,8 @@ impl ProfileRegistry {
     }
 
     /// The signed-in Profiles the Limit monitor reads, in order; `active`
-    /// says which folders are a client's Active Profile.
-    pub(crate) fn watched(&self, active: impl Fn(&Path) -> bool) -> Vec<Watched> {
+    /// says, by id and folder, which are a client's Active Profile.
+    pub(crate) fn watched(&self, active: impl Fn(&str, &Path) -> bool) -> Vec<Watched> {
         self.profiles
             .iter()
             .filter_map(|profile| {
@@ -483,7 +493,23 @@ impl ProfileRegistry {
                     id: profile.id.clone(),
                     config_dir: profile.config_dir.clone(),
                     account_uuid: identity.account_uuid.clone(),
-                    active: active(&profile.config_dir),
+                    active: active(&profile.id, &profile.config_dir),
+                })
+            })
+            .collect()
+    }
+
+    /// Who each signed-in Profile is, in the same order as [`Self::listed`].
+    pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInProfile {
+                    id: profile.id.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    organization_uuid: identity.organization_uuid.clone(),
+                    name: identity.name(),
                 })
             })
             .collect()

@@ -30,7 +30,7 @@
 //! assert!(mac.app_support().join("settings.json").is_file());
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -628,13 +628,15 @@ impl FakeClock {
     }
 }
 
+/// The fake Mac's time zone is UTC, so local times in fixtures (Claude Code's
+/// `procStart`) read the same as the clock.
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
         *self.0.lock().unwrap()
     }
 
-    /// UTC, so shown dates and times don't depend on the machine running
-    /// the tests.
+    /// UTC, so shown dates and times (and fixture `procStart`s) don't depend
+    /// on the machine running the tests.
     fn time_zone(&self) -> jiff::tz::TimeZone {
         jiff::tz::TimeZone::UTC
     }
@@ -644,6 +646,8 @@ impl Clock for FakeClock {
 struct FakeOsState {
     processes: HashMap<u32, ProcessFacts>,
     desktop_app_version: Option<String>,
+    /// Live pids running the desktop app's bundled Claude Code.
+    desktop_children: BTreeSet<u32>,
 }
 
 /// OS facts the test sets by hand. Clones share the facts.
@@ -664,7 +668,16 @@ impl FakeOs {
 
     /// Marks `pid` as gone.
     pub fn end_process(&self, pid: u32) {
-        self.0.lock().unwrap().processes.remove(&pid);
+        let mut state = self.0.lock().unwrap();
+        state.processes.remove(&pid);
+        state.desktop_children.remove(&pid);
+    }
+
+    /// Starts one of the desktop app's Claude Code children (parent: pid 1,
+    /// standing in for Claude), which may or may not write a live-process file.
+    pub fn start_desktop_child(&self, pid: u32, started_at: Timestamp) {
+        self.start_process(pid, 1, started_at);
+        self.0.lock().unwrap().desktop_children.insert(pid);
     }
 
     /// Installs (or with `None`, removes) the desktop app.
@@ -680,6 +693,16 @@ impl OsFacts for FakeOs {
 
     fn desktop_app_version(&self) -> Option<String> {
         self.0.lock().unwrap().desktop_app_version.clone()
+    }
+
+    fn desktop_claude_code_children(&self) -> Vec<u32> {
+        self.0
+            .lock()
+            .unwrap()
+            .desktop_children
+            .iter()
+            .copied()
+            .collect()
     }
 }
 

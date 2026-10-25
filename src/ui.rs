@@ -550,6 +550,8 @@ impl Ui {
                     NSPasteboardTypeString
                 });
             }
+            Effect::BringDesktopAppForward => bring_desktop_app_forward(),
+            Effect::Notify { title, body } => notify(&title, &body),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
                 name,
@@ -871,6 +873,70 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
             .setActive(true);
     }
     body.into_super()
+}
+
+/// The Claude desktop app's bundle id.
+const DESKTOP_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
+
+/// Opens Claude, or brings it forward when it runs. Never quits or relaunches
+/// it: `openApplicationAtURL` activates a running app in place.
+fn bring_desktop_app_forward() {
+    use objc2_app_kit::NSWorkspaceOpenConfiguration;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let Some(url) =
+        workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(DESKTOP_BUNDLE_ID))
+    else {
+        return;
+    };
+    let configuration = NSWorkspaceOpenConfiguration::configuration();
+    configuration.setActivates(true);
+    workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
+}
+
+#[link(name = "UserNotifications", kind = "framework")]
+unsafe extern "C" {}
+
+/// Posts a notification through `UNUserNotificationCenter`, asking for
+/// permission the first time. Only a bundled app may use it (outside a bundle
+/// the center throws), so an unbundled run skips notifications.
+fn notify(title: &str, body: &str) {
+    use block2::RcBlock;
+    use objc2::runtime::{AnyClass, Bool};
+    use objc2_foundation::{NSBundle, NSUUID};
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        return;
+    }
+    let (Some(center_class), Some(content_class), Some(request_class)) = (
+        AnyClass::get(c"UNUserNotificationCenter"),
+        AnyClass::get(c"UNMutableNotificationContent"),
+        AnyClass::get(c"UNNotificationRequest"),
+    ) else {
+        return;
+    };
+    // SAFETY: documented UserNotifications selectors with their documented
+    // argument types; nil completion handlers are allowed.
+    unsafe {
+        let center: Retained<AnyObject> = msg_send![center_class, currentNotificationCenter];
+        // UNAuthorizationOptionSound | UNAuthorizationOptionAlert.
+        let options: usize = (1 << 1) | (1 << 2);
+        let asked = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
+        let _: () = msg_send![&center, requestAuthorizationWithOptions: options, completionHandler: &*asked];
+        let content: Retained<AnyObject> = msg_send![content_class, new];
+        let _: () = msg_send![&content, setTitle: &*NSString::from_str(title)];
+        let _: () = msg_send![&content, setBody: &*NSString::from_str(body)];
+        let id = NSUUID::UUID().UUIDString();
+        let request: Retained<AnyObject> = msg_send![
+            request_class,
+            requestWithIdentifier: &*id,
+            content: &*content,
+            trigger: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![
+            &center,
+            addNotificationRequest: &*request,
+            withCompletionHandler: std::ptr::null::<AnyObject>()
+        ];
+    }
 }
 
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
