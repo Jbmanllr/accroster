@@ -28,6 +28,6 @@ pub use interface::{
     AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
     SettingsView, View,
 };
-pub use interface::{FirstRunView, LaunchAtLoginView};
+pub use interface::{CliSwitchingView, FirstRunView, LaunchAtLoginView};
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

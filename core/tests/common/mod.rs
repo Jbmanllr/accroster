@@ -184,3 +184,14 @@ pub fn mac_signing_in_as(login: &FixtureLogin, rate_limits: Value) -> FakeMac {
         .reply(StubCall::GetUsage, usage_reply(rate_limits));
     mac
 }
+
+/// The disabled detail lines of a Profile's hover submenu.
+pub fn details(row: &ProfileRow) -> Vec<String> {
+    row.submenu
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Detail(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}

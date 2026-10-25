@@ -38,6 +38,15 @@ pub enum Command {
     CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
+    /// The CLI switching switch in Settings. On appends the marked block to
+    /// `~/.zshrc` and installs the `claude` shim; off removes them and the
+    /// pointer.
+    SetCliSwitching(bool),
+    /// A Profile row's click, or "Use for new CLI runs" in its submenu: make
+    /// the Profile (by id) the CLI's Active Profile for new `claude` runs.
+    UseForNewCliRuns(String),
+    /// "Copy shell override" in a Profile's submenu (by id).
+    CopyShellOverride(String),
 }
 
 impl Command {
@@ -52,6 +61,9 @@ impl Command {
             Command::AddProfile => "add_profile",
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
+            Command::SetCliSwitching(_) => "set_cli_switching",
+            Command::UseForNewCliRuns(_) => "use_for_new_cli_runs",
+            Command::CopyShellOverride(_) => "copy_shell_override",
         }
     }
 }
@@ -77,6 +89,8 @@ pub enum Effect {
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
+    /// Put this text on the general pasteboard.
+    CopyToClipboard(String),
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
 }
@@ -114,8 +128,11 @@ pub struct LaunchAtLoginView {
 /// The status item in the menu bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuBarView {
-    /// Short text shown in the menu bar (kept short for the notch).
+    /// Short text shown in the menu bar (kept short for the notch): the CLI's
+    /// Active Profile and its tightest limit, like `Perso 62%`.
     pub label: String,
+    /// Drawn dimmed (the figure is stale).
+    pub dimmed: bool,
 }
 
 /// The status item's menu, top to bottom.
@@ -136,6 +153,13 @@ pub enum MenuItem {
         title: String,
         command: Command,
     },
+    /// A clickable item with a check mark when `checked`; clicking sends
+    /// `command`.
+    Check {
+        title: String,
+        checked: bool,
+        command: Command,
+    },
     /// A disabled plain line (for example `email · Organization · plan` in a
     /// Profile's hover submenu).
     Detail(String),
@@ -148,6 +172,10 @@ pub enum MenuItem {
 pub struct ProfileRow {
     /// The nickname, else `email · Organization`.
     pub title: String,
+    /// Badges after the name: `CLI` when it is the CLI's Active Profile.
+    pub badges: Vec<String>,
+    /// What clicking the row sends, if it does anything.
+    pub command: Option<Command>,
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
@@ -176,6 +204,20 @@ pub struct SettingsView {
     /// The explanatory line under the switch.
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
+    pub cli_switching: CliSwitchingView,
+}
+
+/// The CLI switching switch in Settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliSwitchingView {
+    /// Whether CLI switching is on (the shim is installed).
+    pub on: bool,
+    /// The exact `PATH` line the `~/.zshrc` block holds, shown before the
+    /// user opts in.
+    pub line: String,
+    /// What the last change left for the user to do, if anything (for
+    /// example the lines of an edited block to remove by hand).
+    pub note: Option<String>,
 }
 
 /// The About panel.

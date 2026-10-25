@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Event, MenuItem};
+use accroster_core::Event;
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use jiff::SignedDuration;
@@ -29,10 +29,7 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
         rows[0].limits,
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
-    assert_eq!(
-        rows[0].submenu,
-        [MenuItem::Detail("me@work.example · Work Inc · Max".into())]
-    );
+    assert_eq!(details(&rows[0]), ["me@work.example · Work Inc · Max"]);
     assert_eq!(rows[0].note, None);
     assert!(action_titles(&core).contains(&"Add Profile…".to_string()));
     assert_eq!(mac.list(PROFILES).len(), 1);
@@ -73,8 +70,8 @@ fn the_new_profile_is_still_listed_after_a_relaunch() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].title, "me@work.example · Work Inc");
     assert_eq!(
-        rows[0].submenu,
-        [MenuItem::Detail("me@work.example · Work Inc".into())],
+        details(&rows[0]),
+        ["me@work.example · Work Inc"],
         "no plan known until the next usage read"
     );
 }

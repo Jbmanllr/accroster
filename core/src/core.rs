@@ -8,10 +8,11 @@ use std::time::Duration;
 use jiff::SignedDuration;
 
 use crate::backups;
+use crate::cli_switcher::{self, TurnedOff};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, Command, Effect, Event, FirstRunView, LaunchAtLoginView, MenuBarView, MenuItem,
-    MenuView, SettingsView, View,
+    AboutView, CliSwitchingView, Command, Effect, Event, FirstRunView, LaunchAtLoginView,
+    MenuBarView, MenuItem, MenuView, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::profiles::{self, ProfileRegistry};
@@ -66,6 +67,8 @@ pub struct Core {
     /// Menu warning lines for this run.
     warnings: Vec<String>,
     profiles: ProfileRegistry,
+    /// What the last CLI switching change left for the user to do.
+    cli_note: Option<String>,
 }
 
 impl Core {
@@ -87,6 +90,7 @@ impl Core {
             settings: loaded.settings,
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
+            cli_note: None,
         };
         core.log(
             Level::Info,
@@ -132,6 +136,18 @@ impl Core {
         }
         let (profiles, ctx) = core.profiles();
         *profiles = ProfileRegistry::load(&ctx);
+        match cli_switcher::heal_shim(&core.paths) {
+            Ok(false) => {}
+            Ok(true) => core.log(Level::Info, "cli shim rewritten", &[]),
+            Err(error) => {
+                let error = error.to_string();
+                core.log(
+                    Level::Warn,
+                    "cli shim not rewritten",
+                    &[("error", Field::Text(&error))],
+                );
+            }
+        }
         Ok(core)
     }
 
@@ -177,6 +193,25 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::SetCliSwitching(on) => {
+                self.set_cli_switching(on);
+                Vec::new()
+            }
+            Command::UseForNewCliRuns(id) => {
+                self.use_for_new_cli_runs(&id);
+                Vec::new()
+            }
+            Command::CopyShellOverride(id) => self
+                .profiles
+                .listed()
+                .into_iter()
+                .find(|profile| profile.id == id)
+                .map(|profile| {
+                    vec![Effect::CopyToClipboard(cli_switcher::shell_override(
+                        profile.config_dir,
+                    ))]
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -204,12 +239,21 @@ impl Core {
             .chain(self.profiles.notice())
             .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
+        let mut listed = self.profiles.listed();
+        let cli = cli_switcher::present(&self.paths, &mut listed);
+        let header: Vec<String> = cli.header.into_iter().collect();
+        if !header.is_empty() {
+            items.push(MenuItem::Detail(header.join("    ")));
+        }
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let rows = self.profiles.rows();
-        if !rows.is_empty() {
-            items.extend(rows.into_iter().map(MenuItem::Profile));
+        if !listed.is_empty() {
+            items.extend(
+                listed
+                    .into_iter()
+                    .map(|profile| MenuItem::Profile(profile.row)),
+            );
             items.push(MenuItem::Separator);
         }
         items.push(if self.profiles.signing_in() {
@@ -240,13 +284,19 @@ impl Core {
         ]);
         View {
             menu_bar: MenuBarView {
-                label: "AccRoster".into(),
+                label: cli.label.unwrap_or_else(|| "AccRoster".into()),
+                dimmed: false,
             },
             menu: MenuView { items },
             settings: SettingsView {
                 verbose_logging: self.verbose_logging(),
                 verbose_logging_note: "Turns itself off after 24 hours.".into(),
                 launch_at_login: launch_at_login_view(login_item),
+                cli_switching: CliSwitchingView {
+                    on: cli_switcher::is_on(&self.paths),
+                    line: cli_switcher::path_line(&self.paths),
+                    note: self.cli_note.clone(),
+                },
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -335,6 +385,90 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// The CLI switching switch: on appends the `.zshrc` block and installs
+    /// the shim; off removes them and the pointer, or lists the lines of an
+    /// edited block for the user to remove.
+    fn set_cli_switching(&mut self, on: bool) {
+        let now = self.env.clock.now();
+        let result = if on {
+            cli_switcher::turn_on(&self.paths, &self.env.home, now).map(|()| TurnedOff::Clean)
+        } else {
+            cli_switcher::turn_off(&self.paths, &self.env.home, now)
+        };
+        let state = if on { "on" } else { "off" };
+        match result {
+            Ok(TurnedOff::Clean) => {
+                self.cli_note = None;
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[("state", Field::Word(state))],
+                );
+            }
+            Ok(TurnedOff::EditedBlock(lines)) => {
+                self.cli_note = Some(format!(
+                    "Your AccRoster block in ~/.zshrc was edited, so it was left in place. Remove these lines yourself:\n{}",
+                    lines.join("\n")
+                ));
+                self.log(
+                    Level::Info,
+                    "cli switching changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("zshrc", Field::Word("edited")),
+                    ],
+                );
+            }
+            Err(error) => {
+                self.cli_note = Some(format!("Couldn't turn CLI switching {state}: {error}"));
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli switching not changed",
+                    &[
+                        ("state", Field::Word(state)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Makes Profile `id` the CLI's Active Profile by rewriting only the
+    /// pointer. Ignored while CLI switching is off.
+    fn use_for_new_cli_runs(&mut self, id: &str) {
+        if !cli_switcher::is_on(&self.paths) {
+            return;
+        }
+        let Some(config_dir) = self
+            .profiles
+            .listed()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| profile.config_dir.to_path_buf())
+        else {
+            return;
+        };
+        match cli_switcher::set_pointer(&self.paths, &config_dir) {
+            Ok(()) => self.log(
+                Level::Info,
+                "cli profile chosen",
+                &[("profile", Field::Profile(id))],
+            ),
+            Err(error) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Error,
+                    "cli profile not chosen",
+                    &[
+                        ("profile", Field::Profile(id)),
+                        ("error", Field::Text(&error)),
+                    ],
+                );
+            }
+        }
     }
 
     /// The Profile registry, with what it needs from the rest of the core.

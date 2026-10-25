@@ -82,6 +82,21 @@ impl Identity {
     fn name(&self) -> String {
         format!("{} · {}", self.email, self.organization_name)
     }
+
+    /// The menu bar's short name: the email's local part.
+    fn short_label(&self) -> String {
+        self.email.split('@').next().unwrap_or_default().to_owned()
+    }
+}
+
+/// A signed-in Profile as the menu lists it.
+pub(crate) struct Listed<'a> {
+    pub id: &'a str,
+    /// The folder's absolute path, verbatim.
+    pub config_dir: &'a Path,
+    /// The menu bar's short name for it (`Perso`).
+    pub short_label: String,
+    pub row: ProfileRow,
 }
 
 /// `state/profiles.json`.
@@ -161,6 +176,8 @@ impl Profile {
         }
         ProfileRow {
             title: identity.name(),
+            badges: Vec::new(),
+            command: None,
             limits,
             note,
             submenu: vec![MenuItem::Detail(detail)],
@@ -428,11 +445,19 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
-    /// One row per signed-in Profile, in order.
-    pub(crate) fn rows(&self) -> Vec<ProfileRow> {
+    /// Every signed-in Profile, in order, with its row.
+    pub(crate) fn listed(&self) -> Vec<Listed<'_>> {
         self.profiles
             .iter()
-            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?)))
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(Listed {
+                    id: &profile.id,
+                    config_dir: &profile.config_dir,
+                    short_label: identity.short_label(),
+                    row: profile.row(identity),
+                })
+            })
             .collect()
     }
 
