@@ -211,7 +211,7 @@ fn banked_line(banked: &BankedReset, now: Timestamp, tz: &TimeZone) -> Option<St
 
 /// A day as the menu names it: "today", a weekday within the coming week,
 /// else the date ("Nov 3").
-fn day(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
+pub(crate) fn day(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
     let date = at.to_zoned(tz.clone()).date();
     let today = now.to_zoned(tz.clone()).date();
     let days_ahead = today

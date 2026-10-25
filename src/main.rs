@@ -4,6 +4,7 @@
 //! launches the core and hands it to [`ui`]. All behaviour is in
 //! `accroster-core`.
 
+mod notifications;
 mod ui;
 
 use accroster_core::{Core, Environment, install_panic_hook};
