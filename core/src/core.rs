@@ -20,6 +20,7 @@ use crate::interface::{
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::sessions::SessionIndex;
 use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
 
@@ -80,6 +81,8 @@ pub struct Core {
     desktop: DesktopBridge,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
+    /// The All Sessions list and the Session index behind it.
+    sessions: SessionIndex,
 }
 
 impl Core {
@@ -105,6 +108,7 @@ impl Core {
             cli_note: None,
             desktop: DesktopBridge::default(),
             discovered: Vec::new(),
+            sessions: SessionIndex::default(),
         };
         core.log(
             Level::Info,
@@ -172,6 +176,10 @@ impl Core {
     /// while a usage read runs, by the time the next read is due, and at most
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
+        if self.sessions.building() {
+            // The next batch of the Session index, as soon as input allows.
+            return Duration::ZERO;
+        }
         let idle = if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
@@ -347,6 +355,14 @@ impl Core {
                 }
                 Vec::new()
             }
+            Command::OpenAllSessions => {
+                self.sessions.open(&self.env, &self.paths);
+                vec![Effect::ShowAllSessions]
+            }
+            Command::SearchSessions(text) => {
+                self.sessions.set_search(text);
+                Vec::new()
+            }
         }
     }
 
@@ -363,6 +379,7 @@ impl Core {
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
                 effects.extend(desktop.poll(&ctx, &signed_in));
+                self.index_sessions();
                 effects
             }
             Event::MenuOpened => {
@@ -509,6 +526,10 @@ impl Core {
         if items.len() > before {
             items.push(MenuItem::Separator);
         }
+        items.push(MenuItem::Action {
+            title: "All Sessions…".into(),
+            command: Command::OpenAllSessions,
+        });
         items.push(if self.profiles.signing_in() {
             MenuItem::Action {
                 title: "Waiting for sign-in… Cancel".into(),
@@ -565,6 +586,7 @@ impl Core {
                 tagline: TAGLINE.into(),
                 disclaimer: DISCLAIMER.into(),
             },
+            all_sessions: self.sessions.view(self.env.clock.now()),
             // Offered once: only until answered, and only while it's ours to
             // offer (not already on, not turned off in System Settings).
             first_run: (self.settings.launch_at_login.is_none()
@@ -573,6 +595,29 @@ impl Core {
                     launch_at_login: true,
                 }),
             versions: desktop::versions(&self.env),
+        }
+    }
+
+    /// Reads the next batch of the Session index while a build runs.
+    fn index_sessions(&mut self) {
+        match self.sessions.step(&self.paths) {
+            None => {}
+            Some(Ok(built)) => self.log(
+                Level::Info,
+                "session index built",
+                &[
+                    ("transcripts", Field::Number(built.transcripts as i64)),
+                    ("read", Field::Number(built.read as i64)),
+                ],
+            ),
+            Some(Err(error)) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Warn,
+                    "session index not saved",
+                    &[("error", Field::Text(&error))],
+                );
+            }
         }
     }
 
