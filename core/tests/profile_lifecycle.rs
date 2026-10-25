@@ -80,6 +80,7 @@ fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
     assert_eq!(
         row_actions(&rows(&core)[0]),
         [
+            "Copy shell override",
             "Limit resets → claude.ai",
             "Move Down",
             "Rename…",
@@ -88,7 +89,13 @@ fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
     );
     assert_eq!(
         row_actions(&rows(&core)[1]),
-        ["Limit resets → claude.ai", "Move Up", "Rename…", "Remove…"]
+        [
+            "Copy shell override",
+            "Limit resets → claude.ai",
+            "Move Up",
+            "Rename…",
+            "Remove…"
+        ]
     );
 
     click_in_row(&mut core, 1, "Move Up");
@@ -225,7 +232,15 @@ fn assert_expired(core: &Core) {
     assert_eq!(rows[0].title, WORK, "keeps its name");
     assert!(rows[0].dimmed, "dimmed");
     assert_eq!(rows[0].note.as_deref(), Some("Login expired"));
-    assert_eq!(row_actions(&rows[0])[0], "Sign in again…");
+    let actions = row_actions(&rows[0]);
+    assert!(
+        actions.contains(&"Sign in again…".to_string()),
+        "{actions:?}"
+    );
+    assert!(
+        !actions.contains(&"Limit resets → claude.ai".to_string()),
+        "{actions:?}"
+    );
 }
 
 /// A Mac whose next Add Profile… signs in as `work()` and whose usage read

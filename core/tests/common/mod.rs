@@ -214,3 +214,14 @@ pub fn row_actions(row: &ProfileRow) -> Vec<String> {
         })
         .collect()
 }
+
+/// The disabled detail lines of a Profile's hover submenu.
+pub fn details(row: &ProfileRow) -> Vec<String> {
+    row.submenu
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Detail(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}

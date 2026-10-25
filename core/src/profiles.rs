@@ -92,6 +92,24 @@ impl Identity {
     fn name(&self) -> String {
         format!("{} · {}", self.email, self.organization_name)
     }
+
+    /// The menu bar's short name: the email's local part.
+    fn short_label(&self) -> String {
+        self.email.split('@').next().unwrap_or_default().to_owned()
+    }
+}
+
+/// A signed-in Profile as the menu lists it.
+pub(crate) struct Listed<'a> {
+    pub id: &'a str,
+    /// The folder's absolute path, verbatim.
+    pub config_dir: &'a Path,
+    /// Whether its folder holds a Login (signed in or expired).
+    pub signed_in: bool,
+    /// The menu bar's short name for it: the nickname, else the email's
+    /// local part (`perso`).
+    pub short_label: String,
+    pub row: ProfileRow,
 }
 
 /// `state/profiles.json`.
@@ -234,6 +252,8 @@ impl Profile {
         ));
         ProfileRow {
             title,
+            badges: Vec::new(),
+            command: None,
             limits,
             note,
             dimmed: self.expired,
@@ -562,21 +582,36 @@ impl ProfileRegistry {
         })
     }
 
-    /// One row per Profile (signed in, expired or signed out), in the
-    /// user's order, titled by nickname when there is one.
-    pub(crate) fn rows(&self, clock: &dyn Clock, settings: &Settings) -> Vec<ProfileRow> {
+    /// The folder of signed-in Profile `id`, verbatim.
+    pub(crate) fn config_dir(&self, id: &str) -> Option<&Path> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == id && profile.identity.is_some())
+            .map(|profile| profile.config_dir.as_path())
+    }
+
+    /// Every Profile (signed in, expired or signed out), in the user's
+    /// order, with its row titled by nickname when there is one.
+    pub(crate) fn listed(&self, clock: &dyn Clock, settings: &Settings) -> Vec<Listed<'_>> {
         let (now, tz) = (clock.now(), clock.time_zone());
         let listed = self.ordered(&settings.profile_order);
         listed
             .iter()
             .enumerate()
             .map(|(position, profile)| {
-                let title = settings
-                    .nicknames
-                    .get(&profile.id)
+                let nickname = settings.nicknames.get(&profile.id);
+                let title = nickname.cloned().unwrap_or_else(|| profile.name());
+                let short_label = nickname
                     .cloned()
-                    .unwrap_or_else(|| profile.name());
-                profile.row(title, position, listed.len(), now, &tz)
+                    .or_else(|| profile.identity.as_ref().map(Identity::short_label))
+                    .unwrap_or_else(|| "Signed out".to_owned());
+                Listed {
+                    id: &profile.id,
+                    config_dir: &profile.config_dir,
+                    signed_in: profile.identity.is_some(),
+                    short_label,
+                    row: profile.row(title, position, listed.len(), now, &tz),
+                }
             })
             .collect()
     }

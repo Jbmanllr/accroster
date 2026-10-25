@@ -31,8 +31,8 @@ pub use interface::{
     SettingsView, View,
 };
 pub use interface::{
-    DiscoveredPair, DiscoveredRow, FirstRunView, HiddenDiscovered, LaunchAtLoginView,
-    NicknameTarget,
+    CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView, HiddenDiscovered,
+    LaunchAtLoginView, NicknameTarget,
 };
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};
