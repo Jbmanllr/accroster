@@ -8,6 +8,7 @@ use std::time::Duration;
 use jiff::SignedDuration;
 
 use crate::backups;
+use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Command, Effect, Event, FirstRunView, LaunchAtLoginView, MenuBarView, MenuItem,
@@ -66,6 +67,7 @@ pub struct Core {
     /// Menu warning lines for this run.
     warnings: Vec<String>,
     profiles: ProfileRegistry,
+    desktop: DesktopBridge,
 }
 
 impl Core {
@@ -87,6 +89,7 @@ impl Core {
             settings: loaded.settings,
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
+            desktop: DesktopBridge::default(),
         };
         core.log(
             Level::Info,
@@ -139,7 +142,7 @@ impl Core {
     /// while a sign-in is waiting (so its end shows at once), otherwise
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
-        if self.profiles.signing_in() {
+        if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
@@ -177,6 +180,32 @@ impl Core {
                 Vec::new()
             }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
+            Command::SwitchDesktopApp(id) => {
+                let target = self
+                    .profiles
+                    .signed_in()
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map(Target::of);
+                let Some(target) = target else {
+                    return Vec::new();
+                };
+                let (desktop, ctx) = self.desktop();
+                desktop.start(&ctx, target)
+            }
+            Command::ConfirmDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.confirm(&ctx)
+            }
+            Command::NotifyWhenDesktopIdle => {
+                self.desktop.notify_when_idle();
+                Vec::new()
+            }
+            Command::CancelDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.cancel(&ctx);
+                Vec::new()
+            }
         }
     }
 
@@ -189,7 +218,9 @@ impl Core {
                 }
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
-                Vec::new()
+                let signed_in = self.profiles.signed_in();
+                let (desktop, ctx) = self.desktop();
+                desktop.poll(&ctx, &signed_in)
             }
         }
     }
@@ -204,10 +235,35 @@ impl Core {
             .chain(self.profiles.notice())
             .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
+        items.extend(self.desktop.menu_items());
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let rows = self.profiles.rows();
+        let signed_in = self.profiles.signed_in();
+        let desktop_account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+        let desktop_profile = desktop_account
+            .as_ref()
+            .and_then(|account| account.profile(&signed_in));
+        let mut header: Vec<String> = Vec::new();
+        if desktop_account.is_some() {
+            let name = desktop_profile.map_or("another account", |profile| &profile.name);
+            header.push(format!("Desktop: {name}"));
+        }
+        if !header.is_empty() {
+            items.push(MenuItem::Detail(header.join("    ")));
+        }
+        let desktop_installed = self.env.os.desktop_app_version().is_some();
+        let mut rows = self.profiles.rows();
+        for (row, profile) in rows.iter_mut().zip(&signed_in) {
+            if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
+                row.badges.push("Desktop".into());
+            } else if desktop_installed {
+                row.submenu.push(MenuItem::Action {
+                    title: "Switch desktop app to this Profile…".into(),
+                    command: Command::SwitchDesktopApp(profile.id.clone()),
+                });
+            }
+        }
         if !rows.is_empty() {
             items.extend(rows.into_iter().map(MenuItem::Profile));
             items.push(MenuItem::Separator);
@@ -261,6 +317,7 @@ impl Core {
                 .then_some(FirstRunView {
                     launch_at_login: true,
                 }),
+            versions: desktop::versions(&self.env),
         }
     }
 
@@ -335,6 +392,18 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// The Desktop bridge, with what it needs from the rest of the core.
+    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+        let verbose = self.verbose_logging();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose,
+        };
+        (&mut self.desktop, ctx)
     }
 
     /// The Profile registry, with what it needs from the rest of the core.

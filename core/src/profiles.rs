@@ -84,6 +84,16 @@ impl Identity {
     }
 }
 
+/// A signed-in Profile as other modules see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignedInProfile {
+    pub id: String,
+    pub account_uuid: String,
+    pub organization_uuid: String,
+    /// `email · Organization`.
+    pub name: String,
+}
+
 /// `state/profiles.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryFile {
@@ -161,6 +171,7 @@ impl Profile {
         }
         ProfileRow {
             title: identity.name(),
+            badges: Vec::new(),
             limits,
             note,
             submenu: vec![MenuItem::Detail(detail)],
@@ -433,6 +444,22 @@ impl ProfileRegistry {
         self.profiles
             .iter()
             .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?)))
+            .collect()
+    }
+
+    /// Who each signed-in Profile is, in the same order as [`Self::rows`].
+    pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInProfile {
+                    id: profile.id.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    organization_uuid: identity.organization_uuid.clone(),
+                    name: identity.name(),
+                })
+            })
             .collect()
     }
 

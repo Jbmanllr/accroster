@@ -38,6 +38,15 @@ pub enum Command {
     CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
+    /// "Switch desktop app to this Profile…" in a Profile's submenu, with
+    /// that Profile's id: the Guided switch.
+    SwitchDesktopApp(String),
+    /// "Switch anyway", when the busy guard couldn't tell.
+    ConfirmDesktopSwitch,
+    /// "Notify me when idle", when a desktop turn blocked the switch.
+    NotifyWhenDesktopIdle,
+    /// "Cancel switch".
+    CancelDesktopSwitch,
 }
 
 impl Command {
@@ -52,6 +61,10 @@ impl Command {
             Command::AddProfile => "add_profile",
             Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
+            Command::SwitchDesktopApp(_) => "switch_desktop_app",
+            Command::ConfirmDesktopSwitch => "confirm_desktop_switch",
+            Command::NotifyWhenDesktopIdle => "notify_when_desktop_idle",
+            Command::CancelDesktopSwitch => "cancel_desktop_switch",
         }
     }
 }
@@ -77,6 +90,12 @@ pub enum Effect {
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
+    /// Bring the Claude desktop app (`com.anthropic.claudefordesktop`)
+    /// forward, opening it if it isn't running. Nothing ever quits or
+    /// relaunches it.
+    BringDesktopAppForward,
+    /// Post a user notification.
+    Notify { title: String, body: String },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
 }
@@ -90,6 +109,19 @@ pub struct View {
     pub about: AboutView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
+    /// The installed Claude versions, for Diagnostics.
+    pub versions: ClaudeVersions,
+}
+
+/// The installed Claude versions, read from files (nothing is spawned).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeVersions {
+    /// The Terminal's Claude Code: where `~/.local/bin/claude` links to.
+    pub claude_code: Option<String>,
+    /// The Claude Code versions bundled with the desktop app, oldest first.
+    pub desktop_claude_code: Vec<String>,
+    /// The desktop app's `CFBundleShortVersionString`.
+    pub desktop: Option<String>,
 }
 
 /// The first-run window: the one-time launch-at-login offer.
@@ -148,6 +180,8 @@ pub enum MenuItem {
 pub struct ProfileRow {
     /// The nickname, else `email · Organization`.
     pub title: String,
+    /// Which clients use this Profile: "CLI" first, then "Desktop".
+    pub badges: Vec<String>,
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
