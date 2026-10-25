@@ -1,0 +1,16 @@
+[package]
+name = "accroster-fake-mac"
+description = "Test harness: a fake Mac (temporary home, stub claude, fake clock, fake OS facts) that drives accroster-core end to end."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+accroster-core.workspace = true
+jiff.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

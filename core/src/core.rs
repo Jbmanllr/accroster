@@ -1,0 +1,246 @@
+//! [`Core`]: the one object the UI layer talks to.
+
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+
+use jiff::SignedDuration;
+
+use crate::backups;
+use crate::env::Environment;
+use crate::interface::{
+    AboutView, Command, Effect, Event, MenuBarView, MenuItem, MenuView, SettingsView, View,
+};
+use crate::logging::{Field, Level, Logger};
+use crate::settings::{self, Settings};
+use crate::storage::{self, AppPaths};
+
+/// The tagline, shown in About and the README.
+pub const TAGLINE: &str =
+    "A menu bar app for Claude Code accounts: limits, sessions and one-click switching.";
+
+/// The non-affiliation disclaimer, shown in About and the README.
+pub const DISCLAIMER: &str = "AccRoster is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC.";
+
+/// How long Verbose logging stays on once turned on.
+const VERBOSE_LOGGING_LASTS: SignedDuration = SignedDuration::from_hours(24);
+
+/// Why the core couldn't start. The UI shows it and quits.
+#[derive(Debug)]
+pub struct LaunchError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "couldn't set up {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for LaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// All of the app's behaviour and state.
+///
+/// Drive it with [`Core::command`] and [`Core::event`], perform the returned
+/// [`Effect`]s, and render [`Core::view`]. Each call runs to completion before
+/// the next; the [`crate::driver`] runs the core on its own thread so slow work
+/// never blocks the UI.
+pub struct Core {
+    env: Environment,
+    paths: AppPaths,
+    logger: Logger,
+    settings: Settings,
+    /// Menu warning lines for this run.
+    warnings: Vec<String>,
+}
+
+impl Core {
+    /// Starts the core: creates the app's folder if needed, opens the log and
+    /// loads settings.
+    pub fn launch(env: Environment) -> Result<Core, LaunchError> {
+        let paths = AppPaths::new(&env.home);
+        let fail = |path: PathBuf| move |source| LaunchError { path, source };
+        paths
+            .ensure_layout()
+            .map_err(fail(paths.root().to_path_buf()))?;
+        let logger = Logger::new(paths.app_log(), env.home.clone());
+        let loaded =
+            settings::load(&paths.settings(), env.clock.now()).map_err(fail(paths.settings()))?;
+        let mut core = Core {
+            env,
+            paths,
+            logger,
+            settings: loaded.settings,
+            warnings: Vec::new(),
+        };
+        core.log(
+            Level::Info,
+            "launch",
+            &[
+                ("version", Field::Text(env!("CARGO_PKG_VERSION"))),
+                ("app_folder", Field::Path(core.paths.root())),
+            ],
+        );
+        match backups::prune(&core.paths.backups(), core.env.clock.now()) {
+            Ok(0) => {}
+            Ok(pruned) => core.log(
+                Level::Info,
+                "backups pruned",
+                &[("count", Field::Number(pruned as i64))],
+            ),
+            Err(error) => {
+                let error = error.to_string();
+                core.log(
+                    Level::Warn,
+                    "backups not pruned",
+                    &[("error", Field::Text(&error))],
+                );
+            }
+        }
+        if let Some(set_aside) = loaded.set_aside {
+            core.log(
+                Level::Warn,
+                "settings set aside",
+                &[
+                    ("reason", Field::Text(&set_aside.reason)),
+                    ("kept_as", Field::Path(&set_aside.path)),
+                ],
+            );
+            let name = set_aside
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            core.warnings.push(format!(
+                "Settings were unreadable and were reset · old file kept as {name}"
+            ));
+        }
+        Ok(core)
+    }
+
+    /// Handles a user intent.
+    pub fn command(&mut self, command: Command) -> Vec<Effect> {
+        self.log(
+            Level::Debug,
+            "command",
+            &[("name", Field::Word(command.name()))],
+        );
+        match command {
+            Command::OpenSettings => vec![Effect::ShowSettings],
+            Command::OpenAbout => vec![Effect::ShowAbout],
+            Command::Quit => {
+                self.log(Level::Info, "quit", &[]);
+                vec![Effect::Terminate]
+            }
+            Command::SetVerboseLogging(on) => {
+                let until = on.then(|| self.env.clock.now() + VERBOSE_LOGGING_LASTS);
+                self.set_verbose_logging_until(until);
+                Vec::new()
+            }
+            Command::RevealLogs => vec![Effect::RevealInFinder(self.paths.app_log())],
+        }
+    }
+
+    /// Handles something that happened outside the core.
+    pub fn event(&mut self, event: Event) -> Vec<Effect> {
+        match event {
+            Event::Tick => {
+                if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
+                    self.set_verbose_logging_until(None);
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Everything the UI shows right now.
+    pub fn view(&self) -> View {
+        let mut items: Vec<MenuItem> = self
+            .warnings
+            .iter()
+            .cloned()
+            .map(MenuItem::Warning)
+            .collect();
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        items.extend([
+            MenuItem::Action {
+                title: "Settings…".into(),
+                command: Command::OpenSettings,
+            },
+            MenuItem::Action {
+                title: "About".into(),
+                command: Command::OpenAbout,
+            },
+            MenuItem::Separator,
+            MenuItem::Action {
+                title: "Quit".into(),
+                command: Command::Quit,
+            },
+        ]);
+        View {
+            menu_bar: MenuBarView {
+                label: "AccRoster".into(),
+            },
+            menu: MenuView { items },
+            settings: SettingsView {
+                verbose_logging: self.verbose_logging(),
+                verbose_logging_note: "Turns itself off after 24 hours.".into(),
+            },
+            about: AboutView {
+                name: "AccRoster".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                tagline: TAGLINE.into(),
+                disclaimer: DISCLAIMER.into(),
+            },
+        }
+    }
+
+    fn verbose_logging(&self) -> bool {
+        self.settings
+            .verbose_logging_until
+            .is_some_and(|until| until > self.env.clock.now())
+    }
+
+    fn set_verbose_logging_until(&mut self, until: Option<jiff::Timestamp>) {
+        let mut updated = self.settings.clone();
+        updated.verbose_logging_until = until;
+        if let Err(error) = storage::write_versioned(&self.paths.settings(), &updated) {
+            let error = error.to_string();
+            self.log(
+                Level::Error,
+                "settings not saved",
+                &[("error", Field::Text(&error))],
+            );
+            return;
+        }
+        self.settings = updated;
+        let state = if until.is_some() { "on" } else { "off" };
+        self.log(
+            Level::Info,
+            "verbose logging",
+            &[("state", Field::Word(state))],
+        );
+    }
+
+    fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
+        self.logger.write(
+            self.env.clock.now(),
+            self.verbose_logging(),
+            level,
+            message,
+            fields,
+        );
+    }
+}
