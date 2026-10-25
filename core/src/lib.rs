@@ -47,7 +47,8 @@ pub use interface::{
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView, ProfileSettings,
+    Toggle,
 };
 pub use interface::{SidebarSyncMode, SidebarSyncView, UninstallView};
 pub use logging::install_panic_hook;

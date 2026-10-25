@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Command, Core, Effect, Event, NicknameTarget};
+use accroster_core::{Command, Core, Effect, Event, MenuItem, NicknameTarget, ProfileSettings};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use serde_json::json;
@@ -70,8 +70,12 @@ fn titles(core: &Core) -> Vec<String> {
     rows(core).into_iter().map(|row| row.title).collect()
 }
 
+fn settings_profiles(core: &Core) -> Vec<ProfileSettings> {
+    core.view().settings.profiles
+}
+
 #[test]
-fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
+fn settings_lists_the_profiles_to_reorder_rename_and_mute() {
     let mac = mac_with_two_sign_ins();
     let mut core = mac.launch();
     add_profile(&mut core);
@@ -82,28 +86,42 @@ fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
         [
             "Copy shell override",
             "Limit resets → claude.ai",
-            "Move Down",
             "Rename…",
             "Remove…"
-        ]
+        ],
+        "ordering lives in Settings, not the row"
     );
-    assert_eq!(
-        row_actions(&rows(&core)[1]),
-        [
-            "Copy shell override",
-            "Limit resets → claude.ai",
-            "Move Up",
-            "Rename…",
-            "Remove…"
-        ]
-    );
+    let listed = settings_profiles(&core);
+    let listed_titles: Vec<&str> = listed.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(listed_titles, [WORK, PERSO]);
+    assert!(listed[0].move_up.is_none() && listed[1].move_down.is_none());
+    assert!(!listed[1].mute.as_ref().expect("signed in").on);
 
-    click_in_row(&mut core, 1, "Move Up");
-
+    core.command(listed[1].move_up.clone().expect("the second moves up"));
     assert_eq!(titles(&core), [PERSO, WORK]);
+
+    let effects = core.command(settings_profiles(&core)[0].rename.clone());
+    let (target, name, _) = nickname_prompt(effects);
+    assert_eq!(name, PERSO);
+    core.command(Command::SetNickname {
+        target,
+        nickname: Some("Perso".into()),
+    });
+    let mute = settings_profiles(&core)[0].mute.clone().expect("signed in");
+    core.command(mute.command);
+
+    let listed = settings_profiles(&core);
+    assert_eq!(listed[0].title, "Perso");
+    assert_eq!(listed[0].detail.as_deref(), Some(PERSO));
+    assert!(listed[0].mute.as_ref().unwrap().on);
+    let menu_check = rows(&core)[0].submenu.iter().any(|item| {
+        matches!(item, MenuItem::Check { title, checked: true, .. } if title == "Mute notifications")
+    });
+    assert!(menu_check, "the row's Mute notifications agrees");
     drop(core);
     let core = mac.launch();
-    assert_eq!(titles(&core), [PERSO, WORK], "kept in settings.json");
+    assert_eq!(titles(&core), ["Perso", WORK], "kept in settings.json");
+    assert!(settings_profiles(&core)[0].mute.as_ref().unwrap().on);
 }
 
 /// Clicks Remove… on the row at `row` and returns the confirmation's

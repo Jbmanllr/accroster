@@ -16,8 +16,8 @@ use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
     Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, SidebarSyncMode,
-    SidebarSyncView, UninstallView, View,
+    NicknameTarget, NotificationsView, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
+    SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, LimitsView, Watched};
@@ -817,6 +817,7 @@ impl Core {
         for profile in &mut listed {
             self.annotate_links(profile.id, &mut profile.row);
         }
+        let profile_settings = self.profile_settings(&listed);
         let cli = cli_switcher::present(
             &self.paths,
             &mut listed,
@@ -974,6 +975,7 @@ impl Core {
                         .then_some(Command::SyncSidebarNow),
                     note: self.sync_note.clone(),
                 },
+                profiles: profile_settings,
                 hidden_discovered: shown
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
@@ -1014,6 +1016,35 @@ impl Core {
                 }),
             diagnostics: self.diagnostics(),
         }
+    }
+
+    /// Settings > Profiles: each Profile in the user's order, with what
+    /// reorders, renames and mutes it.
+    fn profile_settings(&self, listed: &[Listed<'_>]) -> Vec<ProfileSettings> {
+        let last = listed.len().saturating_sub(1);
+        listed
+            .iter()
+            .enumerate()
+            .map(|(position, profile)| {
+                let id = profile.id.to_owned();
+                let move_to = |to: usize| Command::MoveProfile { id: id.clone(), to };
+                let muted = self.settings.muted_profiles.contains(&id);
+                ProfileSettings {
+                    title: profile.row.title.clone(),
+                    detail: profile.nicknamed.then(|| profile.name.clone()),
+                    move_up: (position > 0).then(|| move_to(position - 1)),
+                    move_down: (position < last).then(|| move_to(position + 1)),
+                    rename: Command::Rename(NicknameTarget::Profile(id.clone())),
+                    mute: profile.signed_in.then(|| Toggle {
+                        on: muted,
+                        command: Command::SetMuted {
+                            id: id.clone(),
+                            muted: !muted,
+                        },
+                    }),
+                }
+            })
+            .collect()
     }
 
     /// The All Sessions window, with the selected Session's Open section.

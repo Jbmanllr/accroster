@@ -592,6 +592,9 @@ pub struct SettingsView {
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
     pub cli_switching: CliSwitchingView,
+    /// Profiles: every Profile, in the user's order, to reorder, rename and
+    /// mute.
+    pub profiles: Vec<ProfileSettings>,
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
@@ -630,7 +633,31 @@ pub struct SidebarSyncView {
     pub note: Option<String>,
 }
 
-/// One entry of Settings > Hidden (n)….
+/// One Profile in Settings > Profiles, in the user's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSettings {
+    /// The nickname, else `email · Organization`.
+    pub title: String,
+    /// `email · Organization`, when a nickname titles the line.
+    pub detail: Option<String>,
+    /// `None` for the first Profile.
+    pub move_up: Option<Command>,
+    /// `None` for the last Profile.
+    pub move_down: Option<Command>,
+    /// Asks for the nickname.
+    pub rename: Command,
+    /// Mute notifications; `None` for a Profile with no Login.
+    pub mute: Option<Toggle>,
+}
+
+/// A checkbox: whether it is on, and what clicking it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toggle {
+    pub on: bool,
+    pub command: Command,
+}
+
+/// One hidden Discovered Profile in Settings > Hidden (n)….
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiddenDiscovered {
     /// The nickname, else `email · Organization`, else "Unknown Login" with

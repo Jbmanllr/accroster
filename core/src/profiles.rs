@@ -116,6 +116,10 @@ pub(crate) struct Listed<'a> {
     pub config_dir: &'a Path,
     /// Whether its folder holds a Login (signed in or expired).
     pub signed_in: bool,
+    /// `email · Organization`, or "Signed-out Profile".
+    pub name: String,
+    /// A nickname titles its row.
+    pub nicknamed: bool,
     /// The menu bar's short name for it: the nickname, else the email's
     /// local part (`perso`).
     pub short_label: String,
@@ -165,9 +169,8 @@ struct Profile {
 }
 
 impl Profile {
-    /// The menu row: `title` is the nickname, else `email · Organization`;
-    /// `position` and `count` decide which Move items the submenu offers.
-    fn row(&self, title: String, position: usize, count: usize, limits: LimitsView) -> ProfileRow {
+    /// The menu row: `title` is the nickname, else `email · Organization`.
+    fn row(&self, title: String, limits: LimitsView) -> ProfileRow {
         let mut submenu = Vec::new();
         let mut row_limits = LimitsView::default();
         if let Some(identity) = &self.identity {
@@ -214,24 +217,6 @@ impl Profile {
             submenu.push(action(
                 "Sign in again…",
                 Command::SignInAgain(self.id.clone()),
-            ));
-        }
-        if position > 0 {
-            submenu.push(action(
-                "Move Up",
-                Command::MoveProfile {
-                    id: self.id.clone(),
-                    to: position - 1,
-                },
-            ));
-        }
-        if position + 1 < count {
-            submenu.push(action(
-                "Move Down",
-                Command::MoveProfile {
-                    id: self.id.clone(),
-                    to: position + 1,
-                },
             ));
         }
         submenu.push(action(
@@ -924,18 +909,16 @@ impl ProfileRegistry {
         settings: &Settings,
         limits: impl Fn(&str) -> LimitsView,
     ) -> Vec<Listed<'_>> {
-        let listed = self.ordered(&settings.profile_order);
-        listed
-            .iter()
-            .enumerate()
-            .map(|(position, profile)| {
+        self.ordered(&settings.profile_order)
+            .into_iter()
+            .map(|profile| {
                 let nickname = settings.nicknames.get(&profile.id);
                 let title = nickname.cloned().unwrap_or_else(|| profile.name());
                 let short_label = nickname
                     .cloned()
                     .or_else(|| profile.identity.as_ref().map(Identity::short_label))
                     .unwrap_or_else(|| "Signed out".to_owned());
-                let mut row = profile.row(title, position, listed.len(), limits(&profile.id));
+                let mut row = profile.row(title, limits(&profile.id));
                 if self.removing(&profile.id) {
                     row.note = Some("Signing out…".to_owned());
                     row.dimmed = true;
@@ -953,6 +936,8 @@ impl ProfileRegistry {
                     id: &profile.id,
                     config_dir: &profile.config_dir,
                     signed_in: profile.identity.is_some(),
+                    name: profile.name(),
+                    nicknamed: nickname.is_some(),
                     short_label,
                     row,
                 }
