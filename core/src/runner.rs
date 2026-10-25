@@ -32,6 +32,23 @@ const USAGE_FLAGS: [&str; 5] = [
     r#"{"disableAllHooks":true}"#,
 ];
 
+/// The two ways to read a Profile's usage, tried in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageRead {
+    GetUsage,
+    SlashUsage,
+}
+
+impl UsageRead {
+    /// The answer in a finished read's stdout; `None` when there is none.
+    pub(crate) fn parse(self, stdout: &[u8]) -> Option<UsageReply> {
+        match self {
+            UsageRead::GetUsage => usage::parse_get_usage(stdout, USAGE_REQUEST_ID),
+            UsageRead::SlashUsage => usage::parse_slash_usage(stdout),
+        }
+    }
+}
+
 /// Spawns Claude Code in Profile folders.
 pub(crate) struct Runner<'a> {
     env: &'a Environment,
@@ -88,34 +105,43 @@ impl<'a> Runner<'a> {
         Ok(self.run(config_dir, &["auth", "logout"], None)?.succeeded())
     }
 
-    /// One usage read: a `get_usage` control request, or `claude -p "/usage"`
-    /// when Claude Code no longer answers `get_usage`. `None` when neither
-    /// gave a readable answer.
-    pub(crate) fn read_usage(&self, config_dir: &Path) -> Option<UsageReply> {
-        let mut args = vec![
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-        ];
-        args.extend(USAGE_FLAGS);
-        let line = serde_json::json!({
-            "type": "control_request",
-            "request_id": USAGE_REQUEST_ID,
-            "request": { "subtype": "get_usage", "skip_behaviors": true },
-        });
-        let stdin = format!("{line}\n").into_bytes();
-        if let Ok(output) = self.run(config_dir, &args, Some(stdin))
-            && let Some(reply) = usage::parse_get_usage(&output.stdout, USAGE_REQUEST_ID)
-        {
-            return Some(reply);
-        }
-        let mut args = vec!["-p", "--output-format", "stream-json"];
-        args.extend(USAGE_FLAGS);
-        args.push("/usage");
-        let output = self.run(config_dir, &args, None).ok()?;
-        usage::parse_slash_usage(&output.stdout)
+    /// Starts one step of a usage read: the `get_usage` control request
+    /// (its one stdin line, then EOF), or `claude -p "/usage"`, the fallback
+    /// when Claude Code no longer answers `get_usage`. Read the finished
+    /// output with [`UsageRead::parse`].
+    pub(crate) fn start_usage_read(
+        &self,
+        config_dir: &Path,
+        read: UsageRead,
+    ) -> io::Result<Box<dyn RunningProcess>> {
+        let request = match read {
+            UsageRead::GetUsage => {
+                let mut args = vec![
+                    "-p",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                ];
+                args.extend(USAGE_FLAGS);
+                let line = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": USAGE_REQUEST_ID,
+                    "request": { "subtype": "get_usage", "skip_behaviors": true },
+                });
+                let stdin = format!("{line}\n").into_bytes();
+                self.request(config_dir, &args, Some(stdin))?
+            }
+            UsageRead::SlashUsage => {
+                let mut args = vec!["-p", "--output-format", "stream-json"];
+                args.extend(USAGE_FLAGS);
+                args.push("/usage");
+                self.request(config_dir, &args, None)?
+            }
+        };
+        let mut process = self.env.spawner.start(&request)?;
+        process.close_stdin();
+        Ok(process)
     }
 
     fn run(

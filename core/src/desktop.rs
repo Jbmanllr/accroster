@@ -292,7 +292,7 @@ fn live_desktop_processes(env: &Environment, paths: &DesktopPaths) -> Vec<LivePr
 
 /// `procStart` as `ps -o lstart` prints it (`Sun Oct 25 14:02:11 2026`, the
 /// day space-padded), in the Mac's local time.
-fn parse_proc_start(text: &str, time_zone: &jiff::tz::TimeZone) -> Option<Timestamp> {
+pub(crate) fn parse_proc_start(text: &str, time_zone: &jiff::tz::TimeZone) -> Option<Timestamp> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];

@@ -19,9 +19,11 @@ use crate::interface::{
     NicknameTarget, SafetyFeature, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
+use crate::monitor::{LimitMonitor, Watched};
 use crate::profiles::{self, ProfileRegistry, SignInTarget};
 use crate::runner::Runner;
 use crate::safety::{self, CheckId, Finding, Safety};
+use crate::sessions::SessionIndex;
 use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
 
@@ -76,11 +78,14 @@ pub struct Core {
     /// Menu warning lines for this run.
     warnings: Vec<String>,
     profiles: ProfileRegistry,
+    monitor: LimitMonitor,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
+    /// The All Sessions list and the Session index behind it.
+    sessions: SessionIndex,
     /// Format check results and Safety pauses.
     safety: Safety,
     /// The Claude versions as of the last check (launch, menu open).
@@ -131,12 +136,14 @@ impl Core {
             settings: loaded.settings,
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
+            monitor: LimitMonitor::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
             discovered: Vec::new(),
             safety: Safety::load(&paths_for_safety),
             versions: ClaudeVersions::default(),
             links: Vec::new(),
+            sessions: SessionIndex::default(),
         };
         core.log(
             Level::Info,
@@ -200,18 +207,26 @@ impl Core {
             }
         }
         core.rescan_discovered();
+        core.monitor = LimitMonitor::load(&core.context());
         Ok(core)
     }
 
     /// How soon the driver should send the next [`Event::Tick`]: every second
-    /// while a sign-in is waiting (so its end shows at once), otherwise
+    /// while a sign-in is waiting (so its end shows at once), more often
+    /// while a usage read runs, by the time the next read is due, and at most
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
-        if self.profiles.signing_in() || self.desktop.waiting() {
+        if self.sessions.building() {
+            // The next batch of the Session index, as soon as input allows.
+            return Duration::ZERO;
+        }
+        let idle = if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
-        }
+        };
+        self.monitor
+            .tick_interval(self.env.clock.now(), &self.watched(), idle)
     }
 
     /// Effects the core queued outside an input (a Safety pause noticed at
@@ -401,6 +416,14 @@ impl Core {
                 }
                 Vec::new()
             }
+            Command::OpenAllSessions => {
+                self.sessions.open(&self.env, &self.paths);
+                vec![Effect::ShowAllSessions]
+            }
+            Command::SearchSessions(text) => {
+                self.sessions.set_search(text);
+                Vec::new()
+            }
         }
     }
 
@@ -428,6 +451,7 @@ impl Core {
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
                 effects.extend(desktop.poll(&ctx, &signed_in));
+                self.index_sessions();
                 effects
             }
             Event::MenuOpened => {
@@ -437,28 +461,93 @@ impl Core {
                     self.check_links();
                     self.settle();
                 }
+                let watched = self.watched();
+                self.monitor.menu_opened(self.env.clock.now(), &watched);
+                Vec::new()
+            }
+            Event::WillSleep | Event::DidWake => {
+                let watched = self.watched();
+                self.monitor.set_asleep(event == Event::WillSleep, &watched);
+                Vec::new()
+            }
+            Event::ScreenLocked | Event::ScreenUnlocked => {
+                let watched = self.watched();
+                self.monitor
+                    .set_locked(event == Event::ScreenLocked, &watched);
+                Vec::new()
+            }
+            Event::NetworkChanged { online } => {
+                self.monitor.set_online(online);
                 Vec::new()
             }
         };
+        effects.extend(self.run_monitor());
         effects.extend(self.take_effects());
         effects
+    }
+
+    /// Lets the Limit monitor collect a finished read and start the next.
+    /// Finished reads go to the Profile registry, which notices an expired
+    /// Login; returns the notifications that produced.
+    fn run_monitor(&mut self) -> Vec<Effect> {
+        let watched = self.watched();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        };
+        // A finished read is handed over before the next starts, so the
+        // registry's `auth status` check never overlaps a usage read.
+        if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
+        }
+        let watched = self.watched();
+        if let Some(done) = self.monitor.start_due(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
+        }
+        self.profiles.take_effects()
+    }
+
+    /// The signed-in Profiles the Limit monitor reads, with which are a
+    /// client's Active Profile: the CLI's (its pointer) or the desktop app's.
+    fn watched(&self) -> Vec<Watched> {
+        let cli_active = cli_switcher::pointer(&self.paths);
+        let desktop_active =
+            desktop::desktop_account(&DesktopPaths::new(&self.env.home)).and_then(|account| {
+                let signed_in = self.profiles.signed_in();
+                account
+                    .profile(&signed_in)
+                    .map(|profile| profile.id.clone())
+            });
+        self.profiles.watched(|id, config_dir| {
+            cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
+        })
     }
 
     /// Everything the UI shows right now.
     pub fn view(&self) -> View {
         let login_item = self.env.login_item.status();
-        let safety_lines = self.safety.warning_lines();
+        let ctx = self.context();
+        let watched = self.watched();
         let mut items: Vec<MenuItem> = self
-            .warnings
-            .iter()
-            .chain(&safety_lines)
-            .map(String::as_str)
-            .chain(self.profiles.notice())
-            .map(|text| MenuItem::Warning(text.to_owned()))
+            .monitor
+            .offline_line(&ctx, &watched)
+            .into_iter()
+            .chain(
+                self.warnings
+                    .iter()
+                    .cloned()
+                    .chain(self.safety.warning_lines())
+                    .chain(self.profiles.notice().map(str::to_owned)),
+            )
+            .map(MenuItem::Warning)
             .collect();
-        let mut listed = self
-            .profiles
-            .listed(self.env.clock.as_ref(), &self.settings);
+        let mut listed = self.profiles.listed(&self.settings, |id| {
+            let active = watched.iter().any(|w| w.id == id && w.active);
+            self.monitor.view(&ctx, id, active)
+        });
         for profile in &mut listed {
             self.annotate_links(profile.id, &mut profile.row);
         }
@@ -467,6 +556,11 @@ impl Core {
             &mut listed,
             self.safety.is_paused(SafetyFeature::CliSwitching),
         );
+        let pointer = cli_switcher::pointer(&self.paths);
+        // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
+        let menu_bar_dimmed = listed
+            .iter()
+            .any(|profile| Some(profile.config_dir) == pointer.as_deref() && profile.row.dimmed);
         items.extend(self.desktop.menu_items());
         if !items.is_empty() {
             items.push(MenuItem::Separator);
@@ -518,6 +612,10 @@ impl Core {
         if items.len() > before {
             items.push(MenuItem::Separator);
         }
+        items.push(MenuItem::Action {
+            title: "All Sessions…".into(),
+            command: Command::OpenAllSessions,
+        });
         items.push(if self.profiles.signing_in() {
             MenuItem::Action {
                 title: "Waiting for sign-in… Cancel".into(),
@@ -551,7 +649,7 @@ impl Core {
         View {
             menu_bar: MenuBarView {
                 label: cli.label.unwrap_or_else(|| "AccRoster".into()),
-                dimmed: false,
+                dimmed: menu_bar_dimmed,
             },
             menu: MenuView { items },
             settings: SettingsView {
@@ -578,6 +676,7 @@ impl Core {
                 tagline: TAGLINE.into(),
                 disclaimer: DISCLAIMER.into(),
             },
+            all_sessions: self.sessions.view(self.env.clock.now()),
             // Offered once: only until answered, and only while it's ours to
             // offer (not already on, not turned off in System Settings).
             first_run: (self.settings.launch_at_login.is_none()
@@ -591,7 +690,7 @@ impl Core {
 
     /// The Diagnostics window: every check, the versions, the pauses.
     fn diagnostics(&self) -> crate::interface::DiagnosticsView {
-        let usage = self.profiles.usage_summary();
+        let usage = self.monitor.usage_summary();
         let mut finding = if usage.unreadable > 0 {
             Finding::fail(format!(
                 "{} of {} last answers couldn't be read",
@@ -873,6 +972,29 @@ impl Core {
         }
     }
 
+    /// Reads the next batch of the Session index while a build runs.
+    fn index_sessions(&mut self) {
+        match self.sessions.step(&self.paths) {
+            None => {}
+            Some(Ok(built)) => self.log(
+                Level::Info,
+                "session index built",
+                &[
+                    ("transcripts", Field::Number(built.transcripts as i64)),
+                    ("read", Field::Number(built.read as i64)),
+                ],
+            ),
+            Some(Err(error)) => {
+                let error = error.to_string();
+                self.log(
+                    Level::Warn,
+                    "session index not saved",
+                    &[("error", Field::Text(&error))],
+                );
+            }
+        }
+    }
+
     /// Re-reads the Mac's evidence of Discovered Profiles. New pairs simply
     /// appear and emptied ones disappear.
     fn rescan_discovered(&mut self) {
@@ -973,6 +1095,14 @@ impl Core {
     fn remove_profile(&mut self, id: &str) {
         let (profiles, ctx) = self.profiles();
         if profiles.remove(&ctx, id) {
+            let ctx = profiles::Context {
+                env: &self.env,
+                paths: &self.paths,
+                logger: &self.logger,
+                verbose: self.verbose_logging(),
+                share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+            };
+            self.monitor.forget(&ctx, id);
             self.forget_profile_settings(id);
         }
     }
@@ -1205,6 +1335,17 @@ impl Core {
             share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
         };
         (&mut self.profiles, ctx)
+    }
+
+    /// What the registry and the monitor need from the rest of the core.
+    fn context(&self) -> profiles::Context<'_> {
+        profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        }
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {

@@ -16,9 +16,11 @@ pub mod env;
 pub mod interface;
 mod limit_offers;
 mod logging;
+mod monitor;
 mod profiles;
 mod runner;
 mod safety;
+mod sessions;
 mod settings;
 mod storage;
 mod usage;
@@ -33,6 +35,7 @@ pub use interface::{
     AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
     SettingsView, View,
 };
+pub use interface::{AllSessionsView, RunningDot, SessionRow};
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,

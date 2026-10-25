@@ -5,12 +5,14 @@
 //! thread; each [`Update`] hops to the main queue and is applied there.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::ffi::{c_int, c_void};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
-    CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event, LimitBar, MenuItem,
-    ProfileRow, SettingsView, View,
+    AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
+    LimitBar, MenuItem, ProfileRow, RunningDot, SessionRow, SettingsView, View,
 };
+use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
@@ -19,16 +21,20 @@ use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
-    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
-    NSControlStateValueOn, NSEvent, NSFont, NSFontWeightRegular, NSLayoutAttribute,
-    NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSResponder, NSStackView, NSStatusBar,
-    NSStatusItem, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
-    NSView, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize,
+    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont,
+    NSFontWeightRegular, NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator,
+    NSLevelIndicatorStyle, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar,
+    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
+    NSView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSDictionary, NSDistributedNotificationCenter, NSEdgeInsets,
+    NSInteger, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -55,11 +61,14 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
         });
     });
     ui.ivars().core.set(handle).expect("the core starts once");
+    ui.observe_the_mac();
 }
 
 pub struct Ivars {
     core: OnceCell<CoreHandle>,
     status_item: Retained<NSStatusItem>,
+    /// Keeps the network path monitor alive.
+    network: OnceCell<NetworkMonitor>,
     /// The commands of the menu's clickable items (submenus included), by tag.
     actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
@@ -68,12 +77,25 @@ pub struct Ivars {
     resume_commands: RefCell<Vec<Command>>,
     /// The first-run offer, open while the view has one.
     first_run: RefCell<Option<FirstRunWindow>>,
-    /// Whether the status item's menu is open. While it is, the menu (and its
-    /// tag table) is left alone and the newest items wait in `pending_menu`.
+    /// Whether the status item's menu is open. While it is, its tag table is
+    /// left alone: rows whose content changed are swapped in place, and a
+    /// menu whose clickable items changed waits in `pending_menu`.
     menu_open: Cell<bool>,
     pending_menu: RefCell<Option<Vec<MenuItem>>>,
+    /// The items the status item's menu shows now.
+    shown_menu: RefCell<Vec<MenuItem>>,
     /// Settings > Hidden (n)…: each entry's title and Restore command, by tag.
     hidden: RefCell<Vec<(String, Command)>>,
+    all_sessions: OnceCell<AllSessionsWindow>,
+    /// The rows the All Sessions table shows (its data source).
+    session_rows: RefCell<Vec<SessionRow>>,
+}
+
+struct AllSessionsWindow {
+    window: Retained<NSWindow>,
+    search: Retained<NSSearchField>,
+    status: Retained<NSTextField>,
+    table: Retained<NSTableView>,
 }
 
 struct FirstRunWindow {
@@ -109,15 +131,41 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Ui {}
 
+    unsafe impl NSControlTextEditingDelegate for Ui {}
+
+    unsafe impl NSTableViewDataSource for Ui {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, _table: &NSTableView) -> NSInteger {
+            self.ivars().session_rows.borrow().len() as NSInteger
+        }
+    }
+
+    unsafe impl NSTableViewDelegate for Ui {
+        /// One two-line Session row: a running dot, the title, then
+        /// `project · last activity`.
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            _table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            let rows = self.ivars().session_rows.borrow();
+            usize::try_from(row)
+                .ok()
+                .and_then(|row| rows.get(row))
+                .map(|row| session_row_view(self.mtm(), row))
+        }
+    }
+
     unsafe impl NSMenuDelegate for Ui {
         /// The status item's menu is opening: the core rescans what the menu
-        /// shows (Discovered Profiles).
+        /// shows (Discovered Profiles) and refreshes old Limit readings in
+        /// the background.
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(true);
-            if let Some(core) = self.ivars().core.get() {
-                core.event(Event::MenuOpened);
-            }
+            self.event(Event::MenuOpened);
         }
 
         /// Applies the menu that arrived while it was open, after the clicked
@@ -136,6 +184,26 @@ define_class!(
     }
 
     impl Ui {
+        #[unsafe(method(willSleep:))]
+        fn will_sleep(&self, _notification: &NSNotification) {
+            self.event(Event::WillSleep);
+        }
+
+        #[unsafe(method(didWake:))]
+        fn did_wake(&self, _notification: &NSNotification) {
+            self.event(Event::DidWake);
+        }
+
+        #[unsafe(method(screenLocked:))]
+        fn screen_locked(&self, _notification: &NSNotification) {
+            self.event(Event::ScreenLocked);
+        }
+
+        #[unsafe(method(screenUnlocked:))]
+        fn screen_unlocked(&self, _notification: &NSNotification) {
+            self.event(Event::ScreenUnlocked);
+        }
+
         /// A menu item was clicked; its tag indexes the menu's commands.
         #[unsafe(method(menuItemClicked:))]
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
@@ -208,6 +276,12 @@ define_class!(
             }
         }
 
+        /// The All Sessions search field changed.
+        #[unsafe(method(searchChanged:))]
+        fn search_changed(&self, sender: &NSSearchField) {
+            self.send(Command::SearchSessions(sender.stringValue().to_string()));
+        }
+
         #[unsafe(method(revealLogsClicked:))]
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
@@ -237,6 +311,7 @@ impl Ui {
         let this = Ui::alloc(mtm).set_ivars(Ivars {
             core: OnceCell::new(),
             status_item,
+            network: OnceCell::new(),
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
             diagnostics: OnceCell::new(),
@@ -244,9 +319,54 @@ impl Ui {
             first_run: RefCell::new(None),
             menu_open: Cell::new(false),
             pending_menu: RefCell::new(None),
+            shown_menu: RefCell::new(Vec::new()),
             hidden: RefCell::new(Vec::new()),
+            all_sessions: OnceCell::new(),
+            session_rows: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Forwards sleep and wake, screen lock and unlock, and network path
+    /// changes to the core.
+    fn observe_the_mac(&self) {
+        let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
+        let distributed = NSDistributedNotificationCenter::defaultCenter();
+        // SAFETY: each selector names a method of `Ui` taking one
+        // NSNotification; the observer lives as long as the app.
+        unsafe {
+            workspace.addObserver_selector_name_object(
+                self,
+                sel!(willSleep:),
+                Some(NSWorkspaceWillSleepNotification),
+                None,
+            );
+            workspace.addObserver_selector_name_object(
+                self,
+                sel!(didWake:),
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+            );
+            distributed.addObserver_selector_name_object(
+                self,
+                sel!(screenLocked:),
+                Some(ns_string!("com.apple.screenIsLocked")),
+                None,
+            );
+            distributed.addObserver_selector_name_object(
+                self,
+                sel!(screenUnlocked:),
+                Some(ns_string!("com.apple.screenIsUnlocked")),
+                None,
+            );
+        }
+        let _ = self.ivars().network.set(NetworkMonitor::start());
+    }
+
+    fn event(&self, event: Event) {
+        if let Some(core) = self.ivars().core.get() {
+            core.event(event);
+        }
     }
 
     fn mtm(&self) -> MainThreadMarker {
@@ -275,7 +395,9 @@ impl Ui {
             button.setAppearsDisabled(view.menu_bar.dimmed);
         }
         if self.ivars().menu_open.get() {
-            *self.ivars().pending_menu.borrow_mut() = Some(view.menu.items.clone());
+            if !self.update_open_menu(&view.menu.items) {
+                *self.ivars().pending_menu.borrow_mut() = Some(view.menu.items.clone());
+            }
         } else {
             self.set_menu(&view.menu.items);
         }
@@ -291,6 +413,9 @@ impl Ui {
         if let Some(diagnostics) = self.ivars().diagnostics.get() {
             self.render_diagnostics(diagnostics, &view.diagnostics);
         }
+        if let Some(window) = self.ivars().all_sessions.get() {
+            self.render_all_sessions(window, &view.all_sessions);
+        }
         self.render_first_run(view);
     }
 
@@ -301,6 +426,36 @@ impl Ui {
         menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         self.ivars().status_item.setMenu(Some(&menu));
         *self.ivars().actions.borrow_mut() = actions;
+        *self.ivars().shown_menu.borrow_mut() = items.to_vec();
+    }
+
+    /// Updates the open menu in place (a refreshed Limit reading, the
+    /// offline line) when its clickable items, and so its tags, are
+    /// unchanged: each changed item is swapped for a fresh one. Returns
+    /// `false` when the change has to wait until the menu closes.
+    fn update_open_menu(&self, items: &[MenuItem]) -> bool {
+        let Some(menu) = self.ivars().status_item.menu(self.mtm()) else {
+            return false;
+        };
+        let shown = self.ivars().shown_menu.borrow().clone();
+        if shown.len() != items.len() || menu.numberOfItems() as usize != items.len() {
+            return false;
+        }
+        let mut actions = Vec::new();
+        let fresh = self.build_menu(items, &mut actions);
+        if actions != *self.ivars().actions.borrow() {
+            return false;
+        }
+        let fresh_items = fresh.itemArray();
+        fresh.removeAllItems();
+        for (index, (old, new)) in shown.iter().zip(items).enumerate() {
+            if old != new {
+                menu.removeItemAtIndex(index as isize);
+                menu.insertItem_atIndex(&fresh_items.objectAtIndex(index), index as isize);
+            }
+        }
+        *self.ivars().shown_menu.borrow_mut() = items.to_vec();
+        true
     }
 
     fn apply_pending_menu(&self) {
@@ -310,6 +465,28 @@ impl Ui {
         let pending = self.ivars().pending_menu.borrow_mut().take();
         if let Some(items) = pending {
             self.set_menu(&items);
+        }
+    }
+
+    /// Refreshes the All Sessions list. The search field is the user's; it is
+    /// only filled from the view while it isn't being edited.
+    fn render_all_sessions(&self, window: &AllSessionsWindow, view: &AllSessionsView) {
+        let changed = *self.ivars().session_rows.borrow() != view.rows;
+        if changed {
+            *self.ivars().session_rows.borrow_mut() = view.rows.clone();
+            window.table.reloadData();
+        }
+        let count = view.rows.len();
+        let status = match (view.loading, count) {
+            (true, _) => format!("Indexing Sessions… {count}"),
+            (false, 1) => "1 Session".to_owned(),
+            (false, _) => format!("{count} Sessions"),
+        };
+        window.status.setStringValue(&NSString::from_str(&status));
+        if window.search.currentEditor().is_none() {
+            window
+                .search
+                .setStringValue(&NSString::from_str(&view.search));
         }
     }
 
@@ -334,12 +511,18 @@ impl Ui {
         }
     }
 
-    /// Builds a menu from `items`, recording each clickable item's command in
-    /// `actions` under the tag it gets.
+    /// Builds a submenu from `items`.
     fn build_menu(&self, items: &[MenuItem], actions: &mut Vec<Command>) -> Retained<NSMenu> {
-        let mtm = self.mtm();
-        let menu = NSMenu::new(mtm);
+        let menu = NSMenu::new(self.mtm());
         menu.setAutoenablesItems(false);
+        self.fill_menu(&menu, items, actions);
+        menu
+    }
+
+    /// Adds `items` to `menu`, recording each clickable item's command in
+    /// `actions` under the tag it gets.
+    fn fill_menu(&self, menu: &NSMenu, items: &[MenuItem], actions: &mut Vec<Command>) {
+        let mtm = self.mtm();
         for item in items {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
@@ -420,7 +603,6 @@ impl Ui {
             };
             menu.addItem(&row);
         }
-        menu
     }
 
     fn perform(&self, effect: Effect, view: &View) {
@@ -477,6 +659,18 @@ impl Ui {
                 if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
                     NSWorkspace::sharedWorkspace().openURL(&url);
                 }
+            }
+            Effect::ShowAllSessions => {
+                let window = self
+                    .ivars()
+                    .all_sessions
+                    .get_or_init(|| self.make_all_sessions_window());
+                self.render_all_sessions(window, &view.all_sessions);
+                if !window.window.isVisible() {
+                    window.window.center();
+                }
+                window.window.makeKeyAndOrderFront(None);
+                app.activate();
             }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
@@ -583,6 +777,87 @@ impl Ui {
         FirstRunWindow {
             window,
             launch_at_login: checkbox,
+        }
+    }
+
+    /// A resizable window: a status line and the search field on top, the
+    /// Session table below.
+    fn make_all_sessions_window(&self) -> AllSessionsWindow {
+        let mtm = self.mtm();
+        let (width, height) = (560.0, 620.0);
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Resizable
+                    | NSWindowStyleMask::Miniaturizable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("All Sessions"));
+        window.setMinSize(NSSize::new(360.0, 240.0));
+        let content = window.contentView().expect("a window has a content view");
+
+        let status = NSTextField::labelWithString(ns_string!(""), mtm);
+        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        status.setFrame(NSRect::new(
+            NSPoint::new(16.0, height - 34.0),
+            NSSize::new(width - 280.0, 18.0),
+        ));
+        status.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        content.addSubview(&status);
+
+        let search = NSSearchField::new(mtm);
+        search.setFrame(NSRect::new(
+            NSPoint::new(width - 256.0, height - 38.0),
+            NSSize::new(240.0, 24.0),
+        ));
+        search.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        search.setPlaceholderString(Some(ns_string!("Title, prompt, project, branch")));
+        search.setSendsSearchStringImmediately(true);
+        unsafe {
+            search.setTarget(Some(self));
+            search.setAction(Some(sel!(searchChanged:)));
+        }
+        content.addSubview(&search);
+
+        let list_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height - 50.0));
+        let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), list_frame);
+        let column =
+            NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("session"));
+        column.setWidth(width);
+        table.addTableColumn(&column);
+        table.setHeaderView(None);
+        table.setStyle(NSTableViewStyle::FullWidth);
+        table.setRowHeight(40.0);
+        unsafe {
+            table.setDataSource(Some(ProtocolObject::from_ref(self)));
+            table.setDelegate(Some(ProtocolObject::from_ref(self)));
+        }
+        let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), list_frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setDocumentView(Some(&table));
+        scroll.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        content.addSubview(&scroll);
+        table.sizeLastColumnToFit();
+
+        AllSessionsWindow {
+            window,
+            search,
+            status,
+            table,
         }
     }
 
@@ -960,6 +1235,9 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     }
     let refs: Vec<&NSView> = lines.iter().map(|view| &**view).collect();
     let body = stack(mtm, true, 3.0, &refs);
+    if row.dimmed {
+        body.setAlphaValue(0.5);
+    }
     body.setEdgeInsets(NSEdgeInsets {
         top: 5.0,
         left: 16.0,
@@ -1089,6 +1367,35 @@ fn ask_nickname(mtm: MainThreadMarker, name: &str, current: Option<&str>) -> Opt
 
 /// `Session ▓▓▓░░ 62%`: an `NSLevelIndicator`, continuous capacity, warning at
 /// 70 and critical at 90.
+/// An All Sessions row: the running dot (green for Terminal, orange for a
+/// desktop turn, invisible otherwise), the title, and the subtitle.
+fn session_row_view(mtm: MainThreadMarker, row: &SessionRow) -> Retained<NSView> {
+    let dot = label(mtm, "●", NSFont::systemFontOfSize(10.0), false);
+    dot.setTextColor(Some(&*match row.dot {
+        Some(RunningDot::Terminal) => NSColor::systemGreenColor(),
+        Some(RunningDot::Desktop) => NSColor::systemOrangeColor(),
+        None => NSColor::clearColor(),
+    }));
+    let title = label(mtm, &row.title, NSFont::systemFontOfSize(13.0), false);
+    let subtitle = label(mtm, &row.subtitle, NSFont::systemFontOfSize(11.0), true);
+    for line in [&title, &subtitle] {
+        line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        line.setContentCompressionResistancePriority_forOrientation(
+            1.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+    }
+    let lines = stack(mtm, true, 1.0, &[&title, &subtitle]);
+    let row = stack(mtm, false, 6.0, &[&dot, &lines]);
+    row.setEdgeInsets(NSEdgeInsets {
+        top: 0.0,
+        left: 8.0,
+        bottom: 0.0,
+        right: 8.0,
+    });
+    row.into_super()
+}
+
 fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
     let regular =
         || unsafe { NSFont::monospacedDigitSystemFontOfSize_weight(11.0, NSFontWeightRegular) };
@@ -1107,7 +1414,12 @@ fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
         .heightAnchor()
         .constraintEqualToConstant(10.0)
         .setActive(true);
-    let percent = label(mtm, &format!("{}%", bar.percent), regular(), false);
+    let text = if bar.reset {
+        "Reset".to_owned()
+    } else {
+        format!("{}%", bar.percent)
+    };
+    let percent = label(mtm, &text, regular(), false);
     stack(mtm, false, 6.0, &[&name, &level, &percent]).into_super()
 }
 
@@ -1224,4 +1536,66 @@ pub fn show_fatal_error(mtm: MainThreadMarker, message: &str) {
     alert.setInformativeText(&NSString::from_str(message));
     NSApplication::sharedApplication(mtm).activate();
     alert.runModal();
+}
+
+/// Watches the Mac's network path (`NWPathMonitor`) and tells the core when
+/// it is gained or lost, starting with the current state.
+struct NetworkMonitor {
+    monitor: *mut c_void,
+}
+
+#[link(name = "Network", kind = "framework")]
+unsafe extern "C" {
+    fn nw_path_monitor_create() -> *mut c_void;
+    fn nw_path_monitor_set_update_handler(
+        monitor: *mut c_void,
+        handler: &block2::Block<dyn Fn(*mut c_void)>,
+    );
+    fn nw_path_monitor_set_queue(monitor: *mut c_void, queue: &DispatchQueue);
+    fn nw_path_monitor_start(monitor: *mut c_void);
+    fn nw_path_monitor_cancel(monitor: *mut c_void);
+    fn nw_path_get_status(path: *mut c_void) -> c_int;
+    fn nw_release(object: *mut c_void);
+}
+
+/// `nw_path_status_satisfied`.
+const NW_PATH_STATUS_SATISFIED: c_int = 1;
+
+impl NetworkMonitor {
+    fn start() -> NetworkMonitor {
+        let last = std::cell::Cell::new(None::<bool>);
+        let handler = RcBlock::new(move |path: *mut c_void| {
+            // SAFETY: `path` is the nw_path_t the monitor passes in.
+            let online = unsafe { nw_path_get_status(path) } == NW_PATH_STATUS_SATISFIED;
+            if last.replace(Some(online)) == Some(online) {
+                return;
+            }
+            UI.with(|cell| {
+                if let Some(ui) = cell.get() {
+                    ui.event(Event::NetworkChanged { online });
+                }
+            });
+        });
+        // SAFETY: the monitor is created, given its handler and the main
+        // queue (the handler touches the UI's thread-local), then started;
+        // it is cancelled and released on drop.
+        unsafe {
+            let monitor = nw_path_monitor_create();
+            nw_path_monitor_set_update_handler(monitor, &handler);
+            nw_path_monitor_set_queue(monitor, DispatchQueue::main());
+            nw_path_monitor_start(monitor);
+            NetworkMonitor { monitor }
+        }
+    }
+}
+
+impl Drop for NetworkMonitor {
+    fn drop(&mut self) {
+        // SAFETY: `monitor` came from nw_path_monitor_create and is used
+        // nowhere else.
+        unsafe {
+            nw_path_monitor_cancel(self.monitor);
+            nw_release(self.monitor);
+        }
+    }
 }

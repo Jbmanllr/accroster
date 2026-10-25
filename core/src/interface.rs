@@ -75,6 +75,11 @@ pub enum Command {
         target: NicknameTarget,
         nickname: Option<String>,
     },
+    /// All Sessions… in the menu: show the All Sessions window and bring its
+    /// list up to date.
+    OpenAllSessions,
+    /// The All Sessions search field changed. Empty shows every Session.
+    SearchSessions(String),
     /// Moves a Profile (by id) to position `to` in the Profile order.
     MoveProfile { id: String, to: usize },
     /// "Sign in again…" on an expired or signed-out Profile (by id): Claude
@@ -154,6 +159,8 @@ impl Command {
             Command::OpenDiagnostics => "open_diagnostics",
             Command::CopyDiagnosticsReport => "copy_diagnostics_report",
             Command::ResumeFeature(_) => "resume_feature",
+            Command::OpenAllSessions => "open_all_sessions",
+            Command::SearchSessions(_) => "search_sessions",
             Command::MoveProfile { .. } => "move_profile",
             Command::SignInAgain(_) => "sign_in_again",
             Command::AskRemoveProfile(_) => "ask_remove_profile",
@@ -170,8 +177,18 @@ pub enum Event {
     /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
     /// the core reads the actual time from its [`crate::Clock`].
     Tick,
-    /// The status item's menu is opening.
+    /// The status item's menu is about to open.
     MenuOpened,
+    /// The Mac is going to sleep.
+    WillSleep,
+    /// The Mac woke from sleep.
+    DidWake,
+    /// The screen locked.
+    ScreenLocked,
+    /// The screen unlocked.
+    ScreenUnlocked,
+    /// The Mac gained (`true`) or lost (`false`) its network path.
+    NetworkChanged { online: bool },
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -209,6 +226,9 @@ pub enum Effect {
         current: Option<String>,
         target: NicknameTarget,
     },
+    /// Bring the All Sessions window forward, rendering
+    /// [`View::all_sessions`].
+    ShowAllSessions,
     /// Ask before an irreversible action: an alert with `title` and
     /// `message`, a destructive confirm button and Cancel. Confirming sends
     /// `confirm`; Cancel sends nothing.
@@ -226,6 +246,7 @@ pub struct View {
     pub menu: MenuView,
     pub settings: SettingsView,
     pub about: AboutView,
+    pub all_sessions: AllSessionsView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
     pub diagnostics: DiagnosticsView,
@@ -382,10 +403,10 @@ pub struct ProfileRow {
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
-    /// A short line under the bars (for example "Couldn't read limits").
+    /// A short line under the bars (for example "as of 14:02").
     pub note: Option<String>,
-    /// Draw the bars and title dimmed: the reading is not current (for
-    /// example the Login expired).
+    /// Drawn dimmed: the reading is not current (stale, unreadable, or the
+    /// Login expired).
     pub dimmed: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
@@ -403,6 +424,9 @@ pub struct LimitBar {
     /// Utilization, whole percent (0–100, rounded down like Claude Code's
     /// `/usage`).
     pub percent: u32,
+    /// The limit's reset time has passed since the reading: drawn as
+    /// "Reset" at 0%.
+    pub reset: bool,
 }
 
 /// The Settings window.
@@ -427,6 +451,42 @@ pub struct HiddenDiscovered {
     pub title: String,
     /// Sent by its Restore item: [`Command::UnhideDiscovered`].
     pub restore: Command,
+}
+
+/// The All Sessions window: every Session on the Mac, across Profiles and
+/// the CLI, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllSessionsView {
+    /// The Sessions matching [`AllSessionsView::search`], newest first.
+    pub rows: Vec<SessionRow>,
+    /// The search field's text.
+    pub search: String,
+    /// Whether the list is still filling in (the index is being built).
+    pub loading: bool,
+}
+
+/// One Session in the All Sessions list, drawn on two lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// The Session's Transcript id.
+    pub id: String,
+    /// First line: the title, else the first prompt in quotes.
+    pub title: String,
+    /// Second line: `project · last activity` (for example
+    /// `app · 5 min ago`).
+    pub subtitle: String,
+    /// A running dot before the title, when the Session runs.
+    pub dot: Option<RunningDot>,
+}
+
+/// Where a running Session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningDot {
+    /// Green: a Claude Code process outside the desktop app (Terminal, an
+    /// IDE, …), in any status.
+    Terminal,
+    /// Orange: a desktop app turn that is busy or waiting.
+    Desktop,
 }
 
 /// The CLI switching switch in Settings.
