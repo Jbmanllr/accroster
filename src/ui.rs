@@ -8,9 +8,13 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{c_int, c_void};
 
 use accroster_core::driver::{self, CoreHandle, Update};
+use accroster_core::watcher::{self, FolderWatch};
+
+use crate::notifications;
 use accroster_core::{
     AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
-    LimitBar, MenuItem, ProfileRow, RunningDot, SessionRow, SettingsView, SidebarSyncMode, View,
+    LimitBar, MenuItem, ProfileRow, RunningDot, SessionDetail, SessionFilter, SessionRow,
+    SettingsView, SidebarGroup, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -24,17 +28,18 @@ use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize,
     NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont,
     NSFontWeightRegular, NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator,
-    NSLevelIndicatorStyle, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar,
-    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
-    NSView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSLevelIndicatorStyle, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView,
+    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardTypeString,
+    NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar, NSStatusItem,
+    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle,
+    NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSDictionary, NSDistributedNotificationCenter, NSEdgeInsets,
-    NSInteger, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
-    ns_string,
+    NSIndexSet, NSInteger, NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSURL, ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -61,6 +66,13 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
         });
     });
     ui.ivars().core.set(handle).expect("the core starts once");
+    notifications::start(|command| {
+        UI.with(|cell| {
+            if let Some(ui) = cell.get() {
+                ui.send(command);
+            }
+        });
+    });
     ui.observe_the_mac();
 }
 
@@ -89,13 +101,23 @@ pub struct Ivars {
     all_sessions: OnceCell<AllSessionsWindow>,
     /// The rows the All Sessions table shows (its data source).
     session_rows: RefCell<Vec<SessionRow>>,
+    /// The detail pane as last drawn.
+    session_detail: RefCell<Option<SessionDetail>>,
+    /// Set while the UI changes a selection itself, so the selection
+    /// callbacks don't echo it back to the core.
+    rendering: Cell<bool>,
+    /// The FSEvents watch the core asked for while All Sessions is open.
+    watch: RefCell<Option<FolderWatch>>,
 }
 
 struct AllSessionsWindow {
     window: Retained<NSWindow>,
     search: Retained<NSSearchField>,
     status: Retained<NSTextField>,
+    sidebar: Retained<NSOutlineView>,
+    sidebar_source: Retained<SidebarSource>,
     table: Retained<NSTableView>,
+    detail: Retained<NSStackView>,
 }
 
 struct FirstRunWindow {
@@ -122,6 +144,8 @@ struct SettingsWindow {
     verbose_logging: Retained<NSButton>,
     verbose_logging_note: Retained<NSTextField>,
     hidden: Retained<NSButton>,
+    thresholds: Retained<NSTextField>,
+    reset_notification: Retained<NSButton>,
 }
 
 define_class!(
@@ -158,6 +182,33 @@ define_class!(
                 .ok()
                 .and_then(|row| rows.get(row))
                 .map(|row| session_row_view(self.mtm(), row))
+        }
+
+        /// A row was selected (or none): the detail pane follows.
+        #[unsafe(method(tableViewSelectionDidChange:))]
+        fn selection_did_change(&self, notification: &NSNotification) {
+            if self.ivars().rendering.get() {
+                return;
+            }
+            let Some(table) = notification
+                .object()
+                .and_then(|object| object.downcast::<NSTableView>().ok())
+            else {
+                return;
+            };
+            let id = usize::try_from(table.selectedRow())
+                .ok()
+                .and_then(|row| self.ivars().session_rows.borrow().get(row).map(|r| r.id.clone()));
+            self.send(Command::SelectSession(id));
+        }
+    }
+
+    unsafe impl NSWindowDelegate for Ui {
+        /// Only the All Sessions window has this delegate: closing it stops
+        /// the watch.
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            self.send(Command::CloseAllSessions);
         }
     }
 
@@ -258,6 +309,25 @@ define_class!(
             self.send(Command::SyncSidebarNow);
         }
 
+        /// The thresholds field was committed: whole percents separated by
+        /// commas or spaces ("80, 95").
+        #[unsafe(method(thresholdsChanged:))]
+        fn thresholds_changed(&self, sender: &NSTextField) {
+            let text = sender.stringValue().to_string();
+            let values = text
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            self.send(Command::SetThresholds(values));
+        }
+
+        #[unsafe(method(resetNotificationClicked:))]
+        fn reset_notification_clicked(&self, sender: &NSButton) {
+            self.send(Command::SetResetNotification(
+                sender.state() == NSControlStateValueOn,
+            ));
+        }
+
         #[unsafe(method(cliSwitchingClicked:))]
         fn cli_switching_clicked(&self, sender: &NSButton) {
             self.send(Command::SetCliSwitching(sender.state() == NSControlStateValueOn));
@@ -342,6 +412,9 @@ impl Ui {
             hidden: RefCell::new(Vec::new()),
             all_sessions: OnceCell::new(),
             session_rows: RefCell::new(Vec::new()),
+            session_detail: RefCell::new(None),
+            rendering: Cell::new(false),
+            watch: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -490,11 +563,33 @@ impl Ui {
     /// Refreshes the All Sessions list. The search field is the user's; it is
     /// only filled from the view while it isn't being edited.
     fn render_all_sessions(&self, window: &AllSessionsWindow, view: &AllSessionsView) {
+        self.ivars().rendering.set(true);
+        window
+            .sidebar_source
+            .render(&window.sidebar, &view.sidebar, &view.filter);
         let changed = *self.ivars().session_rows.borrow() != view.rows;
         if changed {
             *self.ivars().session_rows.borrow_mut() = view.rows.clone();
             window.table.reloadData();
+            // Keep the selection on the same Session as rows come and go.
+            let selected = view
+                .detail
+                .as_ref()
+                .and_then(|detail| view.rows.iter().position(|row| row.id == detail.id));
+            match selected {
+                Some(row) => window.table.selectRowIndexes_byExtendingSelection(
+                    &NSIndexSet::indexSetWithIndex(row),
+                    false,
+                ),
+                // SAFETY: plain deselection of our own table on the main thread.
+                None => unsafe { window.table.deselectAll(None) },
+            }
         }
+        if *self.ivars().session_detail.borrow() != view.detail {
+            *self.ivars().session_detail.borrow_mut() = view.detail.clone();
+            render_session_detail(self.mtm(), &window.detail, view.detail.as_ref());
+        }
+        self.ivars().rendering.set(false);
         let count = view.rows.len();
         let status = match (view.loading, count) {
             (true, _) => format!("Indexing Sessions… {count}"),
@@ -691,6 +786,22 @@ impl Ui {
                 window.window.makeKeyAndOrderFront(None);
                 app.activate();
             }
+            Effect::WatchSessionFiles(folders) => {
+                let Some(core) = self.ivars().core.get().cloned() else {
+                    return;
+                };
+                // A folder that can't be watched is left to the menu-open
+                // rescan; the UI has no log of its own.
+                let watch = FolderWatch::start(&folders, watcher::DEBOUNCE, move |paths| {
+                    core.event(Event::SessionFilesChanged(paths))
+                })
+                .ok()
+                .map(|(watch, _skipped)| watch);
+                *self.ivars().watch.borrow_mut() = watch;
+            }
+            Effect::StopWatchingSessionFiles => {
+                self.ivars().watch.borrow_mut().take();
+            }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
             },
@@ -702,7 +813,13 @@ impl Ui {
                 });
             }
             Effect::BringDesktopAppForward => bring_desktop_app_forward(),
-            Effect::Notify { title, body } => notify(&title, &body),
+            Effect::Notify { title, body } => notifications::post(&title, &body, None),
+            Effect::NotifyWithAction {
+                title,
+                body,
+                action,
+                command,
+            } => notifications::post(&title, &body, Some((&action, command))),
             Effect::Terminate => app.terminate(None),
             Effect::AskNickname {
                 name,
@@ -799,11 +916,13 @@ impl Ui {
         }
     }
 
-    /// A resizable window: a status line and the search field on top, the
-    /// Session table below.
+    /// A resizable three-pane window under a status line and the search
+    /// field: the sidebar (`NSOutlineView`), the Session table, the detail
+    /// pane.
     fn make_all_sessions_window(&self) -> AllSessionsWindow {
         let mtm = self.mtm();
-        let (width, height) = (560.0, 620.0);
+        let (width, height) = (1040.0, 600.0);
+        let (sidebar_width, detail_width, top) = (200.0, 320.0, 50.0);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -819,7 +938,8 @@ impl Ui {
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("All Sessions"));
-        window.setMinSize(NSSize::new(360.0, 240.0));
+        window.setMinSize(NSSize::new(760.0, 320.0));
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
         let content = window.contentView().expect("a window has a content view");
 
         let status = NSTextField::labelWithString(ns_string!(""), mtm);
@@ -849,11 +969,41 @@ impl Ui {
         }
         content.addSubview(&search);
 
-        let list_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height - 50.0));
+        // Sidebar.
+        let sidebar_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(sidebar_width, height - top),
+        );
+        let sidebar = NSOutlineView::initWithFrame(NSOutlineView::alloc(mtm), sidebar_frame);
+        let column =
+            NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("sidebar"));
+        column.setWidth(sidebar_width);
+        sidebar.addTableColumn(&column);
+        // SAFETY: the column was just added to this outline view.
+        unsafe { sidebar.setOutlineTableColumn(Some(&column)) };
+        sidebar.setHeaderView(None);
+        sidebar.setStyle(NSTableViewStyle::SourceList);
+        sidebar.setRowHeight(22.0);
+        let sidebar_source = SidebarSource::new(mtm);
+        unsafe {
+            sidebar.setDataSource(Some(ProtocolObject::from_ref(&*sidebar_source)));
+            sidebar.setDelegate(Some(ProtocolObject::from_ref(&*sidebar_source)));
+        }
+        let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), sidebar_frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setDocumentView(Some(&sidebar));
+        scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+        content.addSubview(&scroll);
+
+        // Session list.
+        let list_frame = NSRect::new(
+            NSPoint::new(sidebar_width, 0.0),
+            NSSize::new(width - sidebar_width - detail_width, height - top),
+        );
         let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), list_frame);
         let column =
             NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("session"));
-        column.setWidth(width);
+        column.setWidth(list_frame.size.width);
         table.addTableColumn(&column);
         table.setHeaderView(None);
         table.setStyle(NSTableViewStyle::FullWidth);
@@ -872,11 +1022,46 @@ impl Ui {
         content.addSubview(&scroll);
         table.sizeLastColumnToFit();
 
+        // Detail pane: a top-aligned stack, refilled on every change.
+        let detail = stack(mtm, true, 8.0, &[]);
+        detail.setEdgeInsets(NSEdgeInsets {
+            top: 12.0,
+            left: 14.0,
+            bottom: 12.0,
+            right: 14.0,
+        });
+        let detail_frame = NSRect::new(
+            NSPoint::new(width - detail_width, 0.0),
+            NSSize::new(detail_width, height - top),
+        );
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), detail_frame);
+        holder.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        holder.addSubview(&detail);
+        detail.setTranslatesAutoresizingMaskIntoConstraints(false);
+        for (a, b) in [
+            (detail.leadingAnchor(), holder.leadingAnchor()),
+            (detail.trailingAnchor(), holder.trailingAnchor()),
+        ] {
+            a.constraintEqualToAnchor(&b).setActive(true);
+        }
+        detail
+            .topAnchor()
+            .constraintEqualToAnchor(&holder.topAnchor())
+            .setActive(true);
+        content.addSubview(&holder);
+        render_session_detail(mtm, &detail, None);
+
         AllSessionsWindow {
             window,
             search,
             status,
+            sidebar,
+            sidebar_source,
             table,
+            detail,
         }
     }
 
@@ -1023,7 +1208,7 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 420.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 488.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1046,7 +1231,7 @@ impl Ui {
                 mtm,
             )
         };
-        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 386.0));
+        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 456.0));
         content.addSubview(&sidebar_sync);
 
         let sync_now = unsafe {
@@ -1057,7 +1242,7 @@ impl Ui {
                 mtm,
             )
         };
-        sync_now.setFrameOrigin(NSPoint::new(34.0, 352.0));
+        sync_now.setFrameOrigin(NSPoint::new(34.0, 422.0));
         content.addSubview(&sync_now);
 
         let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
@@ -1065,10 +1250,37 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         sidebar_sync_note.setFrame(NSRect::new(
-            NSPoint::new(140.0, 340.0),
+            NSPoint::new(140.0, 410.0),
             NSSize::new(260.0, 44.0),
         ));
         content.addSubview(&sidebar_sync_note);
+
+        let thresholds_label =
+            NSTextField::labelWithString(ns_string!("Notify when a limit reaches (%):"), mtm);
+        thresholds_label.setFrameOrigin(NSPoint::new(20.0, 370.0));
+        thresholds_label.sizeToFit();
+        content.addSubview(&thresholds_label);
+        let thresholds = NSTextField::textFieldWithString(ns_string!(""), mtm);
+        thresholds.setFrame(NSRect::new(
+            NSPoint::new(240.0, 367.0),
+            NSSize::new(80.0, 22.0),
+        ));
+        unsafe {
+            thresholds.setTarget(Some(self));
+            thresholds.setAction(Some(sel!(thresholdsChanged:)));
+        }
+        content.addSubview(&thresholds);
+
+        let reset_notification = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Also notify when a limit that warned resets"),
+                Some(self),
+                Some(sel!(resetNotificationClicked:)),
+                mtm,
+            )
+        };
+        reset_notification.setFrameOrigin(NSPoint::new(20.0, 338.0));
+        content.addSubview(&reset_notification);
 
         let cli_switching = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -1168,7 +1380,289 @@ impl Ui {
             verbose_logging,
             verbose_logging_note,
             hidden,
+            thresholds,
+            reset_notification,
         }
+    }
+}
+
+/// One line of the All Sessions sidebar.
+enum SidebarLine {
+    Heading(String),
+    Item(String, SessionFilter),
+}
+
+pub struct SidebarIvars {
+    lines: RefCell<Vec<SidebarLine>>,
+    /// One item object per line: the outline view doesn't retain its items.
+    items: RefCell<Vec<Retained<NSNumber>>>,
+    /// The groups as last drawn.
+    shown: RefCell<Vec<SidebarGroup>>,
+}
+
+define_class!(
+    /// The All Sessions sidebar's data source and delegate: a flat list of
+    /// headings (group rows) and pickable items.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AccRosterSidebarSource"]
+    #[ivars = SidebarIvars]
+    struct SidebarSource;
+
+    unsafe impl NSObjectProtocol for SidebarSource {}
+
+    unsafe impl NSControlTextEditingDelegate for SidebarSource {}
+
+    unsafe impl NSOutlineViewDataSource for SidebarSource {
+        #[unsafe(method(outlineView:numberOfChildrenOfItem:))]
+        fn number_of_children(
+            &self,
+            _outline: &NSOutlineView,
+            item: Option<&AnyObject>,
+        ) -> NSInteger {
+            match item {
+                None => self.ivars().items.borrow().len() as NSInteger,
+                Some(_) => 0,
+            }
+        }
+
+        #[unsafe(method_id(outlineView:child:ofItem:))]
+        fn child(
+            &self,
+            _outline: &NSOutlineView,
+            index: NSInteger,
+            _item: Option<&AnyObject>,
+        ) -> Retained<AnyObject> {
+            let items = self.ivars().items.borrow();
+            let item = usize::try_from(index)
+                .ok()
+                .and_then(|index| items.get(index).cloned())
+                .unwrap_or_else(|| NSNumber::new_isize(-1));
+            item.into()
+        }
+
+        #[unsafe(method(outlineView:isItemExpandable:))]
+        fn is_expandable(&self, _outline: &NSOutlineView, _item: &AnyObject) -> bool {
+            false
+        }
+    }
+
+    unsafe impl NSOutlineViewDelegate for SidebarSource {
+        #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
+        fn view_for_item(
+            &self,
+            _outline: &NSOutlineView,
+            _column: Option<&NSTableColumn>,
+            item: &AnyObject,
+        ) -> Option<Retained<NSView>> {
+            self.line_view(item)
+        }
+
+        #[unsafe(method(outlineView:isGroupItem:))]
+        fn is_group(&self, _outline: &NSOutlineView, item: &AnyObject) -> bool {
+            self.is_heading(item)
+        }
+
+        #[unsafe(method(outlineView:shouldSelectItem:))]
+        fn should_select(&self, _outline: &NSOutlineView, item: &AnyObject) -> bool {
+            !self.is_heading(item)
+        }
+
+        /// An item was picked: the list shows its Sessions.
+        #[unsafe(method(outlineViewSelectionDidChange:))]
+        fn selection_did_change(&self, notification: &NSNotification) {
+            let picked = UI.with(|cell| {
+                let ui = cell.get()?;
+                if ui.ivars().rendering.get() {
+                    return None;
+                }
+                let outline = notification.object()?.downcast::<NSOutlineView>().ok()?;
+                let row = usize::try_from(outline.selectedRow()).ok()?;
+                match self.ivars().lines.borrow().get(row)? {
+                    SidebarLine::Item(_, filter) => Some((ui.clone(), filter.clone())),
+                    SidebarLine::Heading(_) => None,
+                }
+            });
+            if let Some((ui, filter)) = picked {
+                ui.send(Command::FilterSessions(filter));
+            }
+        }
+    }
+);
+
+impl SidebarSource {
+    fn new(mtm: MainThreadMarker) -> Retained<SidebarSource> {
+        let this = SidebarSource::alloc(mtm).set_ivars(SidebarIvars {
+            lines: RefCell::new(Vec::new()),
+            items: RefCell::new(Vec::new()),
+            shown: RefCell::new(Vec::new()),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn line_view(&self, item: &AnyObject) -> Option<Retained<NSView>> {
+        let mtm = MainThreadMarker::from(self);
+        let lines = self.ivars().lines.borrow();
+        let view = match lines.get(line_index(item)?)? {
+            SidebarLine::Heading(title) => {
+                label(mtm, title, NSFont::boldSystemFontOfSize(11.0), true)
+            }
+            SidebarLine::Item(title, _) => label(mtm, title, NSFont::systemFontOfSize(12.0), false),
+        };
+        view.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        Some(view.into_super().into_super())
+    }
+
+    fn is_heading(&self, item: &AnyObject) -> bool {
+        line_index(item).is_some_and(|index| {
+            matches!(
+                self.ivars().lines.borrow().get(index),
+                Some(SidebarLine::Heading(_))
+            )
+        })
+    }
+
+    /// Redraws the groups when they changed and selects `filter`'s item.
+    fn render(&self, outline: &NSOutlineView, groups: &[SidebarGroup], filter: &SessionFilter) {
+        if *self.ivars().shown.borrow() != groups {
+            *self.ivars().shown.borrow_mut() = groups.to_vec();
+            let mut lines = Vec::new();
+            for group in groups {
+                lines.extend(group.title.clone().map(SidebarLine::Heading));
+                lines.extend(
+                    group
+                        .items
+                        .iter()
+                        .map(|item| SidebarLine::Item(item.title.clone(), item.filter.clone())),
+                );
+            }
+            *self.ivars().items.borrow_mut() = (0..lines.len())
+                .map(|index| NSNumber::new_isize(index as isize))
+                .collect();
+            *self.ivars().lines.borrow_mut() = lines;
+            outline.reloadData();
+        }
+        let selected = self
+            .ivars()
+            .lines
+            .borrow()
+            .iter()
+            .position(|line| matches!(line, SidebarLine::Item(_, f) if f == filter));
+        if let Some(row) = selected
+            && usize::try_from(outline.selectedRow()).ok() != Some(row)
+        {
+            outline
+                .selectRowIndexes_byExtendingSelection(&NSIndexSet::indexSetWithIndex(row), false);
+        }
+    }
+}
+
+/// The sidebar line an outline item stands for.
+fn line_index(item: &AnyObject) -> Option<usize> {
+    let number = item.downcast_ref::<NSNumber>()?;
+    usize::try_from(number.as_isize()).ok()
+}
+
+/// Refills the detail pane: title, folder and branch, last client and age,
+/// turns, first prompt, the running state, one ✓/– line per Profile's
+/// Sidebar, and why nothing opens when the Transcript is gone.
+fn render_session_detail(
+    mtm: MainThreadMarker,
+    pane: &NSStackView,
+    detail: Option<&SessionDetail>,
+) {
+    const WIDTH: f64 = 290.0;
+    for view in pane.arrangedSubviews() {
+        view.removeFromSuperview();
+    }
+    let wrapping = |text: &str, font: Retained<NSFont>, color: Retained<NSColor>| {
+        let field = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+        field.setFont(Some(&font));
+        field.setTextColor(Some(&color));
+        field.setPreferredMaxLayoutWidth(WIDTH);
+        fixed_width(&field, WIDTH);
+        field
+    };
+    let Some(detail) = detail else {
+        pane.addArrangedSubview(&wrapping(
+            "Select a Session.",
+            NSFont::systemFontOfSize(13.0),
+            NSColor::secondaryLabelColor(),
+        ));
+        return;
+    };
+    let small = || NSFont::systemFontOfSize(11.0);
+    pane.addArrangedSubview(&wrapping(
+        &detail.title,
+        NSFont::systemFontOfSize(15.0),
+        if detail.deleted.is_some() {
+            NSColor::tertiaryLabelColor()
+        } else {
+            NSColor::labelColor()
+        },
+    ));
+    let place: Vec<&str> = [detail.folder.as_deref(), detail.branch.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut facts = vec![place.join("  ·  ")];
+    facts.push(match detail.turns {
+        Some(1) => format!("{}  ·  1 turn", detail.last_used),
+        Some(turns) => format!("{}  ·  {turns} turns", detail.last_used),
+        None => detail.last_used.clone(),
+    });
+    if let Some(prompt) = &detail.first_prompt {
+        let mut shown: String = prompt.chars().take(200).collect();
+        if prompt.chars().count() > 200 {
+            shown.push('…');
+        }
+        facts.push(format!("First prompt: “{shown}”"));
+    }
+    facts.retain(|line| !line.is_empty());
+    pane.addArrangedSubview(&wrapping(
+        &facts.join("\n"),
+        small(),
+        NSColor::secondaryLabelColor(),
+    ));
+    match detail.dot {
+        Some(RunningDot::Terminal) => pane.addArrangedSubview(&wrapping(
+            "● Running in Terminal now",
+            NSFont::boldSystemFontOfSize(11.0),
+            NSColor::systemGreenColor(),
+        )),
+        Some(RunningDot::Desktop) => pane.addArrangedSubview(&wrapping(
+            "● A desktop turn is running now",
+            NSFont::boldSystemFontOfSize(11.0),
+            NSColor::systemOrangeColor(),
+        )),
+        None => {}
+    }
+    pane.addArrangedSubview(&wrapping(
+        "Sidebar entries",
+        NSFont::boldSystemFontOfSize(11.0),
+        NSColor::secondaryLabelColor(),
+    ));
+    for sidebar in &detail.sidebars {
+        let mut line = format!(
+            "{}  {}",
+            if sidebar.has_entry { "✓" } else { "–" },
+            sidebar.profile
+        );
+        if sidebar.archived {
+            line.push_str("  (archived)");
+        }
+        if sidebar.desktop_now {
+            line.push_str("  (desktop now)");
+        }
+        let color = if sidebar.has_entry {
+            NSColor::labelColor()
+        } else {
+            NSColor::tertiaryLabelColor()
+        };
+        pane.addArrangedSubview(&wrapping(&line, small(), color));
+    }
+    if let Some(why) = &detail.deleted {
+        pane.addArrangedSubview(&wrapping(why, small(), NSColor::systemOrangeColor()));
     }
 }
 
@@ -1259,6 +1753,8 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     let badges: Vec<Retained<NSTextField>> = row
         .badges
         .iter()
+        .map(String::as_str)
+        .chain(row.most_headroom.then_some("Most headroom"))
         .map(|badge| label(mtm, badge, NSFont::boldSystemFontOfSize(9.0), true))
         .collect();
     let filler = NSView::new(mtm);
@@ -1325,52 +1821,6 @@ fn bring_desktop_app_forward() {
     workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
 }
 
-#[link(name = "UserNotifications", kind = "framework")]
-unsafe extern "C" {}
-
-/// Posts a notification through `UNUserNotificationCenter`, asking for
-/// permission the first time. Only a bundled app may use it (outside a bundle
-/// the center throws), so an unbundled run skips notifications.
-fn notify(title: &str, body: &str) {
-    use block2::RcBlock;
-    use objc2::runtime::{AnyClass, Bool};
-    use objc2_foundation::{NSBundle, NSUUID};
-    if NSBundle::mainBundle().bundleIdentifier().is_none() {
-        return;
-    }
-    let (Some(center_class), Some(content_class), Some(request_class)) = (
-        AnyClass::get(c"UNUserNotificationCenter"),
-        AnyClass::get(c"UNMutableNotificationContent"),
-        AnyClass::get(c"UNNotificationRequest"),
-    ) else {
-        return;
-    };
-    // SAFETY: documented UserNotifications selectors with their documented
-    // argument types; nil completion handlers are allowed.
-    unsafe {
-        let center: Retained<AnyObject> = msg_send![center_class, currentNotificationCenter];
-        // UNAuthorizationOptionSound | UNAuthorizationOptionAlert.
-        let options: usize = (1 << 1) | (1 << 2);
-        let asked = RcBlock::new(|_granted: Bool, _error: *mut AnyObject| {});
-        let _: () = msg_send![&center, requestAuthorizationWithOptions: options, completionHandler: &*asked];
-        let content: Retained<AnyObject> = msg_send![content_class, new];
-        let _: () = msg_send![&content, setTitle: &*NSString::from_str(title)];
-        let _: () = msg_send![&content, setBody: &*NSString::from_str(body)];
-        let id = NSUUID::UUID().UUIDString();
-        let request: Retained<AnyObject> = msg_send![
-            request_class,
-            requestWithIdentifier: &*id,
-            content: &*content,
-            trigger: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![
-            &center,
-            addNotificationRequest: &*request,
-            withCompletionHandler: std::ptr::null::<AnyObject>()
-        ];
-    }
-}
-
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
 /// Unknown Login line.
 fn discovered_row_content(mtm: MainThreadMarker, row: &DiscoveredRow) -> Retained<NSView> {
@@ -1431,6 +1881,9 @@ fn session_row_view(mtm: MainThreadMarker, row: &SessionRow) -> Retained<NSView>
         None => NSColor::clearColor(),
     }));
     let title = label(mtm, &row.title, NSFont::systemFontOfSize(13.0), false);
+    if row.deleted {
+        title.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    }
     let subtitle = label(mtm, &row.subtitle, NSFont::systemFontOfSize(11.0), true);
     for line in [&title, &subtitle] {
         line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
@@ -1560,6 +2013,25 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
     settings
         .sidebar_sync_note
         .setStringValue(&NSString::from_str(&sync_text));
+    let notifications = &view.notifications;
+    let thresholds: Vec<String> = notifications
+        .thresholds
+        .iter()
+        .map(u32::to_string)
+        .collect();
+    // Leave the field alone while the user is typing in it.
+    if settings.thresholds.currentEditor().is_none() {
+        settings
+            .thresholds
+            .setStringValue(&NSString::from_str(&thresholds.join(", ")));
+    }
+    settings
+        .reset_notification
+        .setState(if notifications.reset_notification {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
     let cli = &view.cli_switching;
     settings.cli_switching.setState(if cli.on {
         NSControlStateValueOn

@@ -7,7 +7,10 @@ mod common;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use accroster_core::{Command, Core, Effect, Event, RunningDot, SessionRow};
+use accroster_core::{
+    Command, Core, DiscoveredPair, Effect, Event, RunningDot, SessionDetail, SessionFilter,
+    SessionRow, SidebarPresence,
+};
 use accroster_fake_mac::{FakeMac, FixtureLogin};
 use common::*;
 use serde_json::{Value, json};
@@ -17,10 +20,8 @@ const PROJECT: &str = "-Users-tester-Dev-app";
 /// Opens All Sessions and lets the index finish, as the driver would by
 /// sending ticks.
 fn open(core: &mut Core) -> Vec<SessionRow> {
-    assert_eq!(
-        core.command(Command::OpenAllSessions),
-        vec![Effect::ShowAllSessions]
-    );
+    let effects = core.command(Command::OpenAllSessions);
+    assert!(effects.contains(&Effect::ShowAllSessions), "{effects:?}");
     finish(core)
 }
 
@@ -70,6 +71,7 @@ fn a_transcript_is_listed_with_its_first_prompt_project_and_age() {
             title: "“Fix the login bug”".into(),
             subtitle: "app · 5 min ago".into(),
             dot: None,
+            deleted: false,
         }]
     );
 }
@@ -259,15 +261,9 @@ fn an_earlier_transcript_left_by_clear_is_its_own_row() {
 }
 
 #[test]
-fn entries_and_live_processes_without_a_transcript_add_no_row() {
+fn a_live_process_without_a_transcript_adds_no_row() {
     let mac = FakeMac::new();
     transcript(&mac, S1, "only this", 5, &[]);
-    mac.write_sidebar_entry(
-        ACCOUNT_A,
-        ORG_A,
-        "x2",
-        &entry(S2, "No transcript", "user", 1),
-    );
     live(&mac, ".claude", 4242, S3, "cli", "busy");
     start(&mac, 4242);
     let mut core = mac.launch();
@@ -678,4 +674,520 @@ fn a_deleted_transcript_leaves_the_list() {
     fs::remove_file(gone).unwrap();
 
     assert_eq!(titles(&open(&mut core)), ["“kept”"]);
+}
+
+// ----- Archive and sidebar filters --------------------------------------------------
+
+fn archived(mut entry: Value) -> Value {
+    entry["isArchived"] = json!(true);
+    entry
+}
+
+fn pair(account: &str, org: &str) -> DiscoveredPair {
+    DiscoveredPair {
+        account_uuid: account.into(),
+        organization_uuid: org.into(),
+    }
+}
+
+fn ids(core: &Core) -> Vec<String> {
+    core.view()
+        .all_sessions
+        .rows
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
+}
+
+fn filter(core: &mut Core, filter: SessionFilter) -> Vec<String> {
+    core.command(Command::FilterSessions(filter.clone()));
+    assert_eq!(core.view().all_sessions.filter, filter);
+    ids(core)
+}
+
+#[test]
+fn a_session_leaves_all_sessions_only_when_every_entry_is_archived() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "archived in A only", 5, &[]);
+    transcript(&mac, S2, "archived everywhere", 6, &[]);
+    transcript(&mac, S3, "cli only", 7, &[]);
+    mac.write_sidebar_entry(
+        ACCOUNT_A,
+        ORG_A,
+        "x1",
+        &archived(entry(S1, "One", "user", 1)),
+    );
+    mac.write_sidebar_entry(ACCOUNT_B, ORG_B, "x1", &entry(S1, "One", "user", 1));
+    mac.write_sidebar_entry(
+        ACCOUNT_A,
+        ORG_A,
+        "x2",
+        &archived(entry(S2, "Two", "user", 1)),
+    );
+    mac.write_sidebar_entry(
+        ACCOUNT_B,
+        ORG_B,
+        "x2",
+        &archived(entry(S2, "Two", "user", 1)),
+    );
+    let mut core = mac.launch();
+    open(&mut core);
+
+    assert_eq!(ids(&core), [S1, S3]);
+    assert_eq!(
+        filter(&mut core, SessionFilter::Sidebar(pair(ACCOUNT_A, ORG_A))),
+        [S1, S2],
+        "a Profile's Sidebar lists its archived entries too"
+    );
+    let rows = core.view().all_sessions.rows;
+    assert_eq!(row(&rows, S2).subtitle, "app · 6 min ago · archived");
+    assert_eq!(
+        row(&rows, S1).subtitle,
+        "app · 5 min ago",
+        "not archived everywhere"
+    );
+}
+
+#[test]
+fn the_sidebar_filters_running_project_profile_and_cli_only() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "running cli", 5, &[]);
+    let mut web = prompt(S2, "website work", &mac_time(6));
+    web["cwd"] = json!("/Users/tester/Dev/website");
+    mac.write_transcript("-Users-tester-Dev-website", S2, &[web]);
+    transcript(&mac, S3, "in B", 7, &[]);
+    mac.write_sidebar_entry(ACCOUNT_B, ORG_B, "x3", &entry(S3, "In B", "user", 1));
+    live(&mac, ".claude", 4242, S1, "cli", "idle");
+    start(&mac, 4242);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    assert_eq!(filter(&mut core, SessionFilter::Running), [S1]);
+    assert_eq!(
+        filter(
+            &mut core,
+            SessionFilter::Project("/Users/tester/Dev/website".into())
+        ),
+        [S2]
+    );
+    assert_eq!(
+        filter(
+            &mut core,
+            SessionFilter::Project("/Users/tester/Dev/app".into())
+        ),
+        [S1, S3]
+    );
+    assert_eq!(
+        filter(&mut core, SessionFilter::Sidebar(pair(ACCOUNT_B, ORG_B))),
+        [S3]
+    );
+    assert_eq!(filter(&mut core, SessionFilter::CliOnly), [S1, S2]);
+    assert_eq!(filter(&mut core, SessionFilter::All), [S1, S2, S3]);
+}
+
+#[test]
+fn search_narrows_the_filtered_list() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "fix login", 5, &[]);
+    transcript(&mac, S2, "fix logout", 6, &[]);
+    mac.write_sidebar_entry(ACCOUNT_A, ORG_A, "x2", &entry(S2, "Logout", "auto", 1));
+    let mut core = mac.launch();
+    open(&mut core);
+
+    core.command(Command::SearchSessions("fix".into()));
+    assert_eq!(filter(&mut core, SessionFilter::CliOnly), [S1]);
+}
+
+#[test]
+fn the_sidebar_lists_projects_and_every_profiles_sidebar() {
+    let mac = FakeMac::new();
+    let perso = FixtureLogin::perso();
+    mac.write_json(format!("{PROFILES}/p1/.claude.json"), &perso.claude_json());
+    transcript(&mac, S1, "app", 5, &[]);
+    let mut web = prompt(S2, "website", &mac_time(6));
+    web["cwd"] = json!("/Users/tester/Dev/website");
+    mac.write_transcript("-Users-tester-Dev-website", S2, &[web]);
+    // Account B has entries on this Mac but no Profile in AccRoster.
+    mac.write_sidebar_entry(ACCOUNT_B, ORG_B, "x1", &entry(S1, "Title", "user", 1));
+    let mut core = mac.launch();
+    open(&mut core);
+
+    let sidebar = core.view().all_sessions.sidebar;
+    type Items<'a> = Vec<(&'a str, &'a SessionFilter)>;
+    let groups: Vec<(Option<&str>, Items)> = sidebar
+        .iter()
+        .map(|group| {
+            (
+                group.title.as_deref(),
+                group
+                    .items
+                    .iter()
+                    .map(|item| (item.title.as_str(), &item.filter))
+                    .collect(),
+            )
+        })
+        .collect();
+    let perso_pair = pair(&perso.account_uuid, &perso.organization_uuid);
+    assert_eq!(
+        groups,
+        [
+            (
+                None,
+                vec![
+                    ("All Sessions", &SessionFilter::All),
+                    ("Running", &SessionFilter::Running),
+                ]
+            ),
+            (
+                Some("Projects"),
+                vec![
+                    (
+                        "app",
+                        &SessionFilter::Project("/Users/tester/Dev/app".into())
+                    ),
+                    (
+                        "website",
+                        &SessionFilter::Project("/Users/tester/Dev/website".into())
+                    ),
+                ]
+            ),
+            (
+                Some("Sidebars"),
+                vec![
+                    (
+                        "me@example.com · me@example.com's Organization",
+                        &SessionFilter::Sidebar(perso_pair)
+                    ),
+                    (
+                        "Unknown Login (account bbbbbbbb) (not signed in)",
+                        &SessionFilter::Sidebar(pair(ACCOUNT_B, ORG_B))
+                    ),
+                    ("CLI only (no Sidebar entry)", &SessionFilter::CliOnly),
+                ]
+            ),
+        ]
+    );
+}
+
+// ----- Detail pane and deleted Transcripts -----------------------------------------
+
+fn select(core: &mut Core, id: &str) -> SessionDetail {
+    core.command(Command::SelectSession(Some(id.into())));
+    core.view()
+        .all_sessions
+        .detail
+        .unwrap_or_else(|| panic!("a detail pane for {id}"))
+}
+
+#[test]
+fn the_detail_pane_shows_where_a_session_lives() {
+    let mac = FakeMac::new();
+    let perso = FixtureLogin::perso();
+    mac.write_json(format!("{PROFILES}/p1/.claude.json"), &perso.claude_json());
+    let folder = mac.path("Dev/app").to_string_lossy().into_owned();
+    let mut first = prompt(S1, "Fix the login bug", &mac_time(30));
+    first["cwd"] = json!(folder);
+    let mut second = prompt(S1, "And add a test", &mac_time(20));
+    second["cwd"] = json!(folder);
+    // The branch and client shown are the last ones recorded.
+    second["gitBranch"] = json!("fix/login");
+    second["entrypoint"] = json!("claude-desktop");
+    let mut tool = prompt(S1, "tool output", &mac_time(20));
+    tool["toolUseResult"] = json!({});
+    mac.write_transcript(PROJECT, S1, &[first, tool, second]);
+    mac.write_sidebar_entry(
+        &perso.account_uuid,
+        &perso.organization_uuid,
+        "x1",
+        &archived(entry(S1, "Login fix", "user", 1)),
+    );
+    mac.write_sidebar_entry(ACCOUNT_B, ORG_B, "x9", &entry(S2, "Other", "user", 1));
+    desktop_signed_in_as(&mac, &perso.account_uuid);
+    let mut core = mac.launch();
+    open(&mut core);
+    // Archived everywhere it has an entry: listed under that Sidebar only.
+    let perso_sidebar = pair(&perso.account_uuid, &perso.organization_uuid);
+    assert_eq!(
+        filter(&mut core, SessionFilter::Sidebar(perso_sidebar)),
+        [S1]
+    );
+
+    assert_eq!(
+        select(&mut core, S1),
+        SessionDetail {
+            id: S1.into(),
+            title: "Login fix".into(),
+            folder: Some("~/Dev/app".into()),
+            branch: Some("fix/login".into()),
+            last_used: "Last used in Claude desktop, 20 min ago".into(),
+            turns: Some(2),
+            first_prompt: Some("Fix the login bug".into()),
+            dot: None,
+            sidebars: vec![
+                SidebarPresence {
+                    profile: "me@example.com · me@example.com's Organization".into(),
+                    has_entry: true,
+                    archived: true,
+                    desktop_now: true,
+                },
+                SidebarPresence {
+                    profile: "Unknown Login (account bbbbbbbb) (not signed in)".into(),
+                    has_entry: false,
+                    archived: false,
+                    desktop_now: false,
+                },
+            ],
+            deleted: None,
+        }
+    );
+}
+
+#[test]
+fn an_entry_whose_transcript_is_gone_is_a_greyed_transcript_deleted_row() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "still here", 5, &[]);
+    // Last active three days ago; its Transcript was cleaned up since.
+    let three_days_ago = ONE_HOUR_AGO_MS + 3_600_000 - 3 * 24 * 3_600_000;
+    mac.write_sidebar_entry(
+        ACCOUNT_A,
+        ORG_A,
+        "x2",
+        &entry(S2, "Old migration plan", "user", three_days_ago),
+    );
+    let mut core = mac.launch();
+
+    let rows = open(&mut core);
+
+    assert_eq!(
+        row(&rows, S2),
+        &SessionRow {
+            id: S2.into(),
+            title: "Old migration plan".into(),
+            subtitle: "app · 3 days ago · transcript deleted".into(),
+            dot: None,
+            deleted: true,
+        }
+    );
+    assert!(!row(&rows, S1).deleted);
+    let detail = select(&mut core, S2);
+    assert_eq!(detail.turns, None);
+    assert_eq!(detail.first_prompt, None);
+    assert_eq!(detail.last_used, "Last active 3 days ago");
+    assert!(
+        detail
+            .deleted
+            .as_deref()
+            .is_some_and(|why| why.contains("Transcript was deleted")),
+        "{detail:?}"
+    );
+    assert!(detail.sidebars.iter().any(|sidebar| sidebar.has_entry));
+}
+
+#[test]
+fn the_detail_pane_follows_the_list() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "cli", 5, &[]);
+    transcript(&mac, S2, "in a sidebar", 6, &[]);
+    mac.write_sidebar_entry(ACCOUNT_A, ORG_A, "x2", &entry(S2, "Titled", "user", 1));
+    let mut core = mac.launch();
+    open(&mut core);
+    select(&mut core, S2);
+
+    filter(&mut core, SessionFilter::CliOnly);
+    assert_eq!(core.view().all_sessions.detail, None, "not in the list");
+
+    filter(&mut core, SessionFilter::All);
+    assert_eq!(
+        core.view().all_sessions.detail.map(|d| d.id),
+        Some(S2.into())
+    );
+    core.command(Command::SelectSession(None));
+    assert_eq!(core.view().all_sessions.detail, None);
+}
+
+// ----- Freshness -------------------------------------------------------------------
+
+fn transcript_path(mac: &FakeMac, id: &str) -> std::path::PathBuf {
+    mac.path(format!(".claude/projects/{PROJECT}/{id}.jsonl"))
+}
+
+fn append(path: &std::path::Path, record: Value) {
+    let mut body = fs::read_to_string(path).unwrap();
+    body.push_str(&format!("{record}\n"));
+    fs::write(path, body).unwrap();
+}
+
+fn title_record(id: &str, title: &str) -> Value {
+    json!({"type": "custom-title", "customTitle": title, "sessionId": id})
+}
+
+/// Rewrites a Transcript in place, keeping its size and mtime, so only a
+/// read of its bytes (not a stat) would notice.
+fn rewrite_unnoticed(path: &std::path::Path, from: &str, to: &str) {
+    assert_eq!(from.len(), to.len());
+    let mtime = fs::metadata(path).unwrap().modified().unwrap();
+    let body = fs::read_to_string(path).unwrap().replace(from, to);
+    fs::write(path, body).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+#[test]
+fn the_open_window_watches_claudes_folders_until_it_closes() {
+    let mac = FakeMac::new();
+    mac.with_claude_home(&FixtureLogin::perso());
+    mac.write_json(
+        format!("{PROFILES}/p1/.claude.json"),
+        &FixtureLogin::perso().claude_json(),
+    );
+    mac.write_file(format!("{PROFILES}/p1/sessions/.keep"), "");
+    mac.write_sidebar_entry(ACCOUNT_A, ORG_A, "x1", &entry(S1, "Title", "user", 1));
+    let mut core = mac.launch();
+
+    let watched = vec![
+        mac.path(".claude/projects"),
+        mac.path(".claude/sessions"),
+        mac.path(format!("{PROFILES}/p1/sessions")),
+        mac.path("Library/Application Support/Claude/claude-code-sessions"),
+    ];
+    assert_eq!(
+        core.command(Command::OpenAllSessions),
+        vec![
+            Effect::ShowAllSessions,
+            Effect::WatchSessionFiles(watched.clone())
+        ]
+    );
+    assert_eq!(
+        core.command(Command::OpenAllSessions),
+        vec![Effect::ShowAllSessions],
+        "already watching"
+    );
+    assert_eq!(
+        core.command(Command::CloseAllSessions),
+        vec![Effect::StopWatchingSessionFiles]
+    );
+    assert_eq!(
+        core.command(Command::OpenAllSessions),
+        vec![Effect::ShowAllSessions, Effect::WatchSessionFiles(watched)]
+    );
+}
+
+#[test]
+fn a_changed_transcript_is_reindexed_while_the_window_is_open() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "original", 5, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    let path = transcript_path(&mac, S1);
+    append(&path, title_record(S1, "Named while open"));
+    core.event(Event::SessionFilesChanged(vec![path]));
+
+    assert_eq!(titles(&finish(&mut core)), ["Named while open"]);
+}
+
+#[test]
+fn only_the_files_fsevents_named_are_reindexed() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "first", 5, &[]);
+    transcript(&mac, S2, "second", 6, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    let named = transcript_path(&mac, S1);
+    append(&named, title_record(S1, "Renamed"));
+    // Changed too, but not named by this batch of events.
+    append(&transcript_path(&mac, S2), title_record(S2, "Not yet"));
+    core.event(Event::SessionFilesChanged(vec![named]));
+
+    assert_eq!(titles(&finish(&mut core)), ["Renamed", "“second”"]);
+}
+
+#[test]
+fn new_transcripts_entries_and_processes_show_up_while_open() {
+    let mac = FakeMac::new();
+    mac.with_claude_home(&FixtureLogin::perso());
+    transcript(&mac, S1, "existing", 5, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    transcript(&mac, S2, "new one", 1, &[]);
+    let entry_path = mac.write_sidebar_entry(
+        ACCOUNT_A,
+        ORG_A,
+        "x1",
+        &entry(S1, "Named in desktop", "user", 1),
+    );
+    live(&mac, ".claude", 4242, S2, "cli", "busy");
+    start(&mac, 4242);
+    core.event(Event::SessionFilesChanged(vec![
+        transcript_path(&mac, S2),
+        entry_path,
+        mac.path(".claude/sessions/4242.json"),
+    ]));
+
+    let rows = finish(&mut core);
+    assert_eq!(titles(&rows), ["“new one”", "Named in desktop"]);
+    assert_eq!(row(&rows, S2).dot, Some(RunningDot::Terminal));
+}
+
+#[test]
+fn a_transcript_deleted_while_open_leaves_the_list() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "kept", 5, &[]);
+    transcript(&mac, S2, "gone", 6, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    let gone = transcript_path(&mac, S2);
+    fs::remove_file(&gone).unwrap();
+    core.event(Event::SessionFilesChanged(vec![gone]));
+
+    assert_eq!(titles(&finish(&mut core)), ["“kept”"]);
+}
+
+#[test]
+fn a_folder_event_restats_the_whole_folder() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "first", 5, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+
+    transcript(&mac, S2, "copied in", 1, &[]);
+    core.event(Event::SessionFilesChanged(vec![
+        mac.path(format!(".claude/projects/{PROJECT}")),
+    ]));
+
+    assert_eq!(titles(&finish(&mut core)), ["“copied in”", "“first”"]);
+}
+
+#[test]
+fn while_closed_nothing_is_watched_and_a_menu_open_rescans_by_stat() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "original", 5, &[]);
+    transcript(&mac, S2, "untouched", 6, &[]);
+    let mut core = mac.launch();
+    open(&mut core);
+    core.command(Command::CloseAllSessions);
+
+    let path = transcript_path(&mac, S1);
+    append(&path, title_record(S1, "Named while closed"));
+    rewrite_unnoticed(&transcript_path(&mac, S2), "untouched", "rewritten");
+    core.event(Event::SessionFilesChanged(vec![path]));
+    assert_eq!(
+        titles(&core.view().all_sessions.rows),
+        ["“original”", "“untouched”"],
+        "events after closing are ignored"
+    );
+
+    core.event(Event::MenuOpened);
+    assert_eq!(
+        titles(&finish(&mut core)),
+        ["Named while closed", "“untouched”"],
+        "only the file whose stat changed is read"
+    );
 }

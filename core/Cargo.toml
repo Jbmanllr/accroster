@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 jiff.workspace = true
 libc.workspace = true
+notify-debouncer-mini = "0.7.0"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
 objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 regex.workspace = true
@@ -21,3 +22,4 @@ serde_json.workspace = true
 [dev-dependencies]
 accroster-fake-mac.workspace = true
 jiff.workspace = true
+tempfile.workspace = true

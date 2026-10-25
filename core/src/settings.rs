@@ -1,7 +1,7 @@
 //! `settings.json`: the user's choices.
 //!
 //! Profile folders decide which Profiles exist; settings only add choices on
-//! top (Profile order, nicknames; later tickets add thresholds, …). Losing
+//! top (Profile order, nicknames, thresholds and mutes, …). Losing
 //! this file therefore costs at most those choices, never a Profile or a
 //! login.
 
@@ -41,6 +41,41 @@ pub(crate) struct Settings {
     /// Sidebar sync's mode; Off until chosen.
     #[serde(default)]
     pub sidebar_sync: SidebarSyncMode,
+    /// The global notification thresholds, in whole percent, lowest first.
+    #[serde(default)]
+    pub thresholds: Thresholds,
+    /// Notify when a limit that warned resets. Off by default.
+    #[serde(default)]
+    pub reset_notification: bool,
+    /// Profile ids whose limit notifications are muted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_profiles: Vec<String>,
+}
+
+/// Notification thresholds in whole percent (1–100), sorted, without
+/// repeats. Default 80% and 95%.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Thresholds(Vec<u32>);
+
+impl Thresholds {
+    /// Keeps the values in 1–100, sorted, without repeats.
+    pub fn new(mut values: Vec<u32>) -> Thresholds {
+        values.retain(|value| (1..=100).contains(value));
+        values.sort_unstable();
+        values.dedup();
+        Thresholds(values)
+    }
+
+    pub fn values(&self) -> &[u32] {
+        &self.0
+    }
+}
+
+impl Default for Thresholds {
+    fn default() -> Thresholds {
+        Thresholds(vec![80, 95])
+    }
 }
 
 /// The user's choices for one Discovered Profile.

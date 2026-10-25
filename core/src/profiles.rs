@@ -251,6 +251,7 @@ impl Profile {
             limits: bars,
             note,
             dimmed,
+            most_headroom: false,
             offers,
             submenu,
         }

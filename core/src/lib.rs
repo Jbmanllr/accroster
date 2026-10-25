@@ -17,6 +17,7 @@ pub mod interface;
 mod limit_offers;
 mod logging;
 mod monitor;
+mod notifications;
 mod profiles;
 mod runner;
 mod safety;
@@ -25,6 +26,7 @@ mod settings;
 mod sidebar_sync;
 mod storage;
 mod usage;
+pub mod watcher;
 
 pub use crate::core::{Core, LaunchError};
 pub use env::{
@@ -36,11 +38,14 @@ pub use interface::{
     AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
     SettingsView, View,
 };
-pub use interface::{AllSessionsView, RunningDot, SessionRow};
+pub use interface::{
+    AllSessionsView, RunningDot, SessionDetail, SessionFilter, SessionRow, SidebarGroup,
+    SidebarItem, SidebarPresence,
+};
 pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, NicknameTarget,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView,
 };
 pub use interface::{SidebarSyncMode, SidebarSyncView};
 pub use logging::install_panic_hook;
