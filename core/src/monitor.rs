@@ -87,6 +87,17 @@ pub(crate) struct LimitsView {
     pub plan: Option<String>,
 }
 
+/// The latest usage reads, as the format check sees them.
+#[derive(Debug, Default)]
+pub(crate) struct UsageSummary {
+    /// Profiles whose last read was understood.
+    pub read: usize,
+    /// Profiles whose last read gave no readable answer.
+    pub unreadable: usize,
+    /// Limit kinds this app doesn't know, as Claude Code named them.
+    pub new_kinds: Vec<String>,
+}
+
 /// One Profile's readings and schedule.
 #[derive(Debug, Default)]
 struct Watch {
@@ -296,6 +307,30 @@ impl LimitMonitor {
     }
 
     /// The line topping the menu while offline.
+    /// What the latest usage reads say about the usage format, for
+    /// Diagnostics.
+    pub(crate) fn usage_summary(&self) -> UsageSummary {
+        let mut summary = UsageSummary::default();
+        for watch in self.watches.values() {
+            if watch.unreadable {
+                summary.unreadable += 1;
+            } else if watch.reading.is_some() {
+                summary.read += 1;
+            }
+            let kinds = watch
+                .reading
+                .iter()
+                .flat_map(|reading| reading.limits.iter())
+                .flat_map(|limits| limits.other.iter().map(|(kind, _)| kind));
+            for kind in kinds {
+                if !summary.new_kinds.contains(kind) {
+                    summary.new_kinds.push(kind.clone());
+                }
+            }
+        }
+        summary
+    }
+
     pub(crate) fn offline_line(&self, ctx: &Context, watched: &[Watched]) -> Option<String> {
         if !self.offline {
             return None;

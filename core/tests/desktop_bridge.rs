@@ -411,8 +411,8 @@ fn the_desktop_profile_offers_no_switch_to_itself_and_no_claude_offers_none() {
 #[test]
 fn claude_versions_are_read_from_files_without_spawning() {
     let mac = FakeMac::new();
-    let core = mac.launch();
-    assert_eq!(core.view().versions, ClaudeVersions::default());
+    let mut core = mac.launch();
+    assert_eq!(core.view().diagnostics.versions, ClaudeVersions::default());
 
     mac.write_file(".local/share/claude/versions/2.1.310", "binary");
     std::fs::create_dir_all(mac.path(".local/bin")).unwrap();
@@ -435,8 +435,11 @@ fn claude_versions_are_read_from_files_without_spawning() {
     );
     mac.os.set_desktop_app_version(Some("3.6556.2"));
 
+    // Noticed when the menu opens.
+    core.event(Event::MenuOpened);
+
     assert_eq!(
-        core.view().versions,
+        core.view().diagnostics.versions,
         ClaudeVersions {
             claude_code: Some("2.1.310".into()),
             desktop_claude_code: vec!["2.1.304".into(), "2.1.308".into(), "2.1.1000".into()],

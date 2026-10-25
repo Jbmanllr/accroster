@@ -59,7 +59,7 @@ pub fn start(core: Core, on_update: impl Fn(Update) + Send + 'static) -> CoreHan
             let mut core = core;
             on_update(Update {
                 view: core.view(),
-                effects: Vec::new(),
+                effects: core.take_effects(),
             });
             let mut next_tick = Instant::now() + core.tick_interval();
             loop {

@@ -11,8 +11,8 @@ use accroster_core::driver::{self, CoreHandle, Update};
 
 use crate::notifications;
 use accroster_core::{
-    AllSessionsView, Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow,
-    RunningDot, SessionRow, SettingsView, View,
+    AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
+    LimitBar, MenuItem, ProfileRow, RunningDot, SessionRow, SettingsView, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -81,6 +81,9 @@ pub struct Ivars {
     /// The commands of the menu's clickable items (submenus included), by tag.
     actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
+    diagnostics: OnceCell<DiagnosticsWindow>,
+    /// The Diagnostics window's Resume buttons' commands, by tag.
+    resume_commands: RefCell<Vec<Command>>,
     /// The first-run offer, open while the view has one.
     first_run: RefCell<Option<FirstRunWindow>>,
     /// Whether the status item's menu is open. While it is, its tag table is
@@ -107,6 +110,13 @@ struct AllSessionsWindow {
 struct FirstRunWindow {
     window: Retained<NSWindow>,
     launch_at_login: Retained<NSButton>,
+}
+
+struct DiagnosticsWindow {
+    window: Retained<NSWindow>,
+    text: Retained<NSTextField>,
+    /// One Resume button per feature that can be paused, hidden when unused.
+    resume: Vec<Retained<NSButton>>,
 }
 
 struct SettingsWindow {
@@ -306,6 +316,21 @@ define_class!(
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
         }
+
+        #[unsafe(method(copyReportClicked:))]
+        fn copy_report_clicked(&self, _sender: &NSButton) {
+            self.send(Command::CopyDiagnosticsReport);
+        }
+
+        #[unsafe(method(resumeClicked:))]
+        fn resume_clicked(&self, sender: &NSButton) {
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().resume_commands.borrow().get(tag).cloned());
+            if let Some(command) = command {
+                self.send(command);
+            }
+        }
     }
 );
 
@@ -319,6 +344,8 @@ impl Ui {
             network: OnceCell::new(),
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
+            diagnostics: OnceCell::new(),
+            resume_commands: RefCell::new(Vec::new()),
             first_run: RefCell::new(None),
             menu_open: Cell::new(false),
             pending_menu: RefCell::new(None),
@@ -412,6 +439,9 @@ impl Ui {
             .collect();
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
+        }
+        if let Some(diagnostics) = self.ivars().diagnostics.get() {
+            self.render_diagnostics(diagnostics, &view.diagnostics);
         }
         if let Some(window) = self.ivars().all_sessions.get() {
             self.render_all_sessions(window, &view.all_sessions);
@@ -617,6 +647,16 @@ impl Ui {
                 render_settings(settings, &view.settings);
                 settings.window.center();
                 settings.window.makeKeyAndOrderFront(None);
+                app.activate();
+            }
+            Effect::ShowDiagnostics => {
+                let diagnostics = self
+                    .ivars()
+                    .diagnostics
+                    .get_or_init(|| self.make_diagnostics_window());
+                self.render_diagnostics(diagnostics, &view.diagnostics);
+                diagnostics.window.center();
+                diagnostics.window.makeKeyAndOrderFront(None);
                 app.activate();
             }
             Effect::ShowAbout => {
@@ -855,6 +895,147 @@ impl Ui {
             status,
             table,
         }
+    }
+
+    /// The Diagnostics window: the checks and versions as selectable text,
+    /// a Resume button per resumable pause, and Copy report.
+    fn make_diagnostics_window(&self) -> DiagnosticsWindow {
+        let mtm = self.mtm();
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("AccRoster Diagnostics"));
+        let content = window.contentView().expect("a window has a content view");
+
+        let text = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        text.setSelectable(true);
+        text.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        text.setFrame(NSRect::new(
+            NSPoint::new(20.0, 64.0),
+            NSSize::new(520.0, 360.0),
+        ));
+        content.addSubview(&text);
+
+        let copy = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Copy report"),
+                Some(self),
+                Some(sel!(copyReportClicked:)),
+                mtm,
+            )
+        };
+        copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
+        content.addSubview(&copy);
+
+        let resume = [180.0, 360.0]
+            .into_iter()
+            .map(|x| {
+                let button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!("Resume"),
+                        Some(self),
+                        Some(sel!(resumeClicked:)),
+                        mtm,
+                    )
+                };
+                button.setFrameOrigin(NSPoint::new(x, 20.0));
+                button.setHidden(true);
+                content.addSubview(&button);
+                button
+            })
+            .collect();
+
+        DiagnosticsWindow {
+            window,
+            text,
+            resume,
+        }
+    }
+
+    fn render_diagnostics(&self, diagnostics: &DiagnosticsWindow, view: &DiagnosticsView) {
+        let mut lines = Vec::new();
+        for paused in &view.paused {
+            let state = if paused.resume.is_some() {
+                "checks pass again: Resume when ready"
+            } else {
+                "waiting for the checks to pass"
+            };
+            lines.push(format!("{}: {} ({state})", paused.title, paused.reason));
+        }
+        if !view.paused.is_empty() {
+            lines.push(String::new());
+        }
+        let versions = &view.versions;
+        let unknown = || "unknown".to_owned();
+        lines.push(format!(
+            "Claude Code: {}",
+            versions.claude_code.clone().unwrap_or_else(unknown)
+        ));
+        lines.push(format!(
+            "Desktop's Claude Code: {}",
+            if versions.desktop_claude_code.is_empty() {
+                unknown()
+            } else {
+                versions.desktop_claude_code.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "Claude desktop app: {}",
+            versions.desktop.clone().unwrap_or_else(unknown)
+        ));
+        lines.push(String::new());
+        for check in &view.checks {
+            let mark = match check.status {
+                CheckStatus::Pass => "✓",
+                CheckStatus::Fail => "✗",
+                CheckStatus::NeverSeen => "–",
+            };
+            let status = match check.status {
+                CheckStatus::Pass => "pass",
+                CheckStatus::Fail => "fail",
+                CheckStatus::NeverSeen => "never seen",
+            };
+            match &check.detail {
+                Some(detail) => lines.push(format!("{mark} {} · {status} · {detail}", check.name)),
+                None => lines.push(format!("{mark} {} · {status}", check.name)),
+            }
+        }
+        diagnostics
+            .text
+            .setStringValue(&NSString::from_str(&lines.join("\n")));
+
+        let resumable: Vec<(String, Command)> = view
+            .paused
+            .iter()
+            .filter_map(|paused| {
+                let command = paused.resume.clone()?;
+                let feature = paused.title.trim_end_matches(" paused");
+                Some((format!("Resume {feature}"), command))
+            })
+            .collect();
+        for (index, button) in diagnostics.resume.iter().enumerate() {
+            match resumable.get(index) {
+                Some((title, _)) => {
+                    button.setTitle(&NSString::from_str(title));
+                    button.sizeToFit();
+                    button.setTag(index as isize);
+                    button.setHidden(false);
+                }
+                None => button.setHidden(true),
+            }
+        }
+        *self.ivars().resume_commands.borrow_mut() =
+            resumable.into_iter().map(|(_, command)| command).collect();
     }
 
     fn make_settings_window(&self) -> SettingsWindow {
