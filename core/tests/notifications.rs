@@ -116,6 +116,31 @@ fn each_threshold_fires_once_per_limit_per_window_even_across_relaunches() {
 }
 
 #[test]
+fn a_reset_time_that_jitters_between_reads_is_still_one_window() {
+    // Anthropic reports the same reset with sub-second differences on each
+    // read, sometimes either side of the minute.
+    let mac = mac_signing_in_as(&work(), body(85, "2026-10-25T16:40:00.349Z", 41));
+    then_reads(
+        &mac,
+        &[
+            body(86, "2026-10-25T16:39:59.782Z", 41),
+            body(87, "2026-10-25T16:39:59.548Z", 41),
+        ],
+    );
+    let mut core = mac.launch();
+    assert_eq!(titles(&add_profile(&mut core)).len(), 1);
+
+    assert_eq!(
+        titles(&after(&mac, &mut core, NEXT_READ)),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        titles(&after(&mac, &mut core, NEXT_READ)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn crossing_both_thresholds_at_once_notifies_once() {
     let mac = mac_signing_in_as(&work(), body(99, SESSION_RESETS, 41));
     then_reads(&mac, &[body(99, SESSION_RESETS, 41)]);

@@ -180,18 +180,17 @@ impl Notifier {
         if !choices.reset_notification {
             return Vec::new();
         }
-        let mut said: Vec<(&str, &str, Option<Timestamp>)> = Vec::new();
+        let mut said: Vec<&Fired> = Vec::new();
         let mut effects = Vec::new();
         for fired in &ended {
-            let key = (
-                fired.profile.as_str(),
-                fired.limit.as_str(),
-                fired.resets_at,
-            );
-            if said.contains(&key) {
+            if said.iter().any(|earlier| {
+                earlier.profile == fired.profile
+                    && earlier.limit == fired.limit
+                    && same_window(earlier.resets_at, fired.resets_at)
+            }) {
                 continue;
             }
-            said.push(key);
+            said.push(fired);
             let Some(subject) = subjects
                 .iter()
                 .find(|subject| subject.id == fired.profile && !subject.muted)
@@ -214,7 +213,7 @@ impl Notifier {
         self.fired.iter().any(|fired| {
             fired.profile == id
                 && fired.limit == label
-                && fired.resets_at == limit.resets_at
+                && same_window(fired.resets_at, limit.resets_at)
                 && fired.threshold == threshold
         })
     }
@@ -268,6 +267,16 @@ pub(crate) fn most_headroom<'a>(
 
 /// "Perso: Session limit 95% · resets 16:40", plus the most-headroom
 /// suggestion and Switch CLI for the CLI's Active Profile.
+/// Whether two readings' reset times name the same window. Claude Code
+/// reports one reset with sub-second differences from read to read, while
+/// real windows are hours apart, so a few minutes' slack keeps them one.
+fn same_window(a: Option<Timestamp>, b: Option<Timestamp>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.duration_since(b).abs() <= jiff::SignedDuration::from_mins(5),
+        (a, b) => a == b,
+    }
+}
+
 fn warning(
     ctx: &Context,
     subject: &Subject,
