@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::cli_switcher;
 use crate::env::{Clock, Environment, RunningProcess};
-use crate::interface::{Command, LimitBar, MenuItem, ProfileRow};
+use crate::interface::{Command, DiscoveredPair, LimitBar, MenuItem, ProfileRow};
 use crate::limit_offers;
 use crate::logging::{Field, Level, Logger};
 use crate::runner::Runner;
@@ -78,6 +78,10 @@ impl Identity {
 
     fn same_profile(&self, other: &Identity) -> bool {
         self.account_uuid == other.account_uuid && self.organization_uuid == other.organization_uuid
+    }
+
+    fn is(&self, pair: &DiscoveredPair) -> bool {
+        self.account_uuid == pair.account_uuid && self.organization_uuid == pair.organization_uuid
     }
 
     /// `email · Organization`.
@@ -198,12 +202,22 @@ fn capitalized(word: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The account a sign-in started from a Discovered Profile is meant to add.
+pub(crate) struct SignInTarget {
+    pub pair: DiscoveredPair,
+    /// Passed as `--email` when known.
+    pub email: Option<String>,
+    /// How the menu names it ("X" in "Signed in as Y, not X").
+    pub name: String,
+}
+
 /// A sign-in waiting for the user in the browser.
 struct SignIn {
     id: String,
     config_dir: PathBuf,
     process: Box<dyn RunningProcess>,
     started_at: Timestamp,
+    target: Option<SignInTarget>,
 }
 
 /// Every Profile, plus the sign-in in progress, if any.
@@ -313,8 +327,10 @@ impl ProfileRegistry {
     }
 
     /// Add Profile…: creates the folder, links it, seeds `.claude.json`, and
-    /// starts the browser sign-in. Ignored while a sign-in is running.
-    pub(crate) fn add(&mut self, ctx: &Context) {
+    /// starts the browser sign-in. Ignored while a sign-in is running. With a
+    /// `target` (a Discovered Profile), its email is passed to the sign-in and
+    /// the account that signs in is checked against its pair.
+    pub(crate) fn add(&mut self, ctx: &Context, target: Option<SignInTarget>) {
         if self.sign_in.is_some() {
             return;
         }
@@ -349,13 +365,15 @@ impl ProfileRegistry {
                 ],
             );
         }
-        match ctx.runner().start_sign_in(&config_dir, None) {
+        let email = target.as_ref().and_then(|target| target.email.as_deref());
+        match ctx.runner().start_sign_in(&config_dir, email) {
             Ok(process) => {
                 self.sign_in = Some(SignIn {
                     id,
                     config_dir,
                     process,
                     started_at: ctx.env.clock.now(),
+                    target,
                 })
             }
             Err(error) => {
@@ -450,6 +468,16 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
+    /// Whether a signed-in Profile has this (account, Organization) pair.
+    pub(crate) fn has_signed_in(&self, pair: &DiscoveredPair) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.is(pair))
+        })
+    }
+
     /// The folder of signed-in Profile `id`, verbatim.
     pub(crate) fn config_dir(&self, id: &str) -> Option<&Path> {
         self.profiles
@@ -478,7 +506,12 @@ impl ProfileRegistry {
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
     /// otherwise records the Profile and reads its limits.
     fn finish(&mut self, ctx: &Context, sign_in: SignIn) {
-        let SignIn { id, config_dir, .. } = sign_in;
+        let SignIn {
+            id,
+            config_dir,
+            target,
+            ..
+        } = sign_in;
         let Some(identity) = Identity::read(&config_dir) else {
             ctx.log(
                 Level::Warn,
@@ -526,6 +559,19 @@ impl ProfileRegistry {
                     identity.name()
                 ));
             }
+        }
+        if let Some(target) = target.filter(|target| !identity.is(&target.pair)) {
+            // Kept: it is a real Profile, just not the one asked for.
+            ctx.log(
+                Level::Info,
+                "sign-in matched another account",
+                &[("profile", Field::Profile(&id))],
+            );
+            self.notice = Some(format!(
+                "Signed in as {}, not {} · to add it, pick that account and Organization in the browser",
+                identity.name(),
+                target.name
+            ));
         }
         let reading = match ctx.runner().read_usage(&config_dir) {
             Some(reply) => Reading::Read(reply),

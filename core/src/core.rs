@@ -9,14 +9,16 @@ use jiff::SignedDuration;
 
 use crate::backups;
 use crate::cli_switcher::{self, TurnedOff};
+use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, CliSwitchingView, Command, Effect, Event, FirstRunView, LaunchAtLoginView,
-    MenuBarView, MenuItem, MenuView, SettingsView, View,
+    AboutView, CliSwitchingView, Command, DiscoveredPair, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
-use crate::profiles::{self, ProfileRegistry};
-use crate::settings::{self, Settings};
+use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
 
 /// The tagline, shown in About and the README.
@@ -72,6 +74,8 @@ pub struct Core {
     profiles: ProfileRegistry,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
+    /// Discovered pairs as of the last scan (launch, menu open).
+    discovered: Vec<Evidence>,
 }
 
 impl Core {
@@ -94,6 +98,7 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             cli_note: None,
+            discovered: Vec::new(),
         };
         core.log(
             Level::Info,
@@ -151,6 +156,7 @@ impl Core {
                 );
             }
         }
+        core.rescan_discovered();
         Ok(core)
     }
 
@@ -187,7 +193,48 @@ impl Core {
             Command::RevealLogs => vec![Effect::RevealInFinder(self.paths.app_log())],
             Command::AddProfile => {
                 let (profiles, ctx) = self.profiles();
-                profiles.add(&ctx);
+                profiles.add(&ctx, None);
+                Vec::new()
+            }
+            Command::SignInDiscovered(pair) => {
+                let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
+                    return Vec::new();
+                };
+                let target = SignInTarget {
+                    email: evidence.email().map(str::to_owned),
+                    name: evidence.known_name(),
+                    pair,
+                };
+                let (profiles, ctx) = self.profiles();
+                profiles.add(&ctx, Some(target));
+                Vec::new()
+            }
+            Command::HideDiscovered(pair) => {
+                self.update_choice(&pair, |choice| choice.hidden = true);
+                Vec::new()
+            }
+            Command::UnhideDiscovered(pair) => {
+                self.update_choice(&pair, |choice| choice.hidden = false);
+                Vec::new()
+            }
+            Command::Rename(NicknameTarget::Discovered(pair)) => {
+                let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
+                    return Vec::new();
+                };
+                vec![Effect::AskNickname {
+                    name: evidence.known_name(),
+                    current: self.choice(&pair).and_then(|c| c.nickname.clone()),
+                    target: NicknameTarget::Discovered(pair),
+                }]
+            }
+            Command::SetNickname {
+                target: NicknameTarget::Discovered(pair),
+                nickname,
+            } => {
+                let nickname = nickname
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty());
+                self.update_choice(&pair, |choice| choice.nickname = nickname);
                 Vec::new()
             }
             Command::CancelSignIn => {
@@ -228,6 +275,10 @@ impl Core {
                 profiles.poll(&ctx);
                 Vec::new()
             }
+            Event::MenuOpened => {
+                self.rescan_discovered();
+                Vec::new()
+            }
         }
     }
 
@@ -250,12 +301,22 @@ impl Core {
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        if !listed.is_empty() {
-            items.extend(
-                listed
-                    .into_iter()
-                    .map(|profile| MenuItem::Profile(profile.row)),
-            );
+        let shown = self.shown_discovered();
+        let tz = self.env.clock.time_zone();
+        let discovered_rows = shown
+            .iter()
+            .filter(|(_, choice)| !choice.is_some_and(|c| c.hidden))
+            .map(|(evidence, choice)| {
+                MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref()), &tz))
+            });
+        let before = items.len();
+        items.extend(
+            listed
+                .into_iter()
+                .map(|profile| MenuItem::Profile(profile.row)),
+        );
+        items.extend(discovered_rows);
+        if items.len() > before {
             items.push(MenuItem::Separator);
         }
         items.push(if self.profiles.signing_in() {
@@ -299,6 +360,14 @@ impl Core {
                     line: cli_switcher::path_line(&self.paths),
                     note: self.cli_note.clone(),
                 },
+                hidden_discovered: shown
+                    .iter()
+                    .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
+                    .map(|(evidence, choice)| HiddenDiscovered {
+                        title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                        restore: Command::UnhideDiscovered(evidence.pair.clone()),
+                    })
+                    .collect(),
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -314,6 +383,61 @@ impl Core {
                     launch_at_login: true,
                 }),
         }
+    }
+
+    /// Re-reads the Mac's evidence of Discovered Profiles. New pairs simply
+    /// appear and emptied ones disappear.
+    fn rescan_discovered(&mut self) {
+        let found = discovered::scan(&self.env.home);
+        if found.len() != self.discovered.len() {
+            self.log(
+                Level::Debug,
+                "discovered profiles",
+                &[("count", Field::Number(found.len() as i64))],
+            );
+        }
+        self.discovered = found;
+    }
+
+    /// Discovered pairs without a signed-in Profile, with the user's choices.
+    fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
+        self.discovered
+            .iter()
+            .filter(|evidence| !self.profiles.has_signed_in(&evidence.pair))
+            .map(|evidence| (evidence, self.choice(&evidence.pair)))
+            .collect()
+    }
+
+    fn choice(&self, pair: &DiscoveredPair) -> Option<&DiscoveredChoice> {
+        self.settings.discovered_profiles.iter().find(|choice| {
+            choice.account_uuid == pair.account_uuid
+                && choice.organization_uuid == pair.organization_uuid
+        })
+    }
+
+    /// Changes the saved choice for `pair` (creating it), dropping choices
+    /// that no longer say anything.
+    fn update_choice(&mut self, pair: &DiscoveredPair, change: impl FnOnce(&mut DiscoveredChoice)) {
+        let mut updated = self.settings.clone();
+        let choices = &mut updated.discovered_profiles;
+        let index = match choices.iter().position(|choice| {
+            choice.account_uuid == pair.account_uuid
+                && choice.organization_uuid == pair.organization_uuid
+        }) {
+            Some(index) => index,
+            None => {
+                choices.push(DiscoveredChoice {
+                    account_uuid: pair.account_uuid.clone(),
+                    organization_uuid: pair.organization_uuid.clone(),
+                    nickname: None,
+                    hidden: false,
+                });
+                choices.len() - 1
+            }
+        };
+        change(&mut choices[index]);
+        choices.retain(|choice| choice.hidden || choice.nickname.is_some());
+        self.save_settings(updated);
     }
 
     fn verbose_logging(&self) -> bool {

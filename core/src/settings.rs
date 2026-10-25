@@ -25,6 +25,22 @@ pub(crate) struct Settings {
     /// first-run offer is answered, so the offer is made once.
     #[serde(default)]
     pub launch_at_login: Option<bool>,
+    /// Nicknames and Hide choices for Discovered Profiles, by pair. Kept
+    /// while the pair is off the Mac, so a returning pair stays hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_profiles: Vec<DiscoveredChoice>,
+}
+
+/// The user's choices for one Discovered Profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiscoveredChoice {
+    pub account_uuid: String,
+    pub organization_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl VersionedFile for Settings {
