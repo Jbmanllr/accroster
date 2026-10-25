@@ -8,7 +8,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 
 use accroster_core::driver::{self, CoreHandle, Update};
 use accroster_core::{
-    Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
+    AllSessionsView, Command, Core, DiscoveredRow, Effect, Event, LimitBar, MenuItem, ProfileRow,
+    RunningDot, SessionRow, SettingsView, View,
 };
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
@@ -18,16 +19,18 @@ use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
-    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
-    NSControlStateValueOn, NSEvent, NSFont, NSFontWeightRegular, NSLayoutAttribute,
-    NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSResponder, NSStackView, NSStatusBar,
-    NSStatusItem, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize,
+    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont,
+    NSFontWeightRegular, NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator,
+    NSLevelIndicatorStyle, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar,
+    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength,
     NSView, NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSInteger, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString, NSURL, ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -70,6 +73,16 @@ pub struct Ivars {
     pending_menu: RefCell<Option<Vec<MenuItem>>>,
     /// Settings > Hidden (n)…: each entry's title and Restore command, by tag.
     hidden: RefCell<Vec<(String, Command)>>,
+    all_sessions: OnceCell<AllSessionsWindow>,
+    /// The rows the All Sessions table shows (its data source).
+    session_rows: RefCell<Vec<SessionRow>>,
+}
+
+struct AllSessionsWindow {
+    window: Retained<NSWindow>,
+    search: Retained<NSSearchField>,
+    status: Retained<NSTextField>,
+    table: Retained<NSTableView>,
 }
 
 struct FirstRunWindow {
@@ -97,6 +110,33 @@ define_class!(
     pub struct Ui;
 
     unsafe impl NSObjectProtocol for Ui {}
+
+    unsafe impl NSControlTextEditingDelegate for Ui {}
+
+    unsafe impl NSTableViewDataSource for Ui {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, _table: &NSTableView) -> NSInteger {
+            self.ivars().session_rows.borrow().len() as NSInteger
+        }
+    }
+
+    unsafe impl NSTableViewDelegate for Ui {
+        /// One two-line Session row: a running dot, the title, then
+        /// `project · last activity`.
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            _table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            let rows = self.ivars().session_rows.borrow();
+            usize::try_from(row)
+                .ok()
+                .and_then(|row| rows.get(row))
+                .map(|row| session_row_view(self.mtm(), row))
+        }
+    }
 
     unsafe impl NSMenuDelegate for Ui {
         /// The status item's menu is opening: the core rescans what the menu
@@ -197,6 +237,12 @@ define_class!(
             }
         }
 
+        /// The All Sessions search field changed.
+        #[unsafe(method(searchChanged:))]
+        fn search_changed(&self, sender: &NSSearchField) {
+            self.send(Command::SearchSessions(sender.stringValue().to_string()));
+        }
+
         #[unsafe(method(revealLogsClicked:))]
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
@@ -217,6 +263,8 @@ impl Ui {
             menu_open: Cell::new(false),
             pending_menu: RefCell::new(None),
             hidden: RefCell::new(Vec::new()),
+            all_sessions: OnceCell::new(),
+            session_rows: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -260,6 +308,9 @@ impl Ui {
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
         }
+        if let Some(window) = self.ivars().all_sessions.get() {
+            self.render_all_sessions(window, &view.all_sessions);
+        }
         self.render_first_run(view);
     }
 
@@ -279,6 +330,28 @@ impl Ui {
         let pending = self.ivars().pending_menu.borrow_mut().take();
         if let Some(items) = pending {
             self.set_menu(&items);
+        }
+    }
+
+    /// Refreshes the All Sessions list. The search field is the user's; it is
+    /// only filled from the view while it isn't being edited.
+    fn render_all_sessions(&self, window: &AllSessionsWindow, view: &AllSessionsView) {
+        let changed = *self.ivars().session_rows.borrow() != view.rows;
+        if changed {
+            *self.ivars().session_rows.borrow_mut() = view.rows.clone();
+            window.table.reloadData();
+        }
+        let count = view.rows.len();
+        let status = match (view.loading, count) {
+            (true, _) => format!("Indexing Sessions… {count}"),
+            (false, 1) => "1 Session".to_owned(),
+            (false, _) => format!("{count} Sessions"),
+        };
+        window.status.setStringValue(&NSString::from_str(&status));
+        if window.search.currentEditor().is_none() {
+            window
+                .search
+                .setStringValue(&NSString::from_str(&view.search));
         }
     }
 
@@ -437,6 +510,18 @@ impl Ui {
                     NSWorkspace::sharedWorkspace().openURL(&url);
                 }
             }
+            Effect::ShowAllSessions => {
+                let window = self
+                    .ivars()
+                    .all_sessions
+                    .get_or_init(|| self.make_all_sessions_window());
+                self.render_all_sessions(window, &view.all_sessions);
+                if !window.window.isVisible() {
+                    window.window.center();
+                }
+                window.window.makeKeyAndOrderFront(None);
+                app.activate();
+            }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
             },
@@ -542,6 +627,87 @@ impl Ui {
         FirstRunWindow {
             window,
             launch_at_login: checkbox,
+        }
+    }
+
+    /// A resizable window: a status line and the search field on top, the
+    /// Session table below.
+    fn make_all_sessions_window(&self) -> AllSessionsWindow {
+        let mtm = self.mtm();
+        let (width, height) = (560.0, 620.0);
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Resizable
+                    | NSWindowStyleMask::Miniaturizable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("All Sessions"));
+        window.setMinSize(NSSize::new(360.0, 240.0));
+        let content = window.contentView().expect("a window has a content view");
+
+        let status = NSTextField::labelWithString(ns_string!(""), mtm);
+        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        status.setFrame(NSRect::new(
+            NSPoint::new(16.0, height - 34.0),
+            NSSize::new(width - 280.0, 18.0),
+        ));
+        status.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        content.addSubview(&status);
+
+        let search = NSSearchField::new(mtm);
+        search.setFrame(NSRect::new(
+            NSPoint::new(width - 256.0, height - 38.0),
+            NSSize::new(240.0, 24.0),
+        ));
+        search.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        search.setPlaceholderString(Some(ns_string!("Title, prompt, project, branch")));
+        search.setSendsSearchStringImmediately(true);
+        unsafe {
+            search.setTarget(Some(self));
+            search.setAction(Some(sel!(searchChanged:)));
+        }
+        content.addSubview(&search);
+
+        let list_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height - 50.0));
+        let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), list_frame);
+        let column =
+            NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("session"));
+        column.setWidth(width);
+        table.addTableColumn(&column);
+        table.setHeaderView(None);
+        table.setStyle(NSTableViewStyle::FullWidth);
+        table.setRowHeight(40.0);
+        unsafe {
+            table.setDataSource(Some(ProtocolObject::from_ref(self)));
+            table.setDelegate(Some(ProtocolObject::from_ref(self)));
+        }
+        let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), list_frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setDocumentView(Some(&table));
+        scroll.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        content.addSubview(&scroll);
+        table.sizeLastColumnToFit();
+
+        AllSessionsWindow {
+            window,
+            search,
+            status,
+            table,
         }
     }
 
@@ -907,6 +1073,35 @@ fn ask_nickname(mtm: MainThreadMarker, name: &str, current: Option<&str>) -> Opt
 
 /// `Session ▓▓▓░░ 62%`: an `NSLevelIndicator`, continuous capacity, warning at
 /// 70 and critical at 90.
+/// An All Sessions row: the running dot (green for Terminal, orange for a
+/// desktop turn, invisible otherwise), the title, and the subtitle.
+fn session_row_view(mtm: MainThreadMarker, row: &SessionRow) -> Retained<NSView> {
+    let dot = label(mtm, "●", NSFont::systemFontOfSize(10.0), false);
+    dot.setTextColor(Some(&*match row.dot {
+        Some(RunningDot::Terminal) => NSColor::systemGreenColor(),
+        Some(RunningDot::Desktop) => NSColor::systemOrangeColor(),
+        None => NSColor::clearColor(),
+    }));
+    let title = label(mtm, &row.title, NSFont::systemFontOfSize(13.0), false);
+    let subtitle = label(mtm, &row.subtitle, NSFont::systemFontOfSize(11.0), true);
+    for line in [&title, &subtitle] {
+        line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        line.setContentCompressionResistancePriority_forOrientation(
+            1.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+    }
+    let lines = stack(mtm, true, 1.0, &[&title, &subtitle]);
+    let row = stack(mtm, false, 6.0, &[&dot, &lines]);
+    row.setEdgeInsets(NSEdgeInsets {
+        top: 0.0,
+        left: 8.0,
+        bottom: 0.0,
+        right: 8.0,
+    });
+    row.into_super()
+}
+
 fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
     let regular =
         || unsafe { NSFont::monospacedDigitSystemFontOfSize_weight(11.0, NSFontWeightRegular) };
