@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::SignedDuration;
@@ -28,6 +28,9 @@ pub const DISCLAIMER: &str = "AccRoster is an independent open-source project. I
 
 /// How long Verbose logging stays on once turned on.
 const VERBOSE_LOGGING_LASTS: SignedDuration = SignedDuration::from_hours(24);
+
+/// claude.ai Settings > Usage, where Banked resets can be checked by hand.
+const LIMIT_RESETS_URL: &str = "https://claude.ai/settings/usage";
 
 /// Why the core couldn't start. The UI shows it and quits.
 #[derive(Debug)]
@@ -203,15 +206,14 @@ impl Core {
             }
             Command::CopyShellOverride(id) => self
                 .profiles
-                .listed()
-                .into_iter()
-                .find(|profile| profile.id == id)
-                .map(|profile| {
+                .config_dir(&id)
+                .map(|config_dir| {
                     vec![Effect::CopyToClipboard(cli_switcher::shell_override(
-                        profile.config_dir,
+                        config_dir,
                     ))]
                 })
                 .unwrap_or_default(),
+            Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
         }
     }
 
@@ -239,7 +241,7 @@ impl Core {
             .chain(self.profiles.notice())
             .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
-        let mut listed = self.profiles.listed();
+        let mut listed = self.profiles.listed(self.env.clock.as_ref());
         let cli = cli_switcher::present(&self.paths, &mut listed);
         let header: Vec<String> = cli.header.into_iter().collect();
         if !header.is_empty() {
@@ -442,13 +444,7 @@ impl Core {
         if !cli_switcher::is_on(&self.paths) {
             return;
         }
-        let Some(config_dir) = self
-            .profiles
-            .listed()
-            .into_iter()
-            .find(|profile| profile.id == id)
-            .map(|profile| profile.config_dir.to_path_buf())
-        else {
+        let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
             return;
         };
         match cli_switcher::set_pointer(&self.paths, &config_dir) {
