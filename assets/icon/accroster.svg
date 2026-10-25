@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>AccRoster</title>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#2B2F6B"/>
+  <circle cx="265" cy="316" r="52" fill="#F2F3FF"/>
+  <rect x="368" y="285" width="433" height="62" rx="31" fill="#4A4F95"/>
+  <rect x="368" y="285" width="319" height="62" rx="31" fill="#3FC1B0"/>
+  <circle cx="265" cy="512" r="52" fill="#F2F3FF"/>
+  <rect x="368" y="481" width="433" height="62" rx="31" fill="#4A4F95"/>
+  <rect x="368" y="481" width="155" height="62" rx="31" fill="#3FC1B0"/>
+  <circle cx="265" cy="708" r="52" fill="#F2F3FF"/>
+  <rect x="368" y="677" width="433" height="62" rx="31" fill="#4A4F95"/>
+  <rect x="368" y="677" width="391" height="62" rx="31" fill="#F2C94C"/>
+</svg>
