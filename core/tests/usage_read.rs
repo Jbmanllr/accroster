@@ -84,7 +84,7 @@ fn without_a_limits_list_the_legacy_five_hour_and_seven_day_fields_are_read() {
     })));
 
     assert_eq!(
-        bars,
+        ignoring_reset_times(&bars),
         [bar("Session", 62), bar("Weekly", 41), bar("Opus", 12)]
     );
     assert_eq!(note, None);
@@ -102,7 +102,7 @@ fn every_field_is_optional() {
     })));
 
     assert_eq!(
-        bars,
+        ignoring_reset_times(&bars),
         [bar("Session", 30)],
         "entries missing what a bar needs are skipped"
     );
@@ -153,7 +153,10 @@ fn slash_usage_is_the_fallback_when_get_usage_is_unavailable() {
         },
     );
 
-    assert_eq!(bars, [bar("Session", 18), bar("Weekly", 77)]);
+    assert_eq!(
+        ignoring_reset_times(&bars),
+        [bar("Session", 18), bar("Weekly", 77)]
+    );
     assert_eq!(note, None);
     let call = mac
         .claude

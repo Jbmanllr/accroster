@@ -30,7 +30,7 @@ fn an_unknown_limit_kind_is_an_extra_bar_labelled_with_its_raw_kind() {
     }));
 
     assert_eq!(
-        row.limits,
+        ignoring_reset_times(&row.limits),
         [
             bar("Session", 62),
             bar("Weekly", 41),
@@ -45,7 +45,7 @@ fn a_known_kind_that_disappears_is_not_shown() {
         "limits": [ { "kind": "weekly_all", "percent": 41 } ],
     }));
 
-    assert_eq!(row.limits, [bar("Weekly", 41)]);
+    assert_eq!(ignoring_reset_times(&row.limits), [bar("Weekly", 41)]);
 }
 
 /// A usage body (Session 62%) carrying `extra` next to its limits. The fake
@@ -98,7 +98,11 @@ fn a_banked_reset_shows_its_count_soonest_expiry_and_the_limits_it_clears() {
         row.offers,
         ["3 Banked resets · clear Session, Weekly, Opus · soonest expires Nov 3"]
     );
-    assert_eq!(row.limits, [bar("Session", 62)], "bars are unaffected");
+    assert_eq!(
+        ignoring_reset_times(&row.limits),
+        [bar("Session", 62)],
+        "bars are unaffected"
+    );
 }
 
 #[test]
@@ -160,7 +164,7 @@ fn a_malformed_banked_reset_block_is_ignored() {
         let row = row_for(body_with(extra.clone()));
         assert_eq!(row.offers, Vec::<String>::new(), "{extra}");
         assert_eq!(
-            row.limits,
+            ignoring_reset_times(&row.limits),
             [bar("Session", 62)],
             "limits still read: {extra}"
         );
@@ -212,7 +216,7 @@ fn no_session_refill_line_when_null_ineligible_or_unreadable() {
         let row = row_for(body_with(extra.clone()));
         assert_eq!(row.offers, Vec::<String>::new(), "{extra}");
         assert_eq!(
-            row.limits,
+            ignoring_reset_times(&row.limits),
             [bar("Session", 62)],
             "limits still read: {extra}"
         );

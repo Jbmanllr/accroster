@@ -206,7 +206,18 @@ pub fn bar(label: &str, percent: u32) -> LimitBar {
         label: label.into(),
         percent,
         reset: false,
+        resets: None,
     }
+}
+
+/// `bars` without their reset times, for tests about the figures.
+pub fn ignoring_reset_times(bars: &[LimitBar]) -> Vec<LimitBar> {
+    bars.iter()
+        .map(|bar| LimitBar {
+            resets: None,
+            ..bar.clone()
+        })
+        .collect()
 }
 
 /// `claude auth login` finishing as `login`: writes its `oauthAccount`.

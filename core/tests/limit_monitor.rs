@@ -133,14 +133,14 @@ fn opening_the_menu_shows_the_last_reading_then_refreshes_it_in_place() {
     mac.clock.advance(SignedDuration::from_secs(1));
     core.event(Event::MenuOpened);
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [bar("Session", 62), bar("Weekly", 41)],
         "the menu opens on the last reading"
     );
     settle(&mut core);
     assert_eq!(usage_reads(&mac), 2);
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [bar("Session", 70), bar("Weekly", 43)]
     );
 }
@@ -250,7 +250,7 @@ fn a_reading_older_than_twice_its_cadence_is_dimmed_with_its_time() {
     assert!(row.dimmed);
     assert_eq!(row.note.as_deref(), Some("as of 14:02"));
     assert_eq!(
-        row.limits,
+        ignoring_reset_times(&row.limits),
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)],
         "the old figures stay"
     );
@@ -387,7 +387,10 @@ fn failed_fetches_back_off_from_5_minutes_doubling_to_an_hour() {
     at(&mac, &mut core, "14:17");
     assert_eq!(usage_reads(&mac), 2);
     let row = rows(&core).remove(0);
-    assert_eq!(row.limits, [bar("Session", 62), bar("Weekly", 41)]);
+    assert_eq!(
+        ignoring_reset_times(&row.limits),
+        [bar("Session", 62), bar("Weekly", 41)]
+    );
     assert_eq!(
         row.note.as_deref(),
         Some("Couldn't refresh · next try 14:22")
@@ -417,7 +420,10 @@ fn failed_fetches_back_off_from_5_minutes_doubling_to_an_hour() {
     at(&mac, &mut core, "17:32");
     assert_eq!(usage_reads(&mac), 8);
     let row = rows(&core).remove(0);
-    assert_eq!(row.limits, [bar("Session", 70), bar("Weekly", 43)]);
+    assert_eq!(
+        ignoring_reset_times(&row.limits),
+        [bar("Session", 70), bar("Weekly", 43)]
+    );
     assert_eq!(row.note, None);
     at(&mac, &mut core, "17:47");
     assert_eq!(usage_reads(&mac), 9);
@@ -491,7 +497,7 @@ fn a_fetch_that_fails_as_the_network_goes_away_does_not_count() {
     settle(&mut core);
     assert_eq!(usage_reads(&mac), 3);
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [bar("Session", 70), bar("Weekly", 43)]
     );
 }
@@ -510,7 +516,10 @@ fn an_unreadable_answer_keeps_the_dimmed_reading_and_does_not_back_off() {
 
     at(&mac, &mut core, "14:17");
     let row = rows(&core).remove(0);
-    assert_eq!(row.limits, [bar("Session", 62), bar("Weekly", 41)]);
+    assert_eq!(
+        ignoring_reset_times(&row.limits),
+        [bar("Session", 62), bar("Weekly", 41)]
+    );
     assert!(row.dimmed);
     assert_eq!(row.note.as_deref(), Some("Couldn't read limits"));
     assert!(
@@ -544,6 +553,7 @@ fn reset_bar(label: &str) -> accroster_core::LimitBar {
         label: label.into(),
         percent: 0,
         reset: true,
+        resets: None,
     }
 }
 
@@ -558,13 +568,13 @@ fn a_passed_reset_shows_reset_and_refreshes_at_once() {
 
     at(&mac, &mut core, "14:09");
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [bar("Session", 62), bar("Weekly", 41)]
     );
 
     at(&mac, &mut core, "14:10");
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [reset_bar("Session"), bar("Weekly", 41)]
     );
     assert_eq!(usage_reads(&mac), 1, "asleep: shown as reset, not read");
@@ -573,7 +583,7 @@ fn a_passed_reset_shows_reset_and_refreshes_at_once() {
     settle(&mut core);
     assert_eq!(usage_reads(&mac), 2);
     assert_eq!(
-        rows(&core)[0].limits,
+        ignoring_reset_times(&rows(&core)[0].limits),
         [bar("Session", 3), bar("Weekly", 42)]
     );
 }
@@ -653,12 +663,12 @@ fn the_menu_bar_figure_dims_with_the_clis_active_profiles_reading() {
 
     pass(&mac, &mut core, SignedDuration::from_mins(6));
     let menu_bar = core.view().menu_bar;
-    assert_eq!(menu_bar.label, "me 92%");
+    assert_eq!(menu_bar.label.as_deref(), Some("me 92%"));
     assert!(!menu_bar.dimmed);
 
     pass(&mac, &mut core, SignedDuration::from_secs(1));
     let menu_bar = core.view().menu_bar;
-    assert_eq!(menu_bar.label, "me 92%");
+    assert_eq!(menu_bar.label.as_deref(), Some("me 92%"));
     assert!(menu_bar.dimmed);
 }
 
@@ -705,7 +715,7 @@ fn an_expired_profile_is_no_longer_read_and_keeps_its_last_reading_dimmed() {
     assert_eq!(row.note.as_deref(), Some("Login expired"));
     assert!(row.dimmed);
     assert_eq!(
-        row.limits,
+        ignoring_reset_times(&row.limits),
         [bar("Session", 62), bar("Weekly", 41)],
         "the last reading stays"
     );
@@ -759,7 +769,10 @@ fn a_removed_profiles_backoff_doesnt_hold_back_the_login_added_again() {
     assert_eq!(usage_reads(&mac), reads + 1);
     let row = rows(&core).remove(0);
     assert_eq!(row.note, None, "no next try");
-    assert_eq!(row.limits, [bar("Session", 70), bar("Weekly", 43)]);
+    assert_eq!(
+        ignoring_reset_times(&row.limits),
+        [bar("Session", 70), bar("Weekly", 43)]
+    );
     drop(core);
     assert_eq!(rows(&mac.launch())[0].note, None, "nor after a relaunch");
 }
@@ -782,5 +795,49 @@ fn the_menu_bar_figure_counts_unknown_limit_kinds() {
     let use_it = rows(&core)[0].command.clone().expect("a row click");
     core.command(use_it);
 
-    assert_eq!(core.view().menu_bar.label, "me 97%");
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("me 97%"));
+}
+
+/// Each bar's reset time, as the menu says it.
+fn reset_times(core: &accroster_core::Core) -> Vec<Option<String>> {
+    rows(core)[0]
+        .limits
+        .iter()
+        .map(|bar| bar.resets.clone())
+        .collect()
+}
+
+#[test]
+fn the_session_bar_counts_down_to_its_reset_and_weekly_bars_name_the_day_and_time() {
+    let mac = mac_signing_in_as(
+        &work(),
+        serde_json::json!({
+            "limits": [
+                { "kind": "session", "percent": 62, "resets_at": "2026-10-25T15:42:00Z" },
+                { "kind": "weekly_all", "percent": 41, "resets_at": "2026-10-30T09:00:00Z" },
+                { "kind": "weekly_scoped", "percent": 92, "resets_at": "2026-10-25T23:00:00Z",
+                  "scope": { "model": { "display_name": "Fable" } } },
+                { "kind": "monthly_new", "percent": 5, "resets_at": "2026-11-12T00:00:00Z" },
+                { "kind": "daily_cowork", "percent": 5 },
+            ],
+        }),
+    );
+    let mut core = mac.launch();
+    add_profile(&mut core);
+
+    assert_eq!(
+        reset_times(&core),
+        [
+            Some("resets in 1 h 40 min".to_owned()),
+            Some("resets Fri 09:00".to_owned()),
+            Some("resets today 23:00".to_owned()),
+            Some("resets Nov 12 00:00".to_owned()),
+            None,
+        ]
+    );
+
+    at(&mac, &mut core, "15:02");
+    assert_eq!(reset_times(&core)[0].as_deref(), Some("resets in 40 min"));
+    at(&mac, &mut core, "15:42");
+    assert_eq!(reset_times(&core)[0], None, "passed: the bar says Reset");
 }

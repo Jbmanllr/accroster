@@ -26,7 +26,7 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].title, "me@work.example · Work Inc");
     assert_eq!(
-        rows[0].limits,
+        ignoring_reset_times(&rows[0].limits),
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
     assert_eq!(

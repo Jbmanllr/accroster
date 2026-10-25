@@ -408,8 +408,11 @@ impl LimitMonitor {
                 &ctx.env.clock.time_zone(),
             );
             if let Some(limits) = &reading.limits {
+                let tz = ctx.env.clock.time_zone();
+                let session = limits.session.as_ref();
                 view.bars.extend(limits.all().map(|(label, limit)| {
                     let reset = limit.resets_at.is_some_and(|at| at <= now);
+                    let countdown = session.is_some_and(|session| std::ptr::eq(session, limit));
                     LimitBar {
                         label: label.to_owned(),
                         percent: if reset {
@@ -418,6 +421,10 @@ impl LimitMonitor {
                             limit.percent.clamp(0.0, 100.0).floor() as u32
                         },
                         reset,
+                        resets: limit
+                            .resets_at
+                            .filter(|_| !reset)
+                            .map(|at| resets_text(at, now, &tz, countdown)),
                     }
                 }));
             }
@@ -663,6 +670,22 @@ fn cached_fetch_time(config_dir: &Path, account_uuid: &str) -> Option<Timestamp>
 }
 
 /// `14:02` in the Mac's time zone.
+/// When a limit resets, after its bar: a countdown for the Session limit
+/// ("resets in 1 h 40 min", minutes rounded up), else the day and time
+/// ("resets Thu 09:00", "resets today 23:00", "resets Nov 12 00:00").
+fn resets_text(at: Timestamp, now: Timestamp, tz: &jiff::tz::TimeZone, countdown: bool) -> String {
+    if countdown {
+        let minutes = (at.duration_since(now).as_secs() + 59) / 60;
+        return match (minutes / 60, minutes % 60) {
+            (0, minutes) => format!("resets in {minutes} min"),
+            (hours, 0) => format!("resets in {hours} h"),
+            (hours, minutes) => format!("resets in {hours} h {minutes} min"),
+        };
+    }
+    let time = at.to_zoned(tz.clone()).strftime("%H:%M").to_string();
+    format!("resets {} {time}", limit_offers::day(at, now, tz))
+}
+
 fn clock_time(ctx: &Context, at: Timestamp) -> String {
     at.to_zoned(ctx.env.clock.time_zone())
         .strftime("%H:%M")

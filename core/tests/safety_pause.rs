@@ -90,7 +90,7 @@ fn a_config_dir_in_the_shared_settings_env_pauses_cli_switching_on_menu_open() {
     let effects = core.event(Event::MenuOpened);
 
     let view = core.view();
-    assert_eq!(view.menu_bar.label, "?");
+    assert_eq!(view.menu_bar.label.as_deref(), Some("?"));
     assert_eq!(
         warnings(&core),
         ["settings.json sets CLAUDE_CONFIG_DIR · CLI switching paused"]
@@ -135,7 +135,7 @@ fn a_paused_feature_resumes_only_on_the_click_after_the_checks_pass() {
             is_paused(core, SafetyFeature::CliSwitching),
             "no auto-resume"
         );
-        assert_eq!(core.view().menu_bar.label, "?");
+        assert_eq!(core.view().menu_bar.label.as_deref(), Some("?"));
     }
     drop(core_relaunched);
     let resume = resume_button(&core, SafetyFeature::CliSwitching).expect("Resume offered");
@@ -146,7 +146,7 @@ fn a_paused_feature_resumes_only_on_the_click_after_the_checks_pass() {
 
     assert!(!is_paused(&core, SafetyFeature::CliSwitching));
     assert!(warnings(&core).is_empty());
-    assert_ne!(core.view().menu_bar.label, "?");
+    assert_ne!(core.view().menu_bar.label.as_deref(), Some("?"));
     click_row(&mut core, 1);
     assert!(
         mac.read_file(POINTER)
@@ -175,7 +175,7 @@ fn resume_does_nothing_while_the_check_still_fails() {
     core.command(Command::ResumeFeature(SafetyFeature::CliSwitching));
 
     assert!(is_paused(&core, SafetyFeature::CliSwitching));
-    assert_eq!(core.view().menu_bar.label, "?");
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("?"));
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn a_claude_code_update_that_ignores_profile_folders_pauses_cli_switching() {
         ["Claude Code 2.1.400 ignores Profile folders · CLI switching paused"]
     );
     assert_eq!(notifications(&effects).len(), 1);
-    assert_eq!(core.view().menu_bar.label, "?");
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("?"));
     assert!(rows(&core).iter().all(|row| row.command.is_none()));
     assert_eq!(mac.read_file(POINTER).unwrap(), pointer);
 }
@@ -495,8 +495,11 @@ fn cli_switching_waits_while_the_launch_self_check_is_out() {
     let pointer = mac.read_file(POINTER).unwrap();
     let mut core = relaunch_while_auth_status_hangs(&mac);
 
-    assert_eq!(core.view().menu_bar.label, "?");
-    assert_eq!(menu_header(&core).as_deref(), Some("CLI: me · checking…"));
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("?"));
+    assert_eq!(
+        menu_header(&core).as_deref(),
+        Some("CLI: me · Work Inc · checking…")
+    );
     assert!(
         rows(&core).iter().all(|row| row.command.is_none()
             && !row_actions(row).iter().any(|t| t == "Use for new CLI runs")),
@@ -518,7 +521,7 @@ fn cli_switching_waits_while_the_launch_self_check_is_out() {
     let_the_self_check_time_out(&mac, &mut core);
 
     assert!(!is_paused(&core, SafetyFeature::CliSwitching));
-    assert_eq!(menu_header(&core).as_deref(), Some("CLI: me"));
+    assert_eq!(menu_header(&core).as_deref(), Some("CLI: me · Work Inc"));
     assert_eq!(core.view().settings.cli_switching.note, None);
     click_row(&mut core, 1);
     assert_ne!(mac.read_file(POINTER).unwrap(), pointer, "switches again");
@@ -968,7 +971,7 @@ fn an_unknown_limit_kind_is_a_bar_and_a_diagnostics_line() {
 
     add_profile(&mut core);
 
-    assert!(rows(&core)[0].limits.contains(&bar("weekly_cowork", 30)));
+    assert!(ignoring_reset_times(&rows(&core)[0].limits).contains(&bar("weekly_cowork", 30)));
     let check = diagnostics_check(&core, "get_usage response");
     assert_eq!(check.status, CheckStatus::Pass);
     assert_eq!(

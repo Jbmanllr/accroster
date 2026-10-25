@@ -12,43 +12,49 @@ use accroster_core::watcher::{self, FolderWatch};
 
 use crate::notifications;
 use accroster_core::{
-    AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
-    LimitBar, MenuItem, ProfileRow, ProfileSettings, RunningDot, SafetyFeature, SessionDetail,
-    SessionFilter, SessionRow, SettingsView, SidebarGroup, SidebarSyncMode, View,
+    AllSessionsView, Badge, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect,
+    Event, LimitBar, MenuItem, ProfileRow, ProfileSettings, RunningDot, SafetyFeature,
+    SessionDetail, SessionFilter, SessionRow, SettingsView, SidebarGroup, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::{AnyObject, Bool, NSObject, ProtocolObject};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSControlSize,
-    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont,
-    NSFontWeightRegular, NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator,
-    NSLevelIndicatorStyle, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView,
-    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardTypeString,
-    NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar, NSStatusItem,
-    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle,
-    NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton,
+    NSColor, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSEvent, NSFont, NSFontAttributeName, NSFontWeightBold,
+    NSFontWeightRegular, NSForegroundColorAttributeName, NSImage, NSLayoutAttribute,
+    NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle, NSLineBreakMode,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSMutableParagraphStyle, NSOutlineView,
+    NSOutlineViewDataSource, NSOutlineViewDelegate, NSParagraphStyleAttributeName, NSPasteboard,
+    NSPasteboardTypeString, NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar,
+    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextAlignment, NSTextField, NSTitlePosition,
+    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
     NSWindowDelegate, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSBundle, NSDictionary, NSDistributedNotificationCenter,
-    NSEdgeInsets, NSFileManager, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObjectProtocol,
-    NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSBundle, NSDictionary,
+    NSDistributedNotificationCenter, NSEdgeInsets, NSFileManager, NSIndexSet, NSInteger,
+    NSNotification, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string,
 };
 
-/// Width of a Profile row in the menu.
+/// The least width of a Profile row in the menu; rows widen to fit.
 const ROW_WIDTH: f64 = 300.0;
 
 /// The Settings window without its Profiles section, which sits on top and
 /// grows the window by its own height.
-const SETTINGS_WIDTH: f64 = 420.0;
-const SETTINGS_HEIGHT: f64 = 552.0;
+const SETTINGS_WIDTH: f64 = 540.0;
+const SETTINGS_HEIGHT: f64 = 536.0;
 /// One line of Settings > Profiles.
 const PROFILE_LINE: f64 = 26.0;
 
@@ -564,7 +570,16 @@ impl Ui {
         let mtm = self.mtm();
         let item = &self.ivars().status_item;
         if let Some(button) = item.button(mtm) {
-            button.setTitle(&NSString::from_str(&view.menu_bar.label));
+            match &view.menu_bar.label {
+                Some(label) => {
+                    button.setImage(None);
+                    button.setTitle(&NSString::from_str(label));
+                }
+                None => {
+                    button.setTitle(ns_string!(""));
+                    button.setImage(Some(&menu_bar_icon()));
+                }
+            }
             button.setAppearsDisabled(view.menu_bar.dimmed);
         }
         if self.ivars().menu_open.get() {
@@ -719,7 +734,21 @@ impl Ui {
     /// `actions` under the tag it gets.
     fn fill_menu(&self, menu: &NSMenu, items: &[MenuItem], actions: &mut Vec<Command>) {
         let mtm = self.mtm();
-        for item in items {
+        // Custom rows share one width, the widest row's, so none is clipped.
+        let contents: Vec<Option<Retained<NSView>>> = items
+            .iter()
+            .map(|item| match item {
+                MenuItem::Profile(profile) => Some(profile_row_content(mtm, profile)),
+                MenuItem::Discovered(discovered) => Some(discovered_row_content(mtm, discovered)),
+                _ => None,
+            })
+            .collect();
+        let width = contents
+            .iter()
+            .flatten()
+            .map(|content| content.fittingSize().width.ceil())
+            .fold(ROW_WIDTH, f64::max);
+        for (item, content) in items.iter().zip(&contents) {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
                 MenuItem::Warning(text) => disabled_item(mtm, &format!("⚠︎ {text}")),
@@ -731,6 +760,9 @@ impl Ui {
                 }
                 MenuItem::Action { title, command } => {
                     let row = menu_item(mtm, title);
+                    if let Some(key) = key_equivalent(command) {
+                        row.setKeyEquivalent(&NSString::from_str(key));
+                    }
                     unsafe {
                         row.setAction(Some(sel!(menuItemClicked:)));
                         row.setTarget(Some(self));
@@ -760,10 +792,9 @@ impl Ui {
                 }
                 MenuItem::Profile(profile) => {
                     let row = menu_item(mtm, &profile.title);
-                    row.setView(Some(&RowView::wrap(
-                        mtm,
-                        &profile_row_content(mtm, profile),
-                    )));
+                    if let Some(content) = content {
+                        row.setView(Some(&RowView::wrap(mtm, content, width)));
+                    }
                     // The row sends this itself on click (see RowView).
                     if let Some(command) = &profile.command {
                         unsafe {
@@ -780,10 +811,9 @@ impl Ui {
                 }
                 MenuItem::Discovered(discovered) => {
                     let row = menu_item(mtm, &discovered.title);
-                    row.setView(Some(&RowView::wrap(
-                        mtm,
-                        &discovered_row_content(mtm, discovered),
-                    )));
+                    if let Some(content) = content {
+                        row.setView(Some(&RowView::wrap(mtm, content, width)));
+                    }
                     // The row sends this itself on click (see RowView).
                     unsafe {
                         row.setAction(Some(sel!(menuItemClicked:)));
@@ -828,10 +858,27 @@ impl Ui {
             }
             Effect::ShowAbout => {
                 let about = &view.about;
-                let credits = NSAttributedString::from_nsstring(&NSString::from_str(&format!(
-                    "{}\n\n{}",
-                    about.tagline, about.disclaimer
-                )));
+                let centred = NSMutableParagraphStyle::new();
+                centred.setAlignment(NSTextAlignment::Center);
+                let font = NSFont::systemFontOfSize(NSFont::smallSystemFontSize());
+                let color = NSColor::labelColor();
+                let attributes = unsafe {
+                    NSDictionary::<NSAttributedStringKey, AnyObject>::from_slices(
+                        &[
+                            NSParagraphStyleAttributeName,
+                            NSFontAttributeName,
+                            NSForegroundColorAttributeName,
+                        ],
+                        &[&*centred, &*font, &*color],
+                    )
+                };
+                let credits = unsafe {
+                    NSAttributedString::initWithString_attributes(
+                        NSAttributedString::alloc(),
+                        &NSString::from_str(&format!("{}\n\n{}", about.tagline, about.disclaimer)),
+                        Some(&attributes),
+                    )
+                };
                 let name = NSString::from_str(&about.name);
                 let version = NSString::from_str(&about.version);
                 let options = unsafe {
@@ -1045,7 +1092,7 @@ impl Ui {
     fn make_all_sessions_window(&self) -> AllSessionsWindow {
         let mtm = self.mtm();
         let (width, height) = (1040.0, 600.0);
-        let (sidebar_width, detail_width, top) = (200.0, 320.0, 50.0);
+        let (sidebar_width, detail_width, top) = (240.0, 320.0, 50.0);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -1117,6 +1164,9 @@ impl Ui {
         scroll.setDocumentView(Some(&sidebar));
         scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         content.addSubview(&scroll);
+        // The column as wide as what the scroll view shows, so long lines
+        // end in "…" instead of running under its edge.
+        sidebar.sizeLastColumnToFit();
 
         // Session list.
         let list_frame = NSRect::new(
@@ -1353,160 +1403,113 @@ impl Ui {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("AccRoster Settings"));
         let content = window.contentView().expect("a window has a content view");
+        // The fixed part, laid out top-down: a bold heading per group, each
+        // control's note under it in one column.
+        let mut layout = Layout::new(&content);
 
-        let sidebar_sync = unsafe {
+        let small = || NSFont::systemFontOfSize(NSFont::smallSystemFontSize());
+        let note = |text: &str| {
+            let note = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+            note.setFont(Some(&small()));
+            note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            note
+        };
+        let checkbox = |title: &str, action| unsafe {
             NSButton::checkboxWithTitle_target_action(
-                ns_string!("Sidebar sync: every Session in every Profile's desktop sidebar"),
+                &NSString::from_str(title),
                 Some(self),
-                Some(sel!(sidebarSyncClicked:)),
+                Some(action),
                 mtm,
             )
         };
-        sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 520.0));
-        content.addSubview(&sidebar_sync);
-
-        let sidebar_sync_automatic = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                ns_string!("Automatically, a few seconds after each change"),
-                Some(self),
-                Some(sel!(sidebarSyncAutomaticClicked:)),
-                mtm,
-            )
-        };
-        sidebar_sync_automatic.setFrameOrigin(NSPoint::new(34.0, 498.0));
-        content.addSubview(&sidebar_sync_automatic);
-
-        let sync_now = unsafe {
+        let push_button = |title: &str, action| unsafe {
             NSButton::buttonWithTitle_target_action(
-                ns_string!("Sync now"),
+                &NSString::from_str(title),
                 Some(self),
-                Some(sel!(syncNowClicked:)),
+                Some(action),
                 mtm,
             )
         };
-        sync_now.setFrameOrigin(NSPoint::new(34.0, 464.0));
-        content.addSubview(&sync_now);
+        const NOTE_X: f64 = 40.0;
+        const NOTE_WIDTH: f64 = SETTINGS_WIDTH - NOTE_X - 20.0;
 
-        let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        sidebar_sync_note.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
-        sidebar_sync_note.setFrame(NSRect::new(
-            NSPoint::new(140.0, 460.0),
-            NSSize::new(260.0, 34.0),
-        ));
-        content.addSubview(&sidebar_sync_note);
+        layout.place(&heading(mtm, "Sidebar sync"), 20.0, None, 6.0);
+        let sidebar_sync = checkbox(
+            "Show every Session in every Profile's desktop sidebar",
+            sel!(sidebarSyncClicked:),
+        );
+        layout.place(&sidebar_sync, 20.0, None, 4.0);
+        let sidebar_sync_automatic = checkbox(
+            "Automatically, a few seconds after each change",
+            sel!(sidebarSyncAutomaticClicked:),
+        );
+        layout.place(&sidebar_sync_automatic, NOTE_X, None, 4.0);
+        let sync_now = push_button("Sync now", sel!(syncNowClicked:));
+        layout.place(&sync_now, NOTE_X - 6.0, None, 2.0);
+        let sidebar_sync_note = note("");
+        layout.place(&sidebar_sync_note, NOTE_X, Some((NOTE_WIDTH, 28.0)), 4.0);
 
+        layout.place(&heading(mtm, "Notifications"), 20.0, None, 6.0);
         let thresholds_label =
             NSTextField::labelWithString(ns_string!("Notify when a limit reaches (%):"), mtm);
-        thresholds_label.setFrameOrigin(NSPoint::new(20.0, 434.0));
-        thresholds_label.sizeToFit();
-        content.addSubview(&thresholds_label);
         let thresholds = NSTextField::textFieldWithString(ns_string!(""), mtm);
-        thresholds.setFrame(NSRect::new(
-            NSPoint::new(240.0, 431.0),
-            NSSize::new(80.0, 22.0),
-        ));
         unsafe {
             thresholds.setTarget(Some(self));
             thresholds.setAction(Some(sel!(thresholdsChanged:)));
         }
-        content.addSubview(&thresholds);
+        let label_width = thresholds_label.fittingSize().width.ceil();
+        layout.place_beside(
+            &thresholds_label,
+            20.0,
+            &thresholds,
+            20.0 + label_width + 8.0,
+            (80.0, 22.0),
+            6.0,
+        );
+        let reset_notification = checkbox(
+            "Also notify when a limit that warned resets",
+            sel!(resetNotificationClicked:),
+        );
+        layout.place(&reset_notification, 20.0, None, 14.0);
 
-        let reset_notification = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                ns_string!("Also notify when a limit that warned resets"),
-                Some(self),
-                Some(sel!(resetNotificationClicked:)),
-                mtm,
-            )
-        };
-        reset_notification.setFrameOrigin(NSPoint::new(20.0, 402.0));
-        content.addSubview(&reset_notification);
-
-        let cli_switching = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                ns_string!("CLI switching: clicking a Profile picks it for new claude runs"),
-                Some(self),
-                Some(sel!(cliSwitchingClicked:)),
-                mtm,
-            )
-        };
-        cli_switching.setFrameOrigin(NSPoint::new(20.0, 366.0));
-        content.addSubview(&cli_switching);
-
-        let cli_switching_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        layout.place(&heading(mtm, "CLI switching"), 20.0, None, 6.0);
+        let cli_switching = checkbox(
+            "Clicking a Profile picks it for new claude runs",
+            sel!(cliSwitchingClicked:),
+        );
+        layout.place(&cli_switching, 20.0, None, 4.0);
+        let cli_switching_note = note("");
         cli_switching_note.setSelectable(true);
-        cli_switching_note.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
-        cli_switching_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 260.0),
-            NSSize::new(360.0, 102.0),
-        ));
-        content.addSubview(&cli_switching_note);
+        layout.place(&cli_switching_note, NOTE_X, Some((NOTE_WIDTH, 84.0)), 14.0);
 
-        let launch_at_login = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                ns_string!("Open AccRoster at login"),
-                Some(self),
-                Some(sel!(launchAtLoginClicked:)),
-                mtm,
-            )
-        };
-        launch_at_login.setFrameOrigin(NSPoint::new(20.0, 226.0));
-        content.addSubview(&launch_at_login);
+        layout.place(&heading(mtm, "General"), 20.0, None, 6.0);
+        let launch_at_login = checkbox("Open AccRoster at login", sel!(launchAtLoginClicked:));
+        layout.place(&launch_at_login, 20.0, None, 2.0);
+        let launch_at_login_note = note("");
+        layout.place(&launch_at_login_note, NOTE_X, Some((NOTE_WIDTH, 30.0)), 6.0);
+        let verbose_logging = checkbox("Verbose logging", sel!(verboseLoggingClicked:));
+        layout.place(&verbose_logging, 20.0, None, 2.0);
+        let verbose_logging_note = note("");
+        layout.place(
+            &verbose_logging_note,
+            NOTE_X,
+            Some((NOTE_WIDTH, 16.0)),
+            10.0,
+        );
+        let reveal = push_button("Reveal logs in Finder", sel!(revealLogsClicked:));
+        let uninstall = push_button("Uninstall…", sel!(uninstallClicked:));
+        let retry_uninstall = push_button("Retry", sel!(retryUninstallClicked:));
+        layout.place_row(&[&reveal, &uninstall, &retry_uninstall], 14.0, 2.0);
+        let uninstall_note = note("");
+        layout.place(
+            &uninstall_note,
+            20.0,
+            Some((SETTINGS_WIDTH - 40.0, 32.0)),
+            0.0,
+        );
+        layout.finish();
 
-        let launch_at_login_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        launch_at_login_note.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
-        launch_at_login_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 190.0),
-            NSSize::new(360.0, 32.0),
-        ));
-        content.addSubview(&launch_at_login_note);
-
-        let verbose_logging = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                ns_string!("Verbose logging"),
-                Some(self),
-                Some(sel!(verboseLoggingClicked:)),
-                mtm,
-            )
-        };
-        verbose_logging.setFrameOrigin(NSPoint::new(20.0, 162.0));
-        content.addSubview(&verbose_logging);
-
-        let verbose_logging_note = NSTextField::labelWithString(ns_string!(""), mtm);
-        verbose_logging_note.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
-        verbose_logging_note.setFrame(NSRect::new(
-            NSPoint::new(40.0, 140.0),
-            NSSize::new(320.0, 18.0),
-        ));
-        content.addSubview(&verbose_logging_note);
-
-        let reveal = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!("Reveal logs in Finder"),
-                Some(self),
-                Some(sel!(revealLogsClicked:)),
-                mtm,
-            )
-        };
-        reveal.setFrameOrigin(NSPoint::new(14.0, 88.0));
-        content.addSubview(&reveal);
-
-        let hidden = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!("Hidden (0)…"),
-                Some(self),
-                Some(sel!(hiddenClicked:)),
-                mtm,
-            )
-        };
+        let hidden = push_button("Hidden (0)…", sel!(hiddenClicked:));
         // Placed in the Profiles section by `render_profile_settings`.
         let profiles = NSView::initWithFrame(
             NSView::alloc(mtm),
@@ -1516,38 +1519,6 @@ impl Ui {
             ),
         );
         content.addSubview(&profiles);
-
-        let uninstall = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!("Uninstall…"),
-                Some(self),
-                Some(sel!(uninstallClicked:)),
-                mtm,
-            )
-        };
-        uninstall.setFrameOrigin(NSPoint::new(14.0, 50.0));
-        content.addSubview(&uninstall);
-
-        let retry_uninstall = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!("Retry"),
-                Some(self),
-                Some(sel!(retryUninstallClicked:)),
-                mtm,
-            )
-        };
-        retry_uninstall.setFrameOrigin(NSPoint::new(120.0, 50.0));
-        content.addSubview(&retry_uninstall);
-
-        let uninstall_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        uninstall_note.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
-        uninstall_note.setFrame(NSRect::new(
-            NSPoint::new(20.0, 8.0),
-            NSSize::new(380.0, 40.0),
-        ));
-        content.addSubview(&uninstall_note);
 
         SettingsWindow {
             window,
@@ -1568,6 +1539,85 @@ impl Ui {
             retry_uninstall,
             uninstall_note,
         }
+    }
+}
+
+/// A bold group heading, like Settings > Profiles.
+fn heading(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+    let heading = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    heading.setFont(Some(
+        &NSFont::boldSystemFontOfSize(NSFont::systemFontSize()),
+    ));
+    heading
+}
+
+/// Places views top-down in the bottom [`SETTINGS_HEIGHT`] points of a
+/// (bottom-up) window content view.
+struct Layout<'a> {
+    content: &'a NSView,
+    /// Distance from the top of the fixed part to the next view.
+    top: f64,
+}
+
+impl<'a> Layout<'a> {
+    fn new(content: &'a NSView) -> Layout<'a> {
+        Layout { content, top: 6.0 }
+    }
+
+    /// Adds `view` at `x`, sized `size` or to fit, then leaves `gap`.
+    fn place(&mut self, view: &NSView, x: f64, size: Option<(f64, f64)>, gap: f64) {
+        let (width, height) = size.unwrap_or_else(|| {
+            let fit = view.fittingSize();
+            (fit.width.ceil(), fit.height.ceil())
+        });
+        self.put(view, x, width, height, height);
+        self.top += height + gap;
+    }
+
+    /// Adds `label` and `field` on one line, centred on each other.
+    fn place_beside(
+        &mut self,
+        label: &NSView,
+        label_x: f64,
+        field: &NSView,
+        field_x: f64,
+        (width, height): (f64, f64),
+        gap: f64,
+    ) {
+        let fit = label.fittingSize();
+        self.put(label, label_x, fit.width.ceil(), fit.height.ceil(), height);
+        self.put(field, field_x, width, height, height);
+        self.top += height + gap;
+    }
+
+    /// Adds buttons side by side from `x`.
+    fn place_row(&mut self, views: &[&NSView], mut x: f64, gap: f64) {
+        let height = views
+            .iter()
+            .map(|view| view.fittingSize().height.ceil())
+            .fold(0.0, f64::max);
+        for view in views {
+            let fit = view.fittingSize();
+            self.put(view, x, fit.width.ceil(), fit.height.ceil(), height);
+            x += fit.width.ceil() + 4.0;
+        }
+        self.top += height + gap;
+    }
+
+    /// Frames `view` in a line `line` tall at the current top, centred.
+    fn put(&self, view: &NSView, x: f64, width: f64, height: f64, line: f64) {
+        let y = SETTINGS_HEIGHT - self.top - line + (line - height) / 2.0;
+        view.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)));
+        self.content.addSubview(view);
+    }
+
+    /// Checks everything fit in [`SETTINGS_HEIGHT`].
+    fn finish(self) {
+        debug_assert!(
+            self.top <= SETTINGS_HEIGHT,
+            "Settings needs {} points, has {SETTINGS_HEIGHT}",
+            self.top
+        );
     }
 }
 
@@ -1692,9 +1742,17 @@ impl SidebarSource {
             SidebarLine::Heading(title) => {
                 label(mtm, title, NSFont::boldSystemFontOfSize(11.0), true)
             }
-            SidebarLine::Item(title, _) => label(mtm, title, NSFont::systemFontOfSize(12.0), false),
+            SidebarLine::Item(title, _) => {
+                let line = label(mtm, title, NSFont::systemFontOfSize(12.0), false);
+                line.setToolTip(Some(&NSString::from_str(title)));
+                line
+            }
         };
         view.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        view.setContentCompressionResistancePriority_forOrientation(
+            1.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
         Some(view.into_super().into_super())
     }
 
@@ -1816,20 +1874,24 @@ impl Ui {
         for (index, profile) in profiles.iter().enumerate() {
             let y = height - 28.0 - PROFILE_LINE * (index + 1) as f64;
             let name = NSTextField::labelWithString(&NSString::from_str(&profile.title), mtm);
-            name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            // The middle goes first: the Organization at the end tells two
+            // Profiles of one email apart.
+            name.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
             name.setFrame(NSRect::new(
                 NSPoint::new(20.0, y + 3.0),
-                NSSize::new(170.0, 18.0),
+                NSSize::new(280.0, 18.0),
             ));
-            if let Some(detail) = &profile.detail {
-                name.setToolTip(Some(&NSString::from_str(detail)));
-            }
+            let tooltip = match &profile.detail {
+                Some(detail) => format!("{}\n{detail}", profile.title),
+                None => profile.title.clone(),
+            };
+            name.setToolTip(Some(&NSString::from_str(&tooltip)));
             section.addSubview(&name);
-            button("↑", profile.move_up.as_ref(), 194.0, y, None);
-            button("↓", profile.move_down.as_ref(), 226.0, y, None);
-            button("Rename…", Some(&profile.rename), 258.0, y, None);
+            button("↑", profile.move_up.as_ref(), 306.0, y, None);
+            button("↓", profile.move_down.as_ref(), 338.0, y, None);
+            button("Rename…", Some(&profile.rename), 370.0, y, None);
             if let Some(mute) = &profile.mute {
-                button("Mute", Some(&mute.command), 340.0, y + 3.0, Some(mute.on));
+                button("Mute", Some(&mute.command), 456.0, y + 3.0, Some(mute.on));
             }
         }
         *self.ivars().profile_commands.borrow_mut() = commands;
@@ -1914,6 +1976,7 @@ impl Ui {
             )),
             None => {}
         }
+        pane.addArrangedSubview(&rule(mtm, WIDTH));
         pane.addArrangedSubview(&wrapping(
             "Sidebar entries",
             NSFont::boldSystemFontOfSize(11.0),
@@ -1944,6 +2007,7 @@ impl Ui {
         if detail.open.is_empty() {
             return;
         }
+        pane.addArrangedSubview(&rule(mtm, WIDTH));
         pane.addArrangedSubview(&wrapping(
             "Open",
             NSFont::boldSystemFontOfSize(11.0),
@@ -1968,6 +2032,14 @@ impl Ui {
             }
         }
     }
+}
+
+/// A thin horizontal rule `width` wide, between detail pane sections.
+fn rule(mtm: MainThreadMarker, width: f64) -> Retained<NSBox> {
+    let rule = NSBox::new(mtm);
+    rule.setBoxType(NSBoxType::Separator);
+    fixed_width(&rule, width);
+    rule
 }
 
 /// Opens a new Terminal window running `line` (already quoted for `sh`).
@@ -2077,17 +2149,18 @@ define_class!(
 );
 
 impl RowView {
-    /// A row of [`ROW_WIDTH`] holding `content`, as tall as it needs.
-    fn wrap(mtm: MainThreadMarker, content: &NSView) -> Retained<RowView> {
+    /// A row `width` wide holding `content`, as tall as it needs at that
+    /// width; it widens with the menu when a plain item is wider.
+    fn wrap(mtm: MainThreadMarker, content: &NSView, width: f64) -> Retained<RowView> {
         content.setTranslatesAutoresizingMaskIntoConstraints(false);
-        content
-            .widthAnchor()
-            .constraintEqualToConstant(ROW_WIDTH)
-            .setActive(true);
+        let sizing = content.widthAnchor().constraintEqualToConstant(width);
+        sizing.setActive(true);
         let height = content.fittingSize().height;
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(ROW_WIDTH, height));
+        sizing.setActive(false);
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
         let this = RowView::alloc(mtm).set_ivars(());
         let this: Retained<RowView> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         this.addSubview(content);
         for (a, b) in [
             (content.leadingAnchor(), this.leadingAnchor()),
@@ -2111,18 +2184,17 @@ impl RowView {
 /// reset / Session refill lines, the note.
 fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSView> {
     let name = label(mtm, &row.title, NSFont::boldSystemFontOfSize(13.0), false);
-    let badges: Vec<Retained<NSTextField>> = row
-        .badges
-        .iter()
-        .map(String::as_str)
-        .chain(row.most_headroom.then_some("Most headroom"))
-        .map(|badge| label(mtm, badge, NSFont::boldSystemFontOfSize(9.0), true))
-        .collect();
+    let mut badges: Vec<Retained<NSView>> =
+        row.badges.iter().map(|badge| pill(mtm, *badge)).collect();
+    if let Some(marker) = &row.marker {
+        let marker = label(mtm, marker, NSFont::systemFontOfSize(10.0), true);
+        badges.push(marker.into_super().into_super());
+    }
     let filler = NSView::new(mtm);
     filler.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
     let arrow = label(mtm, "›", NSFont::systemFontOfSize(13.0), true);
     let mut name_line: Vec<&NSView> = vec![&name];
-    name_line.extend(badges.iter().map(|badge| -> &NSView { badge }));
+    name_line.extend(badges.iter().map(|badge| &**badge));
     name_line.extend([&*filler, &arrow]);
     let mut lines: Vec<Retained<NSView>> = vec![stack(mtm, false, 5.0, &name_line).into_super()];
     lines.extend(row.limits.iter().map(|bar| {
@@ -2287,8 +2359,78 @@ fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
     } else {
         format!("{}%", bar.percent)
     };
-    let percent = label(mtm, &text, regular(), false);
-    stack(mtm, false, 6.0, &[&name, &level, &percent]).into_super()
+    let bold = unsafe { NSFont::monospacedDigitSystemFontOfSize_weight(11.0, NSFontWeightBold) };
+    let percent = label(mtm, &text, bold, false);
+    fixed_width(&percent, 36.0);
+    let resets = label(mtm, bar.resets.as_deref().unwrap_or(""), regular(), true);
+    stack(mtm, false, 6.0, &[&name, &level, &percent, &resets]).into_super()
+}
+
+/// A client badge: a coloured pill (CLI blue, Desktop purple) with white
+/// text, like the prototype's.
+fn pill(mtm: MainThreadMarker, badge: Badge) -> Retained<NSView> {
+    let text = label(
+        mtm,
+        badge.title(),
+        NSFont::boldSystemFontOfSize(10.0),
+        false,
+    );
+    text.setTextColor(Some(&NSColor::whiteColor()));
+    let pill = NSBox::new(mtm);
+    pill.setBoxType(NSBoxType::Custom);
+    pill.setTitlePosition(NSTitlePosition::NoTitle);
+    pill.setBorderWidth(0.0);
+    pill.setCornerRadius(4.0);
+    pill.setFillColor(&*match badge {
+        Badge::Cli => NSColor::systemBlueColor(),
+        Badge::Desktop => NSColor::systemPurpleColor(),
+    });
+    pill.setContentViewMargins(NSSize::new(4.0, 1.0));
+    let size = text.fittingSize();
+    pill.setContentView(Some(&text));
+    // A box has no size of its own: as wide and tall as its text.
+    fixed_width(&pill, size.width.ceil() + 8.0);
+    pill.heightAnchor()
+        .constraintEqualToConstant(size.height.ceil() + 2.0)
+        .setActive(true);
+    pill.into_super()
+}
+
+/// The menu's key equivalents (with ⌘), as in the prototype.
+fn key_equivalent(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::OpenAllSessions => Some("s"),
+        Command::AddProfile => Some("n"),
+        Command::OpenSettings => Some(","),
+        Command::Quit => Some("q"),
+        _ => None,
+    }
+}
+
+/// The menu bar's icon when there is no Profile to show: the app icon's
+/// three rows (a dot, then a bar partly filled) as a template image, so
+/// macOS tints it for the menu bar.
+fn menu_bar_icon() -> Retained<NSImage> {
+    let draw = RcBlock::new(|_rect: NSRect| -> Bool {
+        // In a flipped 18 × 16 canvas, top row first.
+        for (index, filled) in [0.74, 0.36, 0.9].into_iter().enumerate() {
+            let y = 2.5 + 5.0 * index as f64;
+            let dot = NSRect::new(NSPoint::new(1.5, y), NSSize::new(3.0, 3.0));
+            NSColor::blackColor().set();
+            NSBezierPath::bezierPathWithOvalInRect(dot).fill();
+            let track = NSRect::new(NSPoint::new(6.0, y + 0.25), NSSize::new(11.0, 2.5));
+            NSColor::blackColor().colorWithAlphaComponent(0.35).set();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(track, 1.25, 1.25).fill();
+            let fill = NSRect::new(track.origin, NSSize::new(11.0 * filled, 2.5));
+            NSColor::blackColor().set();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(fill, 1.25, 1.25).fill();
+        }
+        Bool::YES
+    });
+    let image = NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(18.0, 16.0), true, &draw);
+    image.setTemplate(true);
+    image.setAccessibilityDescription(Some(ns_string!("AccRoster")));
+    image
 }
 
 fn label(

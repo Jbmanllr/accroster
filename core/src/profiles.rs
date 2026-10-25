@@ -91,10 +91,54 @@ impl Identity {
         format!("{} · {}", self.email, self.organization_name)
     }
 
-    /// The menu bar's short name: the email's local part.
-    fn short_label(&self) -> String {
-        self.email.split('@').next().unwrap_or_default().to_owned()
+    /// The menu bar's short names, shortest first: the email's local part,
+    /// then it with the Organization, then the whole `email · Organization`.
+    fn short_labels(&self) -> [String; 3] {
+        let local = self.email.split('@').next().unwrap_or_default();
+        [
+            local.to_owned(),
+            format!("{local} · {}", self.organization_name),
+            self.name(),
+        ]
     }
+}
+
+/// Each Profile's short name, in `profiles`' order: its nickname, else the
+/// shortest of [`Identity::short_labels`] no other Profile shares (two
+/// Profiles named `me` become `me · Work Inc` and `me · Personal`).
+fn short_labels(profiles: &[&Profile], settings: &Settings) -> Vec<String> {
+    let choices: Vec<Vec<String>> = profiles
+        .iter()
+        .map(|profile| match settings.nicknames.get(&profile.id) {
+            Some(nickname) => vec![nickname.clone()],
+            None => match &profile.identity {
+                Some(identity) => identity.short_labels().to_vec(),
+                None => vec!["Signed out".to_owned()],
+            },
+        })
+        .collect();
+    let mut level = vec![0; profiles.len()];
+    loop {
+        let label = |index: usize| &choices[index][level[index]];
+        let collided: Vec<usize> = (0..profiles.len())
+            .filter(|&index| {
+                level[index] + 1 < choices[index].len()
+                    && (0..profiles.len())
+                        .any(|other| other != index && label(other) == label(index))
+            })
+            .collect();
+        if collided.is_empty() {
+            break;
+        }
+        for index in collided {
+            level[index] += 1;
+        }
+    }
+    choices
+        .into_iter()
+        .zip(level)
+        .map(|(mut choices, level)| choices.swap_remove(level))
+        .collect()
 }
 
 /// A signed-in Profile as the menu lists it.
@@ -221,7 +265,7 @@ impl Profile {
             limits: bars,
             note,
             dimmed,
-            most_headroom: false,
+            marker: None,
             offers,
             submenu,
         }
@@ -901,15 +945,14 @@ impl ProfileRegistry {
         settings: &Settings,
         limits: impl Fn(&str) -> LimitsView,
     ) -> Vec<Listed<'_>> {
-        self.ordered(&settings.profile_order)
+        let ordered = self.ordered(&settings.profile_order);
+        let short_labels = short_labels(&ordered, settings);
+        ordered
             .into_iter()
-            .map(|profile| {
+            .zip(short_labels)
+            .map(|(profile, short_label)| {
                 let nickname = settings.nicknames.get(&profile.id);
                 let title = nickname.cloned().unwrap_or_else(|| profile.name());
-                let short_label = nickname
-                    .cloned()
-                    .or_else(|| profile.identity.as_ref().map(Identity::short_label))
-                    .unwrap_or_else(|| "Signed out".to_owned());
                 let mut row = profile.row(title, limits(&profile.id));
                 if self.removing(&profile.id) {
                     row.note = Some("Signing out…".to_owned());

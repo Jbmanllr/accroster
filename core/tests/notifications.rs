@@ -421,7 +421,7 @@ fn switch_cli_on_an_old_notification_does_nothing_while_cli_switching_is_paused(
 
     core.event(clicked_after_relaunch(&on_click));
 
-    assert_eq!(core.view().menu_bar.label, "?", "paused");
+    assert_eq!(core.view().menu_bar.label.as_deref(), Some("?"), "paused");
     assert_eq!(pointer(&mac), perso);
 }
 
@@ -463,14 +463,19 @@ fn a_profile_that_is_not_the_clis_gets_no_suggestion() {
     assert_eq!(
         notices(&effects),
         [(
-            "me: Session limit 85% · resets 16:40".to_owned(),
+            "me · Team Co: Session limit 85% · resets 16:40".to_owned(),
             String::new()
         )]
     );
 }
 
-fn markers(core: &Core) -> Vec<bool> {
-    rows(core).iter().map(|row| row.most_headroom).collect()
+/// Each row's marker text, `None` when it has none.
+fn markers(core: &Core) -> Vec<Option<String>> {
+    rows(core).iter().map(|row| row.marker.clone()).collect()
+}
+
+fn most() -> Option<String> {
+    Some("most headroom".to_owned())
 }
 
 #[test]
@@ -484,7 +489,7 @@ fn the_most_headroom_marker_counts_unknown_limit_kinds() {
         &[],
     );
 
-    assert_eq!(markers(&core), [false, true]);
+    assert_eq!(markers(&core), [None, most()]);
 }
 
 #[test]
@@ -493,7 +498,7 @@ fn a_single_profile_has_no_most_headroom_marker() {
     let mut core = mac.launch();
     add_profile(&mut core);
 
-    assert_eq!(markers(&core), [false]);
+    assert_eq!(markers(&core), [None]);
 }
 
 #[test]
@@ -503,7 +508,7 @@ fn a_stale_profile_never_gets_the_marker() {
         body(12, SESSION_RESETS, 5),
         &[],
     );
-    assert_eq!(markers(&core), [false, true]);
+    assert_eq!(markers(&core), [None, most()]);
 
     // Pro's reads stop answering: its 12% is dimmed, Perso's stays fresh.
     mac.claude
@@ -511,5 +516,5 @@ fn a_stale_profile_never_gets_the_marker() {
         .reply(StubCall::SlashUsage, Reply::fail(1, "no answer"));
     after(&mac, &mut core, NEXT_READ);
     assert!(rows(&core)[1].dimmed, "{:?}", rows(&core)[1]);
-    assert_eq!(markers(&core), [false, false], "one fresh Profile left");
+    assert_eq!(markers(&core), [None, None], "one fresh Profile left");
 }

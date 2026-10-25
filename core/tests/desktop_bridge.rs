@@ -7,7 +7,7 @@ mod common;
 use std::time::{Duration, SystemTime};
 
 use accroster_core::{
-    ClaudeVersions, Command, Core, Effect, Event, MenuItem, ProfileRow, SidebarSyncMode,
+    Badge, ClaudeVersions, Command, Core, Effect, Event, MenuItem, ProfileRow, SidebarSyncMode,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin, StubCall};
 use common::*;
@@ -95,11 +95,26 @@ fn the_desktop_badge_and_header_follow_the_account_and_the_folder_claude_writes(
     sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me")
+        Some("CLI: Default    Desktop: me · Work Inc")
     );
     let rows = rows(&core);
-    assert_eq!(row(&rows, WORK).badges, ["Desktop"]);
+    assert_eq!(row(&rows, WORK).badges, [Badge::Desktop]);
     assert!(row(&rows, PERSO).badges.is_empty());
+}
+
+#[test]
+fn a_separator_sets_the_header_apart_from_the_first_row() {
+    let (mac, core) = mac_with_two_profiles();
+    desktop_signed_in_as(&mac, &work());
+    sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
+
+    let items = core.view().menu.items;
+    let header = items
+        .iter()
+        .position(|item| matches!(item, MenuItem::Detail(text) if text.starts_with("CLI: ")))
+        .expect("a header");
+    assert_eq!(items[header + 1], MenuItem::Separator);
+    assert!(matches!(items[header + 2], MenuItem::Profile(_)));
 }
 
 /// Names the Profile in the row titled `title` `nickname`.
@@ -138,7 +153,10 @@ fn the_header_names_each_clients_active_profile_by_its_short_name() {
     let work_row = rows(&core)[1].command.clone().expect("rows switch the CLI");
     core.command(work_row);
     assert_eq!(header(&core).as_deref(), Some("CLI: Work    Desktop: Work"));
-    assert_eq!(row(&rows(&core), "Work").badges, ["CLI", "Desktop"]);
+    assert_eq!(
+        row(&rows(&core), "Work").badges,
+        [Badge::Cli, Badge::Desktop]
+    );
     assert!(row(&rows(&core), "Perso").badges.is_empty());
 }
 
@@ -164,7 +182,7 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
     sidebar_entry(&mac, &work(), "c", "Newer", Duration::from_secs(1));
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me")
+        Some("CLI: Default    Desktop: me · Work Inc")
     );
 }
 
@@ -181,7 +199,7 @@ fn the_desktop_config_is_read_for_its_account_only_and_never_logged() {
     assert!(!view.contains("sk-ant"), "{view}");
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me")
+        Some("CLI: Default    Desktop: me · me@example.com's Organization")
     );
 }
 
@@ -602,9 +620,9 @@ fn the_switch_is_confirmed_from_the_folder_claude_writes() {
     assert_eq!(warnings(&core), [format!("Claude now uses {WORK}")]);
     assert_eq!(
         header(&core).as_deref(),
-        Some("CLI: Default    Desktop: me")
+        Some("CLI: Default    Desktop: me · Work Inc")
     );
-    assert_eq!(row(&rows(&core), WORK).badges, ["Desktop"]);
+    assert_eq!(row(&rows(&core), WORK).badges, [Badge::Desktop]);
 }
 
 #[test]

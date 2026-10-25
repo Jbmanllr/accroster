@@ -516,8 +516,9 @@ pub struct LaunchAtLoginView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuBarView {
     /// Short text shown in the menu bar (kept short for the notch): the CLI's
-    /// Active Profile and its tightest limit, like `Perso 62%`.
-    pub label: String,
+    /// Active Profile and its tightest limit, like `Perso 62%`. `None` when
+    /// there is no Profile to show: the app's icon stands alone.
+    pub label: Option<String>,
     /// Drawn dimmed (the figure is stale).
     pub dimmed: bool,
 }
@@ -582,9 +583,9 @@ pub struct DiscoveredRow {
 pub struct ProfileRow {
     /// The nickname, else `email · Organization`.
     pub title: String,
-    /// Badges after the name, "CLI" first, then "Desktop": which clients use
+    /// Badges after the name, CLI first, then Desktop: which clients use
     /// this Profile.
-    pub badges: Vec<String>,
+    pub badges: Vec<Badge>,
     /// What clicking the row sends, if it does anything.
     pub command: Option<Command>,
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
@@ -595,9 +596,10 @@ pub struct ProfileRow {
     /// Drawn dimmed: the reading is not current (stale, unreadable, or the
     /// Login expired).
     pub dimmed: bool,
-    /// The most-headroom marker: of the non-stale signed-in Profiles (two or
-    /// more), this one has the lowest tightest limit.
-    pub most_headroom: bool,
+    /// The most-headroom marker text ("most headroom"), drawn after the
+    /// badges: of the non-stale signed-in Profiles (two or more), this one
+    /// has the lowest tightest limit.
+    pub marker: Option<String>,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,
@@ -617,6 +619,29 @@ pub struct LimitBar {
     /// The limit's reset time has passed since the reading: drawn as
     /// "Reset" at 0%.
     pub reset: bool,
+    /// When the limit resets, drawn after the percentage: "resets in 1 h 40
+    /// min" for the Session limit, "resets Thu 09:00" for the others. `None`
+    /// when Claude Code didn't say, or once it has passed.
+    pub resets: Option<String>,
+}
+
+/// A client using a Profile, drawn as a coloured pill after its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Badge {
+    /// The CLI's Active Profile.
+    Cli,
+    /// The Claude desktop app's Active Profile.
+    Desktop,
+}
+
+impl Badge {
+    /// The pill's text.
+    pub fn title(self) -> &'static str {
+        match self {
+            Badge::Cli => "CLI",
+            Badge::Desktop => "Desktop",
+        }
+    }
 }
 
 /// The Settings window.

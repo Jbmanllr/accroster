@@ -22,7 +22,7 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::backups;
-use crate::interface::{Command, MenuItem};
+use crate::interface::{Badge, Command, MenuItem};
 use crate::profiles::Listed;
 use crate::storage::{self, AppPaths};
 
@@ -182,7 +182,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -
         }
         row.submenu.splice(0..0, items);
         if is_active {
-            row.badges.insert(0, "CLI".into());
+            row.badges.insert(0, Badge::Cli);
             let tightest = row.limits.iter().map(|bar| bar.percent).max();
             active = Some((profile.short_label.clone(), tightest));
         }
