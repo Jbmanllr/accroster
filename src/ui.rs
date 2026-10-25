@@ -274,6 +274,11 @@ impl Ui {
                 NSWorkspace::sharedWorkspace()
                     .activateFileViewerSelectingURLs(&NSArray::from_slice(&[&*url]));
             }
+            Effect::OpenUrl(url) => {
+                if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
+                    NSWorkspace::sharedWorkspace().openURL(&url);
+                }
+            }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
             },
@@ -478,7 +483,8 @@ impl RowView {
     }
 }
 
-/// A Profile row: the name and a submenu arrow, one bar per limit, the note.
+/// A Profile row: the name and a submenu arrow, one bar per limit, the Banked
+/// reset / Session refill lines, the note.
 fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSView> {
     let name = label(mtm, &row.title, NSFont::boldSystemFontOfSize(13.0), false);
     let filler = NSView::new(mtm);
@@ -487,6 +493,11 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     let mut lines: Vec<Retained<NSView>> =
         vec![stack(mtm, false, 5.0, &[&name, &filler, &arrow]).into_super()];
     lines.extend(row.limits.iter().map(|bar| limit_line(mtm, bar)));
+    lines.extend(row.offers.iter().map(|offer| {
+        label(mtm, offer, NSFont::systemFontOfSize(10.0), false)
+            .into_super()
+            .into_super()
+    }));
     if let Some(note) = &row.note {
         lines.push(
             label(mtm, note, NSFont::systemFontOfSize(10.0), true)

@@ -122,6 +122,11 @@ pub trait RunningProcess: Send {
 /// The current time.
 pub trait Clock: Send {
     fn now(&self) -> Timestamp;
+
+    /// The time zone dates and times are shown in: the Mac's own.
+    fn time_zone(&self) -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::system()
+    }
 }
 
 /// A process as the OS reports it.

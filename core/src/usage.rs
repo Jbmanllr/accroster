@@ -7,6 +7,8 @@
 
 use serde_json::Value;
 
+use crate::limit_offers::{self, BankedReset, SessionRefill};
+
 /// A usage answer, as far as it could be read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UsageReply {
@@ -17,6 +19,10 @@ pub(crate) struct UsageReply {
     pub rate_limits_available: Option<bool>,
     /// `None` when `rate_limits` was null or isn't a usage body.
     pub limits: Option<Limits>,
+    /// `rate_limits.cedar_ember`, when present, eligible and well formed.
+    pub banked_reset: Option<BankedReset>,
+    /// `rate_limits.juniper_tide`, when reported.
+    pub session_refill: Option<SessionRefill>,
 }
 
 /// A Profile's limits, utilization in percent (0–100, fractional).
@@ -26,6 +32,24 @@ pub(crate) struct Limits {
     pub weekly: Option<f64>,
     /// Model-specific weekly limits: display name and utilization.
     pub models: Vec<(String, f64)>,
+    /// Limit kinds this app doesn't know yet: raw `kind` and utilization.
+    pub other: Vec<(String, f64)>,
+}
+
+impl Limits {
+    /// Every limit with its label, in display order: Session, Weekly, each
+    /// model-specific weekly limit, then each unknown kind. Anything that
+    /// looks for the tightest limit goes through this, so unknown kinds count.
+    pub fn all(&self) -> impl Iterator<Item = (&str, f64)> {
+        let session = self.session.map(|percent| ("Session", percent));
+        let weekly = self.weekly.map(|percent| ("Weekly", percent));
+        session.into_iter().chain(weekly).chain(
+            self.models
+                .iter()
+                .chain(&self.other)
+                .map(|(label, percent)| (label.as_str(), *percent)),
+        )
+    }
 }
 
 /// Reads the `control_response` answering `request_id` from stream-json
@@ -72,6 +96,10 @@ fn reply_from_body(body: &Value) -> UsageReply {
             .map(str::to_owned),
         rate_limits_available: body.get("rate_limits_available").and_then(Value::as_bool),
         limits: body.get("rate_limits").and_then(parse_rate_limits),
+        banked_reset: body.get("rate_limits").and_then(limit_offers::banked_reset),
+        session_refill: body
+            .get("rate_limits")
+            .and_then(limit_offers::session_refill),
     }
 }
 
@@ -98,6 +126,7 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
         session: utilization("five_hour"),
         weekly: utilization("seven_day"),
         models: Vec::new(),
+        other: Vec::new(),
     };
     match body.get("limits").and_then(Value::as_array) {
         Some(entries) => {
@@ -116,7 +145,8 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
                             limits.models.push((name.to_owned(), percent));
                         }
                     }
-                    _ => {}
+                    Some(kind) => limits.other.push((kind.to_owned(), percent)),
+                    None => {}
                 }
             }
         }
