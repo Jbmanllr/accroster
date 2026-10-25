@@ -856,6 +856,26 @@ fn writes_outside_claudes_folder_within_30_seconds_of_an_account_switch_are_not_
 }
 
 #[test]
+fn writes_outside_claudes_folder_within_30_seconds_of_launch_are_not_a_pause() {
+    let (mac, core) = claude_running_on_perso();
+    drop(core);
+    mac.clock.advance(seconds(60));
+    // Claude may have switched just before AccRoster started (both open at
+    // login) and still be flushing the old account's Sessions.
+    let mut core = mac.launch();
+    core.take_effects();
+    mac.clock.advance(seconds(20));
+    let flushed = claude_writes(&mac, WORK, "p1");
+    changed(&mut core, &[flushed]);
+    assert!(!is_paused(&core), "launch grace");
+
+    mac.clock.advance(seconds(11));
+    let parked = claude_writes(&mac, WORK, "p2");
+    changed(&mut core, &[parked]);
+    assert!(is_paused(&core), "31 s after launch");
+}
+
+#[test]
 fn a_sign_in_in_main_log_counts_as_a_switch() {
     let (mac, mut core) = claude_running_on_perso();
     mac.clock.advance(seconds(60));

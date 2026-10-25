@@ -180,7 +180,8 @@ struct Read {
 const SETTLE: SignedDuration = SignedDuration::from_secs(3);
 
 /// Switching flushes the old account's Sessions into its folder: entries
-/// written outside the desktop's folder this soon after a switch are that.
+/// written outside the desktop's folder this soon after a switch, or after
+/// the watch started (a switch just before launch looks the same), are that.
 const SWITCH_GRACE: SignedDuration = SignedDuration::from_secs(30);
 
 /// The watch on the sidebars while sync is on: when Automatic mode runs
@@ -195,8 +196,8 @@ pub(crate) struct Watch {
     /// The desktop's Active Profile folder (`<account>/<org>`) last seen.
     desktop: Option<String>,
     main_log_length: Option<u64>,
-    /// When a switch was last noticed (none since the watch started).
-    switched_at: Option<Timestamp>,
+    /// When a switch was last noticed, or the watch started.
+    switched_at: Timestamp,
 }
 
 impl Watch {
@@ -210,6 +211,7 @@ impl Watch {
                 watching: true,
                 desktop: active_key(&desktop_paths),
                 main_log_length: desktop::main_log_length(&desktop_paths),
+                switched_at: env.clock.now(),
                 ..Watch::default()
             };
             return Some(Effect::WatchSidebarFolders(vec![root]));
@@ -231,7 +233,7 @@ impl Watch {
         let desktop = active_key(&desktop_paths);
         let signed_in = desktop::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
         if desktop != self.desktop || signed_in {
-            self.switched_at = Some(env.clock.now());
+            self.switched_at = env.clock.now();
         }
         self.desktop = desktop;
         self.main_log_length = desktop::main_log_length(&desktop_paths);
@@ -281,9 +283,7 @@ impl Watch {
                 elsewhere += 1;
             }
         }
-        let settled = self
-            .switched_at
-            .is_none_or(|at| now.duration_since(at) > SWITCH_GRACE);
+        let settled = now.duration_since(self.switched_at) > SWITCH_GRACE;
         if self.desktop.is_some() && settled && env.os.desktop_app_running() {
             elsewhere
         } else {

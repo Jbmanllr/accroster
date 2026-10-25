@@ -13,12 +13,12 @@ The app relies on undocumented Claude formats: Sidebar entries and their folder 
 
 - Sync pauses after some desktop updates until the app learns the new field. This is the accepted cost of the policy.
 - The desktop app's dormant multi-account mode has no on-disk signal; its gate and account set live in memory. Two proxies stand in for it, and either one triggers a Safety pause of sync:
-  - a Sidebar entry written outside the desktop's Active Profile folder while Claude runs, not by sync and more than 30 s after the last account switch;
+  - a Sidebar entry written outside the desktop's Active Profile folder while Claude runs, not by sync and more than 30 s after the last account switch or after the watch started (a switch just before launch flushes the same way);
   - a pre-write check finding that a target folder changed since sync's own record of it.
 - Unknown values fail toward caution:
   - an unknown live-process `status`, or a desktop Claude Code child process with no live-process file, means "busy" or "can't tell" for the Guided switch guard;
   - an unknown limit `kind` is shown and counts toward the tightest limit.
-- If a Profile directory's `auth status` identity disagrees with its `oauthAccount`, or every Profile reports the same identity, CLI switching gets a Safety pause: the pointer is frozen and the menu bar label shows `?`.
+- If a Profile directory's `auth status` identity disagrees with its `oauthAccount`, or every Profile reports the same identity, CLI switching gets a Safety pause: the pointer is frozen and the menu bar label shows `?`. While a self-check's `auth status` answers are still coming in (up to 30 s per Profile after launch), CLI switching waits the same way, with "checking…" in the menu header.
 - The self-check also reads the `env` block of the shared `settings.json` and of managed settings, again whenever the shared file's mtime changes (checked on menu open and before each pointer write). The shim can't clear these values, and they apply under every Profile:
   - `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` or `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` gives CLI switching a Safety pause: the first overrides the pointer, the others put one account behind every Profile's name;
   - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or a provider variable only warns once that those Sessions don't use the Profile's subscription;
