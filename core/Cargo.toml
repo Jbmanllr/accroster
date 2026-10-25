@@ -12,6 +12,8 @@ publish.workspace = true
 [dependencies]
 jiff.workspace = true
 libc.workspace = true
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

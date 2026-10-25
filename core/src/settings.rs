@@ -21,6 +21,10 @@ pub(crate) struct Settings {
     /// logging on sets it 24 hours ahead, so it turns itself off.
     #[serde(default)]
     pub verbose_logging_until: Option<Timestamp>,
+    /// The user's last launch-at-login choice in the app. `None` until the
+    /// first-run offer is answered, so the offer is made once.
+    #[serde(default)]
+    pub launch_at_login: Option<bool>,
 }
 
 impl VersionedFile for Settings {

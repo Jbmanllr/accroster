@@ -16,6 +16,9 @@
 //!   program is Claude Code (`claude`), resolved through the `PATH` of the
 //!   request's environment; tests put a stub `claude` first on that `PATH`.
 //! - [`Clock`]: the current time.
+//! - [`LoginItem`]: the app's launch-at-login registration
+//!   (`SMAppService.mainApp`), which the user can also change in System
+//!   Settings → Login Items.
 //! - [`OsFacts`]: facts about the rest of the Mac that are queried, not
 //!   pushed: process liveness and parentage, the desktop app's version.
 //!   Facts the OS pushes (sleep/wake, screen lock, network path changes, the
@@ -42,6 +45,7 @@ pub struct Environment {
     pub spawner: Box<dyn ProcessSpawner>,
     pub clock: Box<dyn Clock>,
     pub os: Box<dyn OsFacts>,
+    pub login_item: Box<dyn LoginItem>,
 }
 
 impl Environment {
@@ -58,6 +62,7 @@ impl Environment {
             spawner: Box::new(SystemSpawner),
             clock: Box::new(SystemClock),
             os: Box::new(SystemOsFacts),
+            login_item: Box::new(SystemLoginItem),
         })
     }
 }
@@ -345,5 +350,62 @@ impl OsFacts for SystemOsFacts {
         let version = String::from_utf8(output.stdout).ok()?;
         let version = version.trim();
         (!version.is_empty()).then(|| version.to_owned())
+    }
+}
+
+/// Where the app stands in System Settings → Login Items, as
+/// `SMAppService.status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginItemStatus {
+    /// Not registered: the app doesn't open at login.
+    NotRegistered,
+    /// Registered and allowed: the app opens at login.
+    Enabled,
+    /// Registered, but the user turned it off in System Settings → Login
+    /// Items. Only the user can turn it back on, there.
+    RequiresApproval,
+    /// macOS can't find the app as a login item (for example, it isn't
+    /// running from its `.app` bundle).
+    NotFound,
+}
+
+/// The app's own launch-at-login registration.
+pub trait LoginItem: Send {
+    fn status(&self) -> LoginItemStatus;
+    /// Registers the app to open at login. `Err` carries macOS's reason.
+    fn register(&self) -> Result<(), String>;
+    /// Stops the app opening at login. `Err` carries macOS's reason.
+    fn unregister(&self) -> Result<(), String>;
+}
+
+/// `SMAppService.mainApp`.
+pub struct SystemLoginItem;
+
+impl LoginItem for SystemLoginItem {
+    fn status(&self) -> LoginItemStatus {
+        use objc2_service_management::{SMAppService, SMAppServiceStatus};
+        // SAFETY: `mainAppService` and `status` take no arguments; SMAppService
+        // has no main-thread requirement.
+        let status = unsafe { SMAppService::mainAppService().status() };
+        match status {
+            SMAppServiceStatus::Enabled => LoginItemStatus::Enabled,
+            SMAppServiceStatus::RequiresApproval => LoginItemStatus::RequiresApproval,
+            SMAppServiceStatus::NotFound => LoginItemStatus::NotFound,
+            _ => LoginItemStatus::NotRegistered,
+        }
+    }
+
+    fn register(&self) -> Result<(), String> {
+        use objc2_service_management::SMAppService;
+        // SAFETY: as in `status`; objc2 handles the error out-parameter.
+        unsafe { SMAppService::mainAppService().registerAndReturnError() }
+            .map_err(|error| error.localizedDescription().to_string())
+    }
+
+    fn unregister(&self) -> Result<(), String> {
+        use objc2_service_management::SMAppService;
+        // SAFETY: as in `register`.
+        unsafe { SMAppService::mainAppService().unregisterAndReturnError() }
+            .map_err(|error| error.localizedDescription().to_string())
     }
 }
