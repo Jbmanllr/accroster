@@ -19,8 +19,10 @@ pub use env::{
     Clock, Environment, OsFacts, ProcessFacts, ProcessSpawner, SpawnOutput, SpawnRequest,
     SystemClock, SystemOsFacts, SystemSpawner,
 };
+pub use env::{LoginItem, LoginItemStatus, SystemLoginItem};
 pub use interface::{
     AboutView, Command, Effect, Event, MenuBarView, MenuItem, MenuView, SettingsView, View,
 };
+pub use interface::{FirstRunView, LaunchAtLoginView};
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

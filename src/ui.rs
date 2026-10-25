@@ -52,10 +52,19 @@ pub struct Ivars {
     /// The latest view, to map clicks back to the commands it attached.
     view: RefCell<Option<View>>,
     settings: OnceCell<SettingsWindow>,
+    /// The first-run offer, open while the view has one.
+    first_run: RefCell<Option<FirstRunWindow>>,
+}
+
+struct FirstRunWindow {
+    window: Retained<NSWindow>,
+    launch_at_login: Retained<NSButton>,
 }
 
 struct SettingsWindow {
     window: Retained<NSWindow>,
+    launch_at_login: Retained<NSButton>,
+    launch_at_login_note: Retained<NSTextField>,
     verbose_logging: Retained<NSButton>,
     verbose_logging_note: Retained<NSTextField>,
 }
@@ -90,6 +99,25 @@ define_class!(
             self.send(Command::SetVerboseLogging(sender.state() == NSControlStateValueOn));
         }
 
+        #[unsafe(method(launchAtLoginClicked:))]
+        fn launch_at_login_clicked(&self, sender: &NSButton) {
+            self.send(Command::SetLaunchAtLogin(sender.state() == NSControlStateValueOn));
+        }
+
+        /// Done in the first-run window: answers with the checkbox's state.
+        #[unsafe(method(firstRunDoneClicked:))]
+        fn first_run_done_clicked(&self, _sender: &NSButton) {
+            let on = self
+                .ivars()
+                .first_run
+                .borrow()
+                .as_ref()
+                .map(|first_run| first_run.launch_at_login.state() == NSControlStateValueOn);
+            if let Some(on) = on {
+                self.send(Command::SetLaunchAtLogin(on));
+            }
+        }
+
         #[unsafe(method(revealLogsClicked:))]
         fn reveal_logs_clicked(&self, _sender: &NSButton) {
             self.send(Command::RevealLogs);
@@ -106,6 +134,7 @@ impl Ui {
             status_item,
             view: RefCell::new(None),
             settings: OnceCell::new(),
+            first_run: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -138,6 +167,28 @@ impl Ui {
         item.setMenu(Some(&self.build_menu(view)));
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
+        }
+        self.render_first_run(view);
+    }
+
+    /// Opens the first-run window when the view has an offer, closes it once
+    /// the view no longer does.
+    fn render_first_run(&self, view: &View) {
+        let mut open = self.ivars().first_run.borrow_mut();
+        match (&view.first_run, open.is_some()) {
+            (Some(offer), false) => {
+                let first_run = self.make_first_run_window(offer.launch_at_login);
+                first_run.window.center();
+                first_run.window.makeKeyAndOrderFront(None);
+                NSApplication::sharedApplication(self.mtm()).activate();
+                *open = Some(first_run);
+            }
+            (None, true) => {
+                if let Some(first_run) = open.take() {
+                    first_run.window.close();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -208,13 +259,78 @@ impl Ui {
                 NSWorkspace::sharedWorkspace()
                     .activateFileViewerSelectingURLs(&NSArray::from_slice(&[&*url]));
             }
+            Effect::OpenLoginItemsSettings => unsafe {
+                objc2_service_management::SMAppService::openSystemSettingsLoginItems()
+            },
             Effect::Terminate => app.terminate(None),
+        }
+    }
+
+    /// A small window with the launch-at-login checkbox and Done. It has no
+    /// close button, so the offer is always answered.
+    fn make_first_run_window(&self, launch_at_login: bool) -> FirstRunWindow {
+        let mtm = self.mtm();
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(380.0, 150.0));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                NSWindowStyleMask::Titled,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("Welcome to AccRoster"));
+        let content = window.contentView().expect("a window has a content view");
+
+        let message = NSTextField::wrappingLabelWithString(
+            ns_string!("AccRoster lives in the menu bar. You can change this later in Settings."),
+            mtm,
+        );
+        message.setFrame(NSRect::new(
+            NSPoint::new(20.0, 90.0),
+            NSSize::new(340.0, 40.0),
+        ));
+        content.addSubview(&message);
+
+        let checkbox = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Open AccRoster at login"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        checkbox.setState(if launch_at_login {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        checkbox.setFrameOrigin(NSPoint::new(20.0, 60.0));
+        content.addSubview(&checkbox);
+
+        let done = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Done"),
+                Some(self),
+                Some(sel!(firstRunDoneClicked:)),
+                mtm,
+            )
+        };
+        done.setKeyEquivalent(ns_string!("\r"));
+        done.setFrameOrigin(NSPoint::new(290.0, 14.0));
+        content.addSubview(&done);
+
+        FirstRunWindow {
+            window,
+            launch_at_login: checkbox,
         }
     }
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(380.0, 140.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 200.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -228,6 +344,27 @@ impl Ui {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("AccRoster Settings"));
         let content = window.contentView().expect("a window has a content view");
+
+        let launch_at_login = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Open AccRoster at login"),
+                Some(self),
+                Some(sel!(launchAtLoginClicked:)),
+                mtm,
+            )
+        };
+        launch_at_login.setFrameOrigin(NSPoint::new(20.0, 162.0));
+        content.addSubview(&launch_at_login);
+
+        let launch_at_login_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+        launch_at_login_note.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        launch_at_login_note.setFrame(NSRect::new(
+            NSPoint::new(40.0, 126.0),
+            NSSize::new(360.0, 32.0),
+        ));
+        content.addSubview(&launch_at_login_note);
 
         let verbose_logging = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -263,6 +400,8 @@ impl Ui {
 
         SettingsWindow {
             window,
+            launch_at_login,
+            launch_at_login_note,
             verbose_logging,
             verbose_logging_note,
         }
@@ -281,6 +420,18 @@ fn menu_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
 }
 
 fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
+    let launch_at_login = &view.launch_at_login;
+    settings.launch_at_login.setState(if launch_at_login.on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    settings.launch_at_login.setEnabled(launch_at_login.enabled);
+    settings
+        .launch_at_login_note
+        .setStringValue(&NSString::from_str(
+            launch_at_login.note.as_deref().unwrap_or(""),
+        ));
     settings.verbose_logging.setState(if view.verbose_logging {
         NSControlStateValueOn
     } else {

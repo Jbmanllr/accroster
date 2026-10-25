@@ -12,7 +12,9 @@
 //!   [`Reply`]s per [`StubCall`] kind and recording every call (args, env,
 //!   stdin) — see [`StubClaude`];
 //! - a **fake clock** ([`FakeClock`]) the test moves by hand;
-//! - **fake OS facts** ([`FakeOs`]): live processes and the desktop app's version.
+//! - **fake OS facts** ([`FakeOs`]): live processes and the desktop app's version;
+//! - a **fake Login Items entry** ([`FakeLoginItem`]) the user can turn off in
+//!   "System Settings".
 //!
 //! A good test states a user-visible outcome: what the view shows, which
 //! effects came out, which files the core wrote or left alone. Never assert on
@@ -35,7 +37,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use accroster_core::{AppPaths, Clock, Core, Environment, OsFacts, ProcessFacts, SystemSpawner};
+use accroster_core::{
+    AppPaths, Clock, Core, Environment, LoginItem, LoginItemStatus, OsFacts, ProcessFacts,
+    SystemSpawner,
+};
 use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
@@ -50,6 +55,8 @@ pub struct FakeMac {
     pub claude: StubClaude,
     pub clock: FakeClock,
     pub os: FakeOs,
+    /// The app's entry in System Settings → Login Items.
+    pub login_item: FakeLoginItem,
     extra_vars: Mutex<Vec<(OsString, OsString)>>,
 }
 
@@ -76,6 +83,7 @@ impl FakeMac {
             claude,
             clock: FakeClock::at(START_TIME.parse().expect("valid start time")),
             os: FakeOs::default(),
+            login_item: FakeLoginItem::default(),
             extra_vars: Mutex::new(Vec::new()),
         }
     }
@@ -97,6 +105,7 @@ impl FakeMac {
             spawner: Box::new(SystemSpawner),
             clock: Box::new(self.clock.clone()),
             os: Box::new(self.os.clone()),
+            login_item: Box::new(self.login_item.clone()),
         }
     }
 
@@ -606,5 +615,87 @@ impl OsFacts for FakeOs {
 
     fn desktop_app_version(&self) -> Option<String> {
         self.0.lock().unwrap().desktop_app_version.clone()
+    }
+}
+
+// ----- Fake login item -------------------------------------------------------------
+
+#[derive(Debug)]
+struct FakeLoginItemState {
+    status: LoginItemStatus,
+    registrations: usize,
+    refusal: Option<String>,
+}
+
+/// The app's Login Items entry, behaving like `SMAppService.mainApp`: it
+/// starts not registered, `register` enables it, `unregister` removes it,
+/// and once the user turns it off in System Settings, registering again
+/// leaves it off. Clones share the entry.
+#[derive(Debug, Clone)]
+pub struct FakeLoginItem(Arc<Mutex<FakeLoginItemState>>);
+
+impl Default for FakeLoginItem {
+    fn default() -> Self {
+        FakeLoginItem(Arc::new(Mutex::new(FakeLoginItemState {
+            status: LoginItemStatus::NotRegistered,
+            registrations: 0,
+            refusal: None,
+        })))
+    }
+}
+
+impl FakeLoginItem {
+    /// Sets the entry's state directly (for example, left over from an
+    /// earlier install, or `NotFound` for an app outside its bundle).
+    pub fn set_status(&self, status: LoginItemStatus) {
+        self.0.lock().unwrap().status = status;
+    }
+
+    /// The user turns AccRoster off in System Settings → Login Items.
+    pub fn turn_off_in_system_settings(&self) {
+        self.set_status(LoginItemStatus::RequiresApproval);
+    }
+
+    /// How many times the app asked to be registered.
+    pub fn registrations(&self) -> usize {
+        self.0.lock().unwrap().registrations
+    }
+
+    /// Makes every later `register` fail with this reason.
+    pub fn refuse_registration(&self, reason: &str) {
+        self.0.lock().unwrap().refusal = Some(reason.to_owned());
+    }
+}
+
+impl LoginItem for FakeLoginItem {
+    fn status(&self) -> LoginItemStatus {
+        self.0.lock().unwrap().status
+    }
+
+    fn register(&self) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        state.registrations += 1;
+        if let Some(reason) = &state.refusal {
+            return Err(reason.clone());
+        }
+        match state.status {
+            LoginItemStatus::NotFound => Err("The app is not a valid login item.".into()),
+            LoginItemStatus::RequiresApproval => Ok(()),
+            _ => {
+                state.status = LoginItemStatus::Enabled;
+                Ok(())
+            }
+        }
+    }
+
+    fn unregister(&self) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        match state.status {
+            LoginItemStatus::NotFound => Err("The app is not a valid login item.".into()),
+            _ => {
+                state.status = LoginItemStatus::NotRegistered;
+                Ok(())
+            }
+        }
     }
 }

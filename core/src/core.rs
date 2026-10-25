@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use jiff::SignedDuration;
 
 use crate::backups;
-use crate::env::Environment;
+use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, Command, Effect, Event, MenuBarView, MenuItem, MenuView, SettingsView, View,
+    AboutView, Command, Effect, Event, FirstRunView, LaunchAtLoginView, MenuBarView, MenuItem,
+    MenuView, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::settings::{self, Settings};
@@ -148,6 +149,7 @@ impl Core {
                 Vec::new()
             }
             Command::RevealLogs => vec![Effect::RevealInFinder(self.paths.app_log())],
+            Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
         }
     }
 
@@ -165,6 +167,7 @@ impl Core {
 
     /// Everything the UI shows right now.
     pub fn view(&self) -> View {
+        let login_item = self.env.login_item.status();
         let mut items: Vec<MenuItem> = self
             .warnings
             .iter()
@@ -197,6 +200,7 @@ impl Core {
             settings: SettingsView {
                 verbose_logging: self.verbose_logging(),
                 verbose_logging_note: "Turns itself off after 24 hours.".into(),
+                launch_at_login: launch_at_login_view(login_item),
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -204,6 +208,13 @@ impl Core {
                 tagline: TAGLINE.into(),
                 disclaimer: DISCLAIMER.into(),
             },
+            // Offered once: only until answered, and only while it's ours to
+            // offer (not already on, not turned off in System Settings).
+            first_run: (self.settings.launch_at_login.is_none()
+                && login_item == LoginItemStatus::NotRegistered)
+                .then_some(FirstRunView {
+                    launch_at_login: true,
+                }),
         }
     }
 
@@ -216,6 +227,20 @@ impl Core {
     fn set_verbose_logging_until(&mut self, until: Option<jiff::Timestamp>) {
         let mut updated = self.settings.clone();
         updated.verbose_logging_until = until;
+        if !self.save_settings(updated) {
+            return;
+        }
+        let state = if until.is_some() { "on" } else { "off" };
+        self.log(
+            Level::Info,
+            "verbose logging",
+            &[("state", Field::Word(state))],
+        );
+    }
+
+    /// Writes `settings.json` and keeps `updated` as the current settings.
+    /// On failure, logs it, keeps the previous settings and returns `false`.
+    fn save_settings(&mut self, updated: Settings) -> bool {
         if let Err(error) = storage::write_versioned(&self.paths.settings(), &updated) {
             let error = error.to_string();
             self.log(
@@ -223,15 +248,47 @@ impl Core {
                 "settings not saved",
                 &[("error", Field::Text(&error))],
             );
-            return;
+            return false;
         }
         self.settings = updated;
-        let state = if until.is_some() { "on" } else { "off" };
-        self.log(
-            Level::Info,
-            "verbose logging",
-            &[("state", Field::Word(state))],
-        );
+        true
+    }
+
+    /// Records the choice, then acts on it. Once the user turned the app off
+    /// in System Settings, only they can turn it back on there: the app opens
+    /// that pane instead of registering again.
+    fn set_launch_at_login(&mut self, on: bool) -> Vec<Effect> {
+        let mut updated = self.settings.clone();
+        updated.launch_at_login = Some(on);
+        self.save_settings(updated);
+        let status = self.env.login_item.status();
+        let (action, result) = match (on, status) {
+            (true, LoginItemStatus::RequiresApproval) => {
+                self.log(Level::Info, "login item left to System Settings", &[]);
+                return vec![Effect::OpenLoginItemsSettings];
+            }
+            (true, LoginItemStatus::Enabled) | (false, LoginItemStatus::NotRegistered) => {
+                return Vec::new();
+            }
+            (true, _) => ("register", self.env.login_item.register()),
+            (false, _) => ("unregister", self.env.login_item.unregister()),
+        };
+        match result {
+            Ok(()) => self.log(
+                Level::Info,
+                "login item changed",
+                &[("action", Field::Word(action))],
+            ),
+            Err(error) => self.log(
+                Level::Warn,
+                "login item not changed",
+                &[
+                    ("action", Field::Word(action)),
+                    ("error", Field::Text(&error)),
+                ],
+            ),
+        }
+        Vec::new()
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
@@ -242,5 +299,34 @@ impl Core {
             message,
             fields,
         );
+    }
+}
+
+/// The Settings toggle shows what macOS has now, not what the app last asked.
+fn launch_at_login_view(status: LoginItemStatus) -> LaunchAtLoginView {
+    match status {
+        LoginItemStatus::Enabled => LaunchAtLoginView {
+            on: true,
+            enabled: true,
+            note: None,
+        },
+        LoginItemStatus::NotRegistered => LaunchAtLoginView {
+            on: false,
+            enabled: true,
+            note: None,
+        },
+        LoginItemStatus::RequiresApproval => LaunchAtLoginView {
+            on: false,
+            enabled: true,
+            note: Some(
+                "Turned off in System Settings → Login Items. Turning it on opens System Settings."
+                    .into(),
+            ),
+        },
+        LoginItemStatus::NotFound => LaunchAtLoginView {
+            on: false,
+            enabled: false,
+            note: Some("Available when AccRoster runs from its app bundle.".into()),
+        },
     }
 }
