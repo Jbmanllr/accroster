@@ -52,7 +52,7 @@ impl Level {
 
 /// A value in a log line, rendered so it reveals nothing private.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Profile, Project and SessionId are for the Profile and Session tickets.
+#[allow(dead_code)] // Project and SessionId are for the Session tickets.
 pub(crate) enum Field<'a> {
     /// Outside text (an error message, a version string). Scrubbed.
     Text(&'a str),

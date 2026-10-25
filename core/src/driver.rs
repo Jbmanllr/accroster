@@ -3,8 +3,9 @@
 //! The UI layer sends [`Input`]s through a [`CoreHandle`] and receives an
 //! [`Update`] (the new [`View`] and the [`Effect`]s to perform) after the
 //! core starts and after every input. The driver also sends
-//! [`Event::Tick`] every [`TICK_INTERVAL`]. Inputs are handled one at a time,
-//! in order, so the core itself stays single-threaded.
+//! [`Event::Tick`] every [`Core::tick_interval`] ([`TICK_INTERVAL`] unless
+//! the core is waiting on something). Inputs are handled one at a time, in
+//! order, so the core itself stays single-threaded.
 
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
@@ -60,13 +61,13 @@ pub fn start(core: Core, on_update: impl Fn(Update) + Send + 'static) -> CoreHan
                 view: core.view(),
                 effects: Vec::new(),
             });
-            let mut next_tick = Instant::now() + TICK_INTERVAL;
+            let mut next_tick = Instant::now() + core.tick_interval();
             loop {
                 let wait = next_tick.saturating_duration_since(Instant::now());
                 let input = match received.recv_timeout(wait) {
                     Ok(input) => input,
                     Err(RecvTimeoutError::Timeout) => {
-                        next_tick = Instant::now() + TICK_INTERVAL;
+                        next_tick = Instant::now() + core.tick_interval();
                         Input::Event(Event::Tick)
                     }
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -75,6 +76,9 @@ pub fn start(core: Core, on_update: impl Fn(Update) + Send + 'static) -> CoreHan
                     Input::Command(command) => core.command(command),
                     Input::Event(event) => core.event(event),
                 };
+                // An input may have started something the core must check on
+                // sooner (a sign-in).
+                next_tick = next_tick.min(Instant::now() + core.tick_interval());
                 on_update(Update {
                     view: core.view(),
                     effects,

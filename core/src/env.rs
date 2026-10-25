@@ -11,9 +11,10 @@
 //! - [`Environment::inherited_vars`]: the environment variables the app was
 //!   started with. Spawns build their environment from these, so the core can
 //!   decide what to clear (`CLAUDE*`, `ANTHROPIC_*`) and what to pass through.
-//! - [`ProcessSpawner`]: runs an external program. The only spawned program is
-//!   Claude Code (`claude`), resolved through the `PATH` of the request's
-//!   environment; tests put a stub `claude` first on that `PATH`.
+//! - [`ProcessSpawner`]: runs an external program to completion, or starts
+//!   one that can be polled and killed (a browser sign-in). The only spawned
+//!   program is Claude Code (`claude`), resolved through the `PATH` of the
+//!   request's environment; tests put a stub `claude` first on that `PATH`.
 //! - [`Clock`]: the current time.
 //! - [`LoginItem`]: the app's launch-at-login registration
 //!   (`SMAppService.mainApp`), which the user can also change in System
@@ -28,9 +29,10 @@
 //! the code that starts real processes is exercised by the tests too.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
 
 use jiff::Timestamp;
 
@@ -95,11 +97,26 @@ impl SpawnOutput {
     }
 }
 
-/// Runs external programs to completion.
+/// Runs external programs.
 pub trait ProcessSpawner: Send {
     /// Runs the program and waits for it. `Err` means it could not be started
     /// (for example, not found on `PATH`); a non-zero exit is an `Ok`.
     fn run(&self, request: &SpawnRequest) -> io::Result<SpawnOutput>;
+
+    /// Starts the program and returns at once, for runs that may take minutes
+    /// and must be cancellable (a browser sign-in). The child's stdin receives
+    /// `request.stdin`, if any, and then stays open until the child exits or
+    /// is killed. `Err` means it could not be started.
+    fn start(&self, request: &SpawnRequest) -> io::Result<Box<dyn RunningProcess>>;
+}
+
+/// A program started by [`ProcessSpawner::start`]. Dropping it kills the
+/// program if it is still running.
+pub trait RunningProcess: Send {
+    /// `Some` once the program has exited, with everything it printed.
+    fn try_wait(&mut self) -> io::Result<Option<SpawnOutput>>;
+    /// Kills the program (if still running) and waits for it to go.
+    fn kill(&mut self) -> io::Result<SpawnOutput>;
 }
 
 /// The current time.
@@ -129,22 +146,12 @@ pub struct SystemSpawner;
 
 impl ProcessSpawner for SystemSpawner {
     fn run(&self, request: &SpawnRequest) -> io::Result<SpawnOutput> {
-        let program = resolve_program(&request.program, &request.env)?;
-        let mut command = Command::new(program);
-        command
-            .args(&request.args)
-            .env_clear()
-            .envs(request.env.iter().map(|(name, value)| (name, value)))
-            .stdin(if request.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
+        let mut command = command_for(request)?;
+        command.stdin(if request.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         let mut child = command.spawn()?;
         if let Some(input) = &request.stdin {
             // Take stdin so it is closed (EOF) once written.
@@ -161,6 +168,103 @@ impl ProcessSpawner for SystemSpawner {
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+
+    fn start(&self, request: &SpawnRequest) -> io::Result<Box<dyn RunningProcess>> {
+        let mut command = command_for(request)?;
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        if let Some(input) = &request.stdin {
+            match stdin.write_all(input) {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                other => other?,
+            }
+        }
+        // Drain stdout and stderr on their own threads, so a chatty child
+        // never blocks on a full pipe while nobody is waiting on it.
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        Ok(Box::new(SystemProcess {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        }))
+    }
+}
+
+/// What every spawn shares: the program, its args, exactly the request's
+/// environment, its cwd, and piped stdout and stderr.
+fn command_for(request: &SpawnRequest) -> io::Result<Command> {
+    let program = resolve_program(&request.program, &request.env)?;
+    let mut command = Command::new(program);
+    command
+        .args(&request.args)
+        .env_clear()
+        .envs(request.env.iter().map(|(name, value)| (name, value)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = &request.cwd {
+        command.current_dir(cwd);
+    }
+    Ok(command)
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// A child started by [`SystemSpawner::start`].
+struct SystemProcess {
+    child: Child,
+    /// Held open until the child exits.
+    stdin: Option<ChildStdin>,
+    /// `None` once the child has been reaped.
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl SystemProcess {
+    fn finish(&mut self, status: ExitStatus) -> SpawnOutput {
+        self.stdin = None;
+        let collect = |handle: Option<JoinHandle<Vec<u8>>>| {
+            handle
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default()
+        };
+        SpawnOutput {
+            exit_code: status.code(),
+            stdout: collect(self.stdout.take()),
+            stderr: collect(self.stderr.take()),
+        }
+    }
+}
+
+impl RunningProcess for SystemProcess {
+    fn try_wait(&mut self) -> io::Result<Option<SpawnOutput>> {
+        Ok(self.child.try_wait()?.map(|status| self.finish(status)))
+    }
+
+    fn kill(&mut self) -> io::Result<SpawnOutput> {
+        // `Child::kill` on an already-reaped child is a no-op `Ok`.
+        self.child.kill()?;
+        let status = self.child.wait()?;
+        Ok(self.finish(status))
+    }
+}
+
+impl Drop for SystemProcess {
+    fn drop(&mut self) {
+        if self.stdout.is_some() {
+            let _ = self.kill();
+        }
     }
 }
 

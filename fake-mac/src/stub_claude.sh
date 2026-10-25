@@ -5,10 +5,11 @@
 # 1. Classifies the call into a reply key (auth-login, auth-status,
 #    auth-logout, get-usage, slash-usage, other).
 # 2. Records the call under calls/<n>/: args and env (NUL-separated), the
-#    stdin it read, and the key.
+#    stdin it read, the key and its pid.
 # 3. Answers from replies/<key>/<seq>/: copies files/ into $CLAUDE_CONFIG_DIR,
 #    prints stdout and stderr, exits with exit_code. Replies are consumed in
-#    order; the last one repeats. With no reply, exits 97.
+#    order; the last one repeats. With no reply, exits 97. A reply marked
+#    hang never answers: it waits until killed.
 set -u
 state="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -47,7 +48,8 @@ mkdir -p "$call"
 printf '%s\0' "$@" > "$call/args"
 /usr/bin/env -0 > "$call/env"
 printf '%s' "$stdin_line" > "$call/stdin"
-printf '%s' "$key" > "$call/key"
+printf %s "$key" > "$call/key"
+printf %s "$$" > "$call/pid"
 
 replies="$state/replies/$key"
 first=""
@@ -63,6 +65,12 @@ if [ -z "$first" ]; then
   exit 97
 fi
 reply="$replies/$first"
+
+# A hanging reply waits, like a sign-in nobody finishes, until killed. exec
+# keeps the pid, so killing the recorded pid kills the wait.
+if [ -f "$reply/hang" ]; then
+  exec /bin/sleep 600
+fi
 
 if [ -d "$reply/files" ]; then
   if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then

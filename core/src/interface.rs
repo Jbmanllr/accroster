@@ -31,6 +31,11 @@ pub enum Command {
     SetVerboseLogging(bool),
     /// Reveal logs in Finder, in Settings.
     RevealLogs,
+    /// Add Profile… in the menu: create a Profile folder and start Claude
+    /// Code's browser sign-in in it.
+    AddProfile,
+    /// "Waiting for sign-in… Cancel" in the menu.
+    CancelSignIn,
     /// The launch-at-login checkbox, in the first-run offer or in Settings.
     SetLaunchAtLogin(bool),
 }
@@ -44,6 +49,8 @@ impl Command {
             Command::Quit => "quit",
             Command::SetVerboseLogging(_) => "set_verbose_logging",
             Command::RevealLogs => "reveal_logs",
+            Command::AddProfile => "add_profile",
+            Command::CancelSignIn => "cancel_sign_in",
             Command::SetLaunchAtLogin(_) => "set_launch_at_login",
         }
     }
@@ -129,6 +136,36 @@ pub enum MenuItem {
         title: String,
         command: Command,
     },
+    /// A disabled plain line (for example `email · Organization · plan` in a
+    /// Profile's hover submenu).
+    Detail(String),
+    /// A signed-in Profile's row, drawn as a custom view with limit bars.
+    Profile(ProfileRow),
+}
+
+/// One Profile's row in the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRow {
+    /// The nickname, else `email · Organization`.
+    pub title: String,
+    /// Session limit, Weekly limit, then each model-specific weekly limit, in
+    /// that order; empty until the first Limit reading.
+    pub limits: Vec<LimitBar>,
+    /// A short line under the bars (for example "Couldn't read limits").
+    pub note: Option<String>,
+    /// The hover submenu.
+    pub submenu: Vec<MenuItem>,
+}
+
+/// One limit, drawn as an `NSLevelIndicator` (continuous capacity, warning at
+/// 70, critical at 90) with its percentage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitBar {
+    /// "Session", "Weekly", or the model's display name.
+    pub label: String,
+    /// Utilization, whole percent (0–100, rounded down like Claude Code's
+    /// `/usage`).
+    pub percent: u32,
 }
 
 /// The Settings window.

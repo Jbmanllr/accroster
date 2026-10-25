@@ -3,6 +3,7 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use jiff::SignedDuration;
 
@@ -13,6 +14,7 @@ use crate::interface::{
     MenuView, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
+use crate::profiles::{self, ProfileRegistry};
 use crate::settings::{self, Settings};
 use crate::storage::{self, AppPaths};
 
@@ -63,6 +65,7 @@ pub struct Core {
     settings: Settings,
     /// Menu warning lines for this run.
     warnings: Vec<String>,
+    profiles: ProfileRegistry,
 }
 
 impl Core {
@@ -83,6 +86,7 @@ impl Core {
             logger,
             settings: loaded.settings,
             warnings: Vec::new(),
+            profiles: ProfileRegistry::default(),
         };
         core.log(
             Level::Info,
@@ -126,7 +130,20 @@ impl Core {
                 "Settings were unreadable and were reset · old file kept as {name}"
             ));
         }
+        let (profiles, ctx) = core.profiles();
+        *profiles = ProfileRegistry::load(&ctx);
         Ok(core)
+    }
+
+    /// How soon the driver should send the next [`Event::Tick`]: every second
+    /// while a sign-in is waiting (so its end shows at once), otherwise
+    /// [`crate::driver::TICK_INTERVAL`].
+    pub fn tick_interval(&self) -> Duration {
+        if self.profiles.signing_in() {
+            Duration::from_secs(1)
+        } else {
+            crate::driver::TICK_INTERVAL
+        }
     }
 
     /// Handles a user intent.
@@ -149,6 +166,16 @@ impl Core {
                 Vec::new()
             }
             Command::RevealLogs => vec![Effect::RevealInFinder(self.paths.app_log())],
+            Command::AddProfile => {
+                let (profiles, ctx) = self.profiles();
+                profiles.add(&ctx);
+                Vec::new()
+            }
+            Command::CancelSignIn => {
+                let (profiles, ctx) = self.profiles();
+                profiles.cancel(&ctx);
+                Vec::new()
+            }
             Command::SetLaunchAtLogin(on) => self.set_launch_at_login(on),
         }
     }
@@ -160,6 +187,8 @@ impl Core {
                 if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
                     self.set_verbose_logging_until(None);
                 }
+                let (profiles, ctx) = self.profiles();
+                profiles.poll(&ctx);
                 Vec::new()
             }
         }
@@ -171,12 +200,29 @@ impl Core {
         let mut items: Vec<MenuItem> = self
             .warnings
             .iter()
-            .cloned()
-            .map(MenuItem::Warning)
+            .map(String::as_str)
+            .chain(self.profiles.notice())
+            .map(|text| MenuItem::Warning(text.to_owned()))
             .collect();
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
+        let rows = self.profiles.rows();
+        if !rows.is_empty() {
+            items.extend(rows.into_iter().map(MenuItem::Profile));
+            items.push(MenuItem::Separator);
+        }
+        items.push(if self.profiles.signing_in() {
+            MenuItem::Action {
+                title: "Waiting for sign-in… Cancel".into(),
+                command: Command::CancelSignIn,
+            }
+        } else {
+            MenuItem::Action {
+                title: "Add Profile…".into(),
+                command: Command::AddProfile,
+            }
+        });
         items.extend([
             MenuItem::Action {
                 title: "Settings…".into(),
@@ -289,6 +335,18 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// The Profile registry, with what it needs from the rest of the core.
+    fn profiles(&mut self) -> (&mut ProfileRegistry, profiles::Context<'_>) {
+        let verbose = self.verbose_logging();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose,
+        };
+        (&mut self.profiles, ctx)
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
