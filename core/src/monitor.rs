@@ -21,7 +21,7 @@ use crate::logging::{Field, Level};
 use crate::profiles::Context;
 use crate::runner::UsageRead;
 use crate::storage::{self, ReadError, VersionedFile};
-use crate::usage::UsageReply;
+use crate::usage::{Limits, UsageReply};
 
 /// How often an Active Profile is read.
 const ACTIVE_CADENCE: SignedDuration = SignedDuration::from_mins(3);
@@ -334,6 +334,11 @@ impl LimitMonitor {
         };
         let wait = Duration::try_from(due.duration_since(now)).unwrap_or(Duration::ZERO);
         wait.clamp(Duration::from_secs(1), idle)
+    }
+
+    /// The latest reading's limits for a Profile, if it has one.
+    pub(crate) fn limits(&self, id: &str) -> Option<&Limits> {
+        self.watches.get(id)?.reading.as_ref()?.limits.as_ref()
     }
 
     /// The limits part of a Profile's row.

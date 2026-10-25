@@ -96,6 +96,14 @@ pub enum Command {
     /// That removal confirmed: point the CLI at `next` (or delete the
     /// pointer) first, then remove the Profile.
     RemoveProfileWithNextCli { id: String, next: Option<String> },
+    /// "Mute notifications" in a Profile's hover submenu (by id): mutes
+    /// (`true`) or unmutes its limit notifications.
+    SetMuted { id: String, muted: bool },
+    /// The thresholds in Settings, in whole percent (1–100). Out-of-range
+    /// values are dropped; the rest are kept sorted, without repeats.
+    SetThresholds(Vec<u32>),
+    /// The reset notification switch in Settings.
+    SetResetNotification(bool),
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -146,6 +154,9 @@ impl Command {
             Command::RemoveProfile(_) => "remove_profile",
             Command::AskRemoveProfileWithNextCli { .. } => "ask_remove_profile_with_next_cli",
             Command::RemoveProfileWithNextCli { .. } => "remove_profile_with_next_cli",
+            Command::SetMuted { .. } => "set_muted",
+            Command::SetThresholds(_) => "set_thresholds",
+            Command::SetResetNotification(_) => "set_reset_notification",
         }
     }
 }
@@ -193,6 +204,14 @@ pub enum Effect {
     BringDesktopAppForward,
     /// Post a user notification.
     Notify { title: String, body: String },
+    /// Post a user notification with one action button titled `action`;
+    /// clicking it sends `command`. Nothing happens unless it is clicked.
+    NotifyWithAction {
+        title: String,
+        body: String,
+        action: String,
+        command: Command,
+    },
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
     /// Ask for a nickname for `name` (prefilled with `current`), then send
@@ -343,6 +362,9 @@ pub struct ProfileRow {
     /// Drawn dimmed: the reading is not current (stale, unreadable, or the
     /// Login expired).
     pub dimmed: bool,
+    /// The most-headroom marker: of the non-stale signed-in Profiles (two or
+    /// more), this one has the lowest tightest limit.
+    pub most_headroom: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,
@@ -376,6 +398,18 @@ pub struct SettingsView {
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
+    pub notifications: NotificationsView,
+}
+
+/// Settings > Notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationsView {
+    /// The thresholds every limit of every signed-in Profile warns at, in
+    /// whole percent, lowest first ([`Command::SetThresholds`]).
+    pub thresholds: Vec<u32>,
+    /// Whether a limit that warned notifies again when it resets
+    /// ([`Command::SetResetNotification`]). Off by default.
+    pub reset_notification: bool,
 }
 
 /// One entry of Settings > Hidden (n)….

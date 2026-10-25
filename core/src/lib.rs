@@ -16,6 +16,7 @@ pub mod interface;
 mod limit_offers;
 mod logging;
 mod monitor;
+mod notifications;
 mod profiles;
 mod runner;
 mod sessions;
@@ -36,7 +37,7 @@ pub use interface::{
 pub use interface::{AllSessionsView, RunningDot, SessionRow};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, NicknameTarget,
+    HiddenDiscovered, LaunchAtLoginView, NicknameTarget, NotificationsView,
 };
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};

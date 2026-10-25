@@ -15,13 +15,14 @@ use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, CliSwitchingView, Command, DiscoveredPair, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    SettingsView, View,
+    NotificationsView, ProfileRow, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
-use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
+use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
 use crate::sessions::SessionIndex;
-use crate::settings::{self, DiscoveredChoice, Settings};
+use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
 use crate::storage::{self, AppPaths};
 
 /// The tagline, shown in About and the README.
@@ -76,6 +77,8 @@ pub struct Core {
     warnings: Vec<String>,
     profiles: ProfileRegistry,
     monitor: LimitMonitor,
+    /// Which limit notifications already fired.
+    notifier: Notifier,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
@@ -105,6 +108,7 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             monitor: LimitMonitor::default(),
+            notifier: Notifier::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
             discovered: Vec::new(),
@@ -168,6 +172,7 @@ impl Core {
         }
         core.rescan_discovered();
         core.monitor = LimitMonitor::load(&core.context());
+        core.notifier = Notifier::load(&core.context());
         Ok(core)
     }
 
@@ -363,6 +368,27 @@ impl Core {
                 self.sessions.set_search(text);
                 Vec::new()
             }
+            Command::SetMuted { id, muted } => {
+                let mut updated = self.settings.clone();
+                updated.muted_profiles.retain(|known| *known != id);
+                if muted {
+                    updated.muted_profiles.push(id);
+                }
+                self.save_settings(updated);
+                Vec::new()
+            }
+            Command::SetThresholds(values) => {
+                let mut updated = self.settings.clone();
+                updated.thresholds = Thresholds::new(values);
+                self.save_settings(updated);
+                Vec::new()
+            }
+            Command::SetResetNotification(on) => {
+                let mut updated = self.settings.clone();
+                updated.reset_notification = on;
+                self.save_settings(updated);
+                Vec::new()
+            }
         }
     }
 
@@ -429,7 +455,47 @@ impl Core {
         if let Some(done) = self.monitor.start_due(&ctx, &watched) {
             self.profiles.record_reading(&ctx, &done.id, done.reply);
         }
-        self.profiles.take_effects()
+        let mut effects = self.profiles.take_effects();
+        effects.extend(self.notify_limits());
+        effects
+    }
+
+    /// The limit notifications due now (thresholds crossed, warned limits
+    /// that reset).
+    fn notify_limits(&mut self) -> Vec<Effect> {
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+        };
+        let watched = self.watched();
+        let listed = self.profiles.listed(&self.settings, |id| {
+            let active = watched.iter().any(|w| w.id == id && w.active);
+            self.monitor.view(&ctx, id, active)
+        });
+        let headroom = most_headroom(&listed, &watched);
+        let pointer = cli_switcher::pointer(&self.paths);
+        let subjects: Vec<Subject> = watched
+            .iter()
+            .filter_map(|w| {
+                let listed = listed.iter().find(|listed| listed.id == w.id)?;
+                Some(Subject {
+                    id: &w.id,
+                    name: &listed.short_label,
+                    limits: self.monitor.limits(&w.id),
+                    tightest: tightest(&listed.row),
+                    muted: self.settings.muted_profiles.contains(&w.id),
+                    cli_active: pointer.as_deref() == Some(w.config_dir.as_path()),
+                })
+            })
+            .collect();
+        let choices = Choices {
+            thresholds: self.settings.thresholds.values(),
+            reset_notification: self.settings.reset_notification,
+        };
+        self.notifier
+            .check(&ctx, &subjects, headroom.as_ref(), &choices)
     }
 
     /// The signed-in Profiles the Limit monitor reads, with which are a
@@ -469,6 +535,11 @@ impl Core {
             let active = watched.iter().any(|w| w.id == id && w.active);
             self.monitor.view(&ctx, id, active)
         });
+        if let Some(headroom) = most_headroom(&listed, &watched) {
+            for listed in listed.iter_mut() {
+                listed.row.most_headroom = listed.id == headroom.id;
+            }
+        }
         let cli = cli_switcher::present(&self.paths, &mut listed);
         let pointer = cli_switcher::pointer(&self.paths);
         // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
@@ -499,6 +570,26 @@ impl Core {
                 continue;
             };
             let row = &mut listed.row;
+            let muted = self.settings.muted_profiles.contains(&profile.id);
+            let remove = row
+                .submenu
+                .iter()
+                .position(|item| {
+                    matches!(item, MenuItem::Action { title, .. } | MenuItem::Submenu { title, .. }
+                        if title == "Remove…")
+                })
+                .unwrap_or(row.submenu.len());
+            row.submenu.insert(
+                remove,
+                MenuItem::Check {
+                    title: "Mute notifications".into(),
+                    checked: muted,
+                    command: Command::SetMuted {
+                        id: profile.id.clone(),
+                        muted: !muted,
+                    },
+                },
+            );
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
                 row.badges.push("Desktop".into());
             } else if desktop_installed {
@@ -579,6 +670,10 @@ impl Core {
                         restore: Command::UnhideDiscovered(evidence.pair.clone()),
                     })
                     .collect(),
+                notifications: NotificationsView {
+                    thresholds: self.settings.thresholds.values().to_vec(),
+                    reset_notification: self.settings.reset_notification,
+                },
             },
             about: AboutView {
                 name: "AccRoster".into(),
@@ -728,6 +823,7 @@ impl Core {
                 verbose: self.verbose_logging(),
             };
             self.monitor.forget(&ctx, id);
+            self.notifier.forget(&ctx, id);
             self.forget_profile_settings(id);
         }
     }
@@ -764,6 +860,7 @@ impl Core {
     fn forget_profile_settings(&mut self, id: &str) {
         let mut updated = self.settings.clone();
         updated.nicknames.remove(id);
+        updated.muted_profiles.retain(|known| known != id);
         updated.profile_order.retain(|known| known != id);
         if updated != self.settings {
             self.save_settings(updated);
@@ -966,6 +1063,26 @@ impl Core {
             fields,
         );
     }
+}
+
+/// A row's tightest limit: its highest bar, unknown limit kinds included.
+fn tightest(row: &ProfileRow) -> Option<u32> {
+    row.limits.iter().map(|bar| bar.percent).max()
+}
+
+/// The non-stale watched Profile with the lowest tightest limit, among two
+/// or more.
+fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom> {
+    notifications::most_headroom(listed.iter().filter_map(|listed| {
+        if listed.row.dimmed || !watched.iter().any(|w| w.id == listed.id) {
+            return None;
+        }
+        Some((
+            listed.id,
+            listed.short_label.as_str(),
+            tightest(&listed.row)?,
+        ))
+    }))
 }
 
 /// The Settings toggle shows what macOS has now, not what the app last asked.

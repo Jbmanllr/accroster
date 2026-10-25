@@ -373,7 +373,12 @@ fn sign_in_again_in_the_same_folder_with_the_email_fixes_an_expired_login() {
         rows[0].limits,
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
-    assert!(notifications(&effects).is_empty());
+    assert!(
+        !notifications(&effects)
+            .iter()
+            .any(|notice| notice.starts_with("Login expired")),
+        "{effects:?}"
+    );
     assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
     drop(core);
     assert!(
