@@ -522,6 +522,89 @@ fn signing_in_again_as_another_login_is_undone_and_the_profile_stays_expired() {
 }
 
 #[test]
+fn an_unreadable_claude_json_is_never_overwritten_when_undoing_another_logins_sign_in() {
+    let (mac, mut core) = mac_with_expired_work();
+    let folder = only_profile_folder(&mac);
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&FixtureLogin::perso()))
+        .reply(
+            StubCall::AuthLogout,
+            signed_out().writing(".claude.json", "{ not json"),
+        );
+
+    click_in_row(&mut core, 0, "Sign in again…");
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(
+        mac.read_file(format!("{folder}/.claude.json")).as_deref(),
+        Some("{ not json"),
+        "left as it is"
+    );
+    assert_eq!(
+        warnings(&core),
+        [format!(
+            "Signed in as {PERSO}, not {WORK} · that sign-in was undone, but {WORK}'s .claude.json couldn't be read, so its Login wasn't put back"
+        )]
+    );
+}
+
+/// The Profile folder whose `.claude.json` names `email`.
+fn folder_of(mac: &FakeMac, email: &str) -> String {
+    mac.list(PROFILES)
+        .into_iter()
+        .map(|id| format!("{PROFILES}/{id}"))
+        .find(|folder| {
+            mac.read_json(format!("{folder}/.claude.json"))
+                .is_some_and(|body| body["oauthAccount"]["emailAddress"] == json!(email))
+        })
+        .expect("a folder for that email")
+}
+
+#[test]
+fn while_seeding_is_paused_undoing_another_logins_sign_in_writes_nothing() {
+    let mac = mac_signing_in_work_reading(rate_limits_unavailable());
+    let team = FixtureLogin::new(
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "me@team.example",
+        "Team Co",
+    );
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&team))
+        .reply(StubCall::AuthStatus, auth_status(&team));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    add_profile(&mut core);
+    drop(core);
+    let work = folder_of(&mac, "me@work.example");
+    // Claude Code changed the account format in the other Profile's file.
+    mac.write_json(
+        format!("{}/.claude.json", folder_of(&mac, "me@team.example")),
+        &json!({ "oauthAccount": { "accountUuid": 7, "organizationUuid": "o", "emailAddress": "me@team.example" } }),
+    );
+    let mut core = mac.launch();
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&FixtureLogin::perso()))
+        .reply(
+            StubCall::AuthLogout,
+            signed_out().writing(".claude.json", "{}"),
+        );
+
+    click_in_row(&mut core, 0, "Sign in again…");
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(
+        mac.read_file(format!("{work}/.claude.json")).as_deref(),
+        Some("{}"),
+        "nothing written while paused"
+    );
+    let expected = format!(
+        "Signed in as {PERSO}, not {WORK} · that sign-in was undone, but Seeding .claude.json is paused, so its Login wasn't put back"
+    );
+    assert!(warnings(&core).contains(&expected), "{:?}", warnings(&core));
+}
+
+#[test]
 fn remove_warns_first_when_a_shared_anthropic_configs_folder_exists() {
     let mac = mac_signing_in_as(&work(), limits_body());
     mac.write_file(".config/anthropic/configs/default.json", "{}");

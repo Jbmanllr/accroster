@@ -167,11 +167,46 @@ pub enum SidebarSyncMode {
 pub enum SafetyFeature {
     /// The pointer and row clicks.
     CliSwitching,
-    /// The Profile links that share Transcripts and resume data
-    /// (`projects`, `file-history`, `session-env`).
-    TranscriptSharing,
+    /// Creating or repairing the links from Profile folders to
+    /// `~/.claude` (a replaced `projects`, `file-history` or `session-env`
+    /// link pauses them).
+    Links,
+    /// Writing a Profile's `.claude.json`: seeding it from `~/.claude.json`,
+    /// and putting its Login back after another Login's sign-in there was
+    /// undone.
+    Seeding,
     /// Copying Sidebar entries between Profiles.
     SidebarSync,
+}
+
+impl SafetyFeature {
+    pub const ALL: [SafetyFeature; 4] = [
+        SafetyFeature::CliSwitching,
+        SafetyFeature::Links,
+        SafetyFeature::Seeding,
+        SafetyFeature::SidebarSync,
+    ];
+
+    /// How the menu, notifications and Diagnostics name it ("Resume
+    /// <name>", "<name> paused").
+    pub fn name(self) -> &'static str {
+        match self {
+            SafetyFeature::CliSwitching => "CLI switching",
+            SafetyFeature::Links => "Profile links",
+            SafetyFeature::Seeding => "Seeding .claude.json",
+            SafetyFeature::SidebarSync => "Sidebar sync",
+        }
+    }
+
+    /// Its key in `state/safety.json` and the log.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            SafetyFeature::CliSwitching => "cliSwitching",
+            SafetyFeature::Links => "links",
+            SafetyFeature::Seeding => "seeding",
+            SafetyFeature::SidebarSync => "sidebarSync",
+        }
+    }
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.

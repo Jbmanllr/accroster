@@ -425,7 +425,7 @@ pub(crate) struct BlockedLink {
 }
 
 /// The links that share Transcripts and resume data. One replaced pauses
-/// Transcript sharing for every Profile (ADR 0004).
+/// Profile links for every Profile (ADR 0004).
 pub(crate) const TRANSCRIPT_LINKS: [&str; 3] = ["projects", "file-history", "session-env"];
 
 /// The links of `profile_dir` whose place holds something else: a regular
@@ -452,16 +452,11 @@ pub(crate) fn replaced_links(profile_dir: &Path, claude_home: &Path) -> Vec<&'st
         .collect()
 }
 
-/// Makes every missing link from `profile_dir` to `claude_home`, except the
-/// [`TRANSCRIPT_LINKS`] unless `share_transcripts` (Transcript sharing is
-/// not under a Safety pause). Never replaces what is already there: a
+/// Makes every missing link from `profile_dir` to `claude_home` (the caller
+/// checks that Profile links aren't under a Safety pause). Never replaces what is already there: a
 /// regular file or folder in a link's place is reported, not overwritten. A
 /// link that exists is left as it is.
-pub(crate) fn ensure_links(
-    profile_dir: &Path,
-    claude_home: &Path,
-    share_transcripts: bool,
-) -> io::Result<Vec<BlockedLink>> {
+pub(crate) fn ensure_links(profile_dir: &Path, claude_home: &Path) -> io::Result<Vec<BlockedLink>> {
     let mut blocked = Vec::new();
     let mut link = |name: &str| -> io::Result<()> {
         let path = profile_dir.join(name);
@@ -478,9 +473,6 @@ pub(crate) fn ensure_links(
         }
     };
     for name in LINKED_DIRS {
-        if !share_transcripts && TRANSCRIPT_LINKS.contains(&name) {
-            continue;
-        }
         fs::create_dir_all(claude_home.join(name))?;
         link(name)?;
     }

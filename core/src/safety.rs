@@ -82,9 +82,9 @@ pub(crate) struct Finding {
     pub status: CheckStatus,
     /// Field names, counts and versions only: it goes into "Copy report".
     pub detail: Option<String>,
-    /// The write feature this result stops, and why (a phrase for the menu
-    /// line, like "settings.json sets CLAUDE_CONFIG_DIR").
-    pub blocks: Option<(SafetyFeature, String)>,
+    /// The write features this result stops, and why (a phrase for the
+    /// menu line, like "settings.json sets CLAUDE_CONFIG_DIR").
+    pub blocks: Vec<(SafetyFeature, String)>,
 }
 
 impl Finding {
@@ -92,7 +92,7 @@ impl Finding {
         Finding {
             status: CheckStatus::Pass,
             detail: None,
-            blocks: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -100,7 +100,7 @@ impl Finding {
         Finding {
             status: CheckStatus::NeverSeen,
             detail: None,
-            blocks: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -108,7 +108,7 @@ impl Finding {
         Finding {
             status: CheckStatus::Fail,
             detail: Some(detail.into()),
-            blocks: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -118,35 +118,15 @@ impl Finding {
     }
 
     pub(crate) fn blocking(mut self, feature: SafetyFeature, reason: impl Into<String>) -> Finding {
-        self.blocks = Some((feature, reason.into()));
+        self.blocks.push((feature, reason.into()));
         self
     }
 }
 
-fn feature_name(feature: SafetyFeature) -> &'static str {
-    match feature {
-        SafetyFeature::CliSwitching => "CLI switching",
-        SafetyFeature::TranscriptSharing => "Transcript sharing",
-        SafetyFeature::SidebarSync => "Sidebar sync",
-    }
-}
-
-fn feature_key(feature: SafetyFeature) -> &'static str {
-    match feature {
-        SafetyFeature::CliSwitching => "cliSwitching",
-        SafetyFeature::TranscriptSharing => "transcriptSharing",
-        SafetyFeature::SidebarSync => "sidebarSync",
-    }
-}
-
 fn feature_from_key(key: &str) -> Option<SafetyFeature> {
-    [
-        SafetyFeature::CliSwitching,
-        SafetyFeature::TranscriptSharing,
-        SafetyFeature::SidebarSync,
-    ]
-    .into_iter()
-    .find(|feature| feature_key(*feature) == key)
+    SafetyFeature::ALL
+        .into_iter()
+        .find(|feature| feature.key() == key)
 }
 
 /// `state/safety.json`.
@@ -238,7 +218,7 @@ impl Safety {
                         CheckStatus::Fail
                     },
                     detail: stored.detail.clone(),
-                    blocks: None,
+                    blocks: Vec::new(),
                 },
             );
         }
@@ -273,11 +253,11 @@ impl Safety {
                 continue;
             }
             self.file.paused.push(PauseRecord {
-                feature: feature_key(feature).to_owned(),
+                feature: feature.key().to_owned(),
                 reason: reason.clone(),
             });
             self.pending.push(Effect::Notify {
-                title: format!("{} paused", feature_name(feature)),
+                title: format!("{} paused", feature.name()),
                 body: format!(
                     "{reason}. Nothing was written. Resume it in Diagnostics once this is fixed."
                 ),
@@ -292,7 +272,7 @@ impl Safety {
     fn blockers(&self) -> Vec<(SafetyFeature, String)> {
         self.findings
             .values()
-            .filter_map(|finding| finding.blocks.clone())
+            .flat_map(|finding| finding.blocks.iter().cloned())
             .collect()
     }
 
@@ -300,6 +280,15 @@ impl Safety {
         self.blockers()
             .iter()
             .any(|(blocked, _)| *blocked == feature)
+    }
+
+    /// Every feature under a Safety pause.
+    pub(crate) fn paused(&self) -> Vec<SafetyFeature> {
+        self.file
+            .paused
+            .iter()
+            .filter_map(|record| feature_from_key(&record.feature))
+            .collect()
     }
 
     pub(crate) fn is_paused(&self, feature: SafetyFeature) -> bool {
@@ -334,11 +323,7 @@ impl Safety {
             .iter()
             .filter_map(|record| {
                 let feature = feature_from_key(&record.feature)?;
-                Some(format!(
-                    "{} · {} paused",
-                    record.reason,
-                    feature_name(feature)
-                ))
+                Some(format!("{} · {} paused", record.reason, feature.name()))
             })
             .chain(self.warnings.iter().cloned())
             .collect()
@@ -466,7 +451,7 @@ impl Safety {
                 let feature = feature_from_key(&record.feature)?;
                 Some(PausedFeature {
                     feature,
-                    title: format!("{} paused", feature_name(feature)),
+                    title: format!("{} paused", feature.name()),
                     reason: record.reason.clone(),
                     resume: (!self.is_blocked(feature)).then_some(Command::ResumeFeature(feature)),
                 })

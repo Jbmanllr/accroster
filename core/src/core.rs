@@ -156,7 +156,7 @@ fn context_of<'a>(
         paths,
         logger,
         verbose: verbose_logging(settings, env),
-        share_transcripts: !safety.is_paused(SafetyFeature::TranscriptSharing),
+        paused: safety.paused(),
     }
 }
 
@@ -1368,7 +1368,7 @@ impl Core {
             self.log(
                 Level::Warn,
                 "safety pause",
-                &[("feature", Field::Word(feature_word(feature)))],
+                &[("feature", Field::Word(feature.key()))],
             );
         }
     }
@@ -1387,7 +1387,7 @@ impl Core {
     }
 
     /// Checks every Profile folder's links: a replaced shared-Transcript link
-    /// blocks Transcript sharing; other replaced links are only reported.
+    /// pauses Profile links; other replaced links are only reported.
     fn check_links(&mut self) {
         let claude_home = self.env.home.join(".claude");
         self.links = self
@@ -1434,9 +1434,7 @@ impl Core {
             })
         };
         let transcripts = match summary(true) {
-            Some(text) => {
-                Finding::fail(text.clone()).blocking(SafetyFeature::TranscriptSharing, text)
-            }
+            Some(text) => Finding::fail(text.clone()).blocking(SafetyFeature::Links, text),
             None => Finding::pass(),
         };
         let others = match summary(false) {
@@ -1480,7 +1478,8 @@ impl Core {
                     return;
                 }
             }
-            SafetyFeature::TranscriptSharing => self.check_links(),
+            SafetyFeature::Links => self.check_links(),
+            SafetyFeature::Seeding => self.check_accounts(),
             SafetyFeature::SidebarSync => self.check_sidebar_entries(),
         }
         self.finish_resume(feature);
@@ -1492,16 +1491,16 @@ impl Core {
             self.log(
                 Level::Info,
                 "safety pause kept",
-                &[("feature", Field::Word(feature_word(feature)))],
+                &[("feature", Field::Word(feature.key()))],
             );
             return;
         }
         self.log(
             Level::Info,
             "safety pause resumed",
-            &[("feature", Field::Word(feature_word(feature)))],
+            &[("feature", Field::Word(feature.key()))],
         );
-        if feature == SafetyFeature::TranscriptSharing {
+        if feature == SafetyFeature::Links {
             let (profiles, ctx) = self.profiles();
             profiles.heal_links(&ctx);
             self.check_links();
@@ -2257,14 +2256,6 @@ fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom>
             tightest(&listed.row)?,
         ))
     }))
-}
-
-fn feature_word(feature: SafetyFeature) -> &'static str {
-    match feature {
-        SafetyFeature::CliSwitching => "cli_switching",
-        SafetyFeature::TranscriptSharing => "transcript_sharing",
-        SafetyFeature::SidebarSync => "sidebar_sync",
-    }
 }
 
 /// The Settings toggle shows what macOS has now, not what the app last asked.

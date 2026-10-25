@@ -18,8 +18,9 @@ use crate::profiles::{Account, CrossCheckAnswer};
 use crate::safety::{Finding, claude_code_name, reportable};
 
 /// `oauthAccount` and `cachedUsageUtilization` in each Profile's
-/// `.claude.json`. A malformed `oauthAccount` pauses CLI switching: the app
-/// could no longer tell which account a folder is.
+/// `.claude.json`. A malformed `oauthAccount` pauses CLI switching (the app
+/// could no longer tell which account a folder is) and Seeding (the app
+/// would write a file whose format changed).
 pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Finding) {
     let mut accounts_seen = 0;
     let mut bad_accounts = BTreeSet::new();
@@ -55,10 +56,10 @@ pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Findin
     } else if bad_accounts.is_empty() {
         Finding::pass()
     } else {
-        Finding::fail(format!("missing or not text: {}", join(&bad_accounts))).blocking(
-            SafetyFeature::CliSwitching,
-            format!("{claude_code} changed .claude.json accounts"),
-        )
+        let reason = format!("{claude_code} changed .claude.json accounts");
+        Finding::fail(format!("missing or not text: {}", join(&bad_accounts)))
+            .blocking(SafetyFeature::CliSwitching, reason.clone())
+            .blocking(SafetyFeature::Seeding, reason)
     };
     let caches = if caches_seen == 0 {
         Finding::never_seen()

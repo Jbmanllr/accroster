@@ -13,8 +13,8 @@ use accroster_core::watcher::{self, FolderWatch};
 use crate::notifications;
 use accroster_core::{
     AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
-    LimitBar, MenuItem, ProfileRow, RunningDot, SessionDetail, SessionFilter, SessionRow,
-    SettingsView, SidebarGroup, SidebarSyncMode, View,
+    LimitBar, MenuItem, ProfileRow, RunningDot, SafetyFeature, SessionDetail, SessionFilter,
+    SessionRow, SettingsView, SidebarGroup, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -1166,7 +1166,7 @@ impl Ui {
     /// a Resume button per resumable pause, and Copy report.
     fn make_diagnostics_window(&self) -> DiagnosticsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 440.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(860.0, 440.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1187,7 +1187,7 @@ impl Ui {
         )));
         text.setFrame(NSRect::new(
             NSPoint::new(20.0, 64.0),
-            NSSize::new(680.0, 360.0),
+            NSSize::new(820.0, 360.0),
         ));
         content.addSubview(&text);
 
@@ -1202,9 +1202,10 @@ impl Ui {
         copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
         content.addSubview(&copy);
 
-        let resume = [140.0, 330.0, 530.0]
-            .into_iter()
-            .map(|x| {
+        // Placed side by side as they are shown (`render_diagnostics`).
+        let resume = SafetyFeature::ALL
+            .iter()
+            .map(|_| {
                 let button = unsafe {
                     NSButton::buttonWithTitle_target_action(
                         ns_string!("Resume"),
@@ -1213,7 +1214,6 @@ impl Ui {
                         mtm,
                     )
                 };
-                button.setFrameOrigin(NSPoint::new(x, 20.0));
                 button.setHidden(true);
                 content.addSubview(&button);
                 button
@@ -1284,15 +1284,18 @@ impl Ui {
             .iter()
             .filter_map(|paused| {
                 let command = paused.resume.clone()?;
-                let feature = paused.title.trim_end_matches(" paused");
-                Some((format!("Resume {feature}"), command))
+                Some((format!("Resume {}", paused.feature.name()), command))
             })
             .collect();
+        // Right of Copy report, side by side.
+        let mut x = 140.0;
         for (index, button) in diagnostics.resume.iter().enumerate() {
             match resumable.get(index) {
                 Some((title, _)) => {
                     button.setTitle(&NSString::from_str(title));
                     button.sizeToFit();
+                    button.setFrameOrigin(NSPoint::new(x, 20.0));
+                    x += button.frame().size.width + 8.0;
                     button.setTag(index as isize);
                     button.setHidden(false);
                 }

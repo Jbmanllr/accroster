@@ -468,6 +468,89 @@ fn replace_link(mac: &FakeMac, email: &str, name: &str) -> String {
     dir
 }
 
+/// The folders under `profiles/` that `before` didn't list.
+fn new_folders(mac: &FakeMac, before: &[String]) -> Vec<String> {
+    mac.list(PROFILES)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .map(|id| format!("{PROFILES}/{id}"))
+        .collect()
+}
+
+fn links_in(mac: &FakeMac, folder: &str) -> Vec<String> {
+    mac.list(folder)
+        .into_iter()
+        .filter(|name| {
+            std::fs::symlink_metadata(mac.path(format!("{folder}/{name}")))
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .collect()
+}
+
+#[test]
+fn while_links_are_paused_no_link_is_made_or_repaired() {
+    let (mac, core) = cli_on_with_two_profiles();
+    drop(core);
+    replace_link(&mac, "me@work.example", "projects");
+    let perso = format!("{PROFILES}/{}", profile_of(&mac, "me@example.com"));
+    std::fs::remove_file(mac.path(format!("{perso}/skills"))).unwrap();
+
+    let mut core = mac.launch();
+
+    assert!(is_paused(&core, SafetyFeature::Links));
+    assert!(
+        !links_in(&mac, &perso).contains(&"skills".to_owned()),
+        "a missing link isn't repaired"
+    );
+    let before = mac.list(PROFILES);
+    mac.claude.reply(StubCall::AuthLogin, Reply::hanging());
+    core.command(Command::AddProfile);
+    let added = new_folders(&mac, &before);
+    assert_eq!(added.len(), 1);
+    assert!(
+        links_in(&mac, &added[0]).is_empty(),
+        "a new Profile gets none: {:?}",
+        mac.list(&added[0])
+    );
+    assert!(
+        mac.read_file(format!("{}/.claude.json", added[0]))
+            .is_some(),
+        "seeding isn't paused"
+    );
+    core.command(Command::CancelSignIn);
+}
+
+#[test]
+fn a_changed_claude_json_account_format_pauses_seeding_too() {
+    let (mac, core) = cli_on_with_two_profiles();
+    drop(core);
+    let work = format!(
+        "{PROFILES}/{}/.claude.json",
+        profile_of(&mac, "me@work.example")
+    );
+    mac.write_json(
+        &work,
+        &json!({ "oauthAccount": { "accountUuid": 7, "organizationUuid": "o", "emailAddress": "me@work.example" } }),
+    );
+    mac.write_json(".claude.json", &json!({ "theme": "dark" }));
+
+    let mut core = mac.launch();
+
+    assert!(is_paused(&core, SafetyFeature::Seeding));
+    let before = mac.list(PROFILES);
+    mac.claude.reply(StubCall::AuthLogin, Reply::hanging());
+    core.command(Command::AddProfile);
+    let added = new_folders(&mac, &before);
+    assert_eq!(added.len(), 1);
+    assert_eq!(
+        mac.read_file(format!("{}/.claude.json", added[0])),
+        None,
+        "not seeded while paused"
+    );
+    assert!(!links_in(&mac, &added[0]).is_empty(), "links aren't paused");
+    core.command(Command::CancelSignIn);
+}
+
 fn row_titled<'a>(
     rows: &'a [accroster_core::ProfileRow],
     email: &str,
@@ -478,22 +561,22 @@ fn row_titled<'a>(
 }
 
 #[test]
-fn a_replaced_projects_link_pauses_transcript_sharing_and_nothing_is_overwritten() {
+fn a_replaced_projects_link_pauses_profile_links_and_nothing_is_overwritten() {
     let (mac, core) = cli_on_with_two_profiles();
     drop(core);
     let replaced = replace_link(&mac, "me@work.example", "projects");
 
     let mut core = mac.launch();
 
-    assert!(is_paused(&core, SafetyFeature::TranscriptSharing));
+    assert!(is_paused(&core, SafetyFeature::Links));
     assert_eq!(
         warnings(&core),
-        ["projects link replaced in 1 Profile · Transcript sharing paused"]
+        ["projects link replaced in 1 Profile · Profile links paused"]
     );
     assert_eq!(
         notifications(&core.take_effects()),
         [(
-            "Transcript sharing paused".to_owned(),
+            "Profile links paused".to_owned(),
             "projects link replaced in 1 Profile. Nothing was written. Resume it in Diagnostics once this is fixed.".to_owned()
         )]
     );
@@ -515,12 +598,12 @@ fn a_replaced_projects_link_pauses_transcript_sharing_and_nothing_is_overwritten
     // Fixed by hand, then resumed by the click.
     std::fs::remove_dir_all(mac.path(&replaced)).unwrap();
     core.event(Event::MenuOpened);
-    assert!(is_paused(&core, SafetyFeature::TranscriptSharing));
-    let resume = resume_button(&core, SafetyFeature::TranscriptSharing).expect("Resume offered");
+    assert!(is_paused(&core, SafetyFeature::Links));
+    let resume = resume_button(&core, SafetyFeature::Links).expect("Resume offered");
     core.command(resume);
     settle(&mut core);
 
-    assert!(!is_paused(&core, SafetyFeature::TranscriptSharing));
+    assert!(!is_paused(&core, SafetyFeature::Links));
     assert!(
         std::fs::symlink_metadata(mac.path(&replaced))
             .unwrap()
@@ -536,7 +619,7 @@ fn rows_of(core: &Core) -> Vec<accroster_core::ProfileRow> {
 }
 
 #[test]
-fn a_profile_added_during_the_pause_gets_no_transcript_links() {
+fn a_profile_added_during_the_pause_gets_no_links_and_says_transcripts_arent_shared() {
     let mac = FakeMac::new();
     mac.with_claude_home(&FixtureLogin::perso());
     for login in [work(), FixtureLogin::perso()] {
@@ -554,18 +637,12 @@ fn a_profile_added_during_the_pause_gets_no_transcript_links() {
     add_profile(&mut core);
 
     let perso = format!("{PROFILES}/{}", profile_of(&mac, "me@example.com"));
-    for name in ["projects", "file-history", "session-env"] {
+    for name in ["projects", "file-history", "session-env", "skills"] {
         assert!(
             std::fs::symlink_metadata(mac.path(format!("{perso}/{name}"))).is_err(),
             "{name} not linked during the pause"
         );
     }
-    assert!(
-        std::fs::symlink_metadata(mac.path(format!("{perso}/skills")))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
     assert_eq!(
         row_titled(&rows(&core), "me@example.com").note.as_deref(),
         Some("Transcripts not shared")
@@ -860,7 +937,10 @@ fn a_malformed_oauth_account_pauses_cli_switching_and_hides_only_that_profile() 
     assert!(is_paused(&core, SafetyFeature::CliSwitching));
     assert_eq!(
         warnings(&core),
-        ["Claude Code changed .claude.json accounts · CLI switching paused"]
+        [
+            "Claude Code changed .claude.json accounts · CLI switching paused",
+            "Claude Code changed .claude.json accounts · Seeding .claude.json paused"
+        ]
     );
     let titles: Vec<String> = rows(&core).into_iter().map(|row| row.title).collect();
     assert_eq!(

@@ -18,7 +18,9 @@ use serde_json::Value;
 use crate::backups;
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
-use crate::interface::{Command, DiscoveredPair, Effect, MenuItem, NicknameTarget, ProfileRow};
+use crate::interface::{
+    Command, DiscoveredPair, Effect, MenuItem, NicknameTarget, ProfileRow, SafetyFeature,
+};
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{Completed, LimitsView, Watched};
 use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs, Runner};
@@ -34,12 +36,16 @@ pub(crate) struct Context<'a> {
     pub paths: &'a AppPaths,
     pub logger: &'a Logger,
     pub verbose: bool,
-    /// Whether the links sharing Transcripts may be made (Transcript sharing
-    /// isn't under a Safety pause).
-    pub share_transcripts: bool,
+    /// The write features under a Safety pause: nothing they write is
+    /// written.
+    pub paused: Vec<SafetyFeature>,
 }
 
 impl Context<'_> {
+    pub(crate) fn is_paused(&self, feature: SafetyFeature) -> bool {
+        self.paused.contains(&feature)
+    }
+
     pub(crate) fn log(
         &self,
         level: Level,
@@ -309,9 +315,12 @@ enum Then {
     /// delete it once signed out. `failed` is the notice if that fails.
     Discard { failed: Option<String> },
     /// Another Login's sign-in into an existing Profile, undone: put the
-    /// Profile's own Login back. `failed` is the notice if that fails.
+    /// Profile's own Login back. `undone` is the notice when that worked,
+    /// `failed` the one when the sign-out failed; `name` names the Profile.
     UndoSignInAgain {
         previous_account: Option<Value>,
+        name: String,
+        undone: String,
         failed: String,
     },
     /// A folder under `profiles/` that isn't a Profile (Uninstall…).
@@ -600,12 +609,19 @@ impl ProfileRegistry {
             }
             Then::UndoSignInAgain {
                 previous_account,
+                name,
+                undone,
                 failed,
             } => {
                 if !signed_out(ctx, &id, finished) {
                     self.notice = Some(failed);
-                } else if let Some(account) = previous_account {
-                    restore_account(ctx, &id, &config_dir, &account);
+                } else if let Some(account) = previous_account
+                    && let Err(not_restored) = restore_account(ctx, &id, &config_dir, &account)
+                {
+                    self.notice = Some(format!(
+                        "{undone}, but {}, so its Login wasn't put back",
+                        not_restored.reason(&name)
+                    ));
                 }
             }
             Then::RemoveUnlisted => {
@@ -748,7 +764,13 @@ impl ProfileRegistry {
             &[("profile", Field::Profile(&id))],
         );
         link(ctx, &id, &config_dir);
-        if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
+        if ctx.is_paused(SafetyFeature::Seeding) {
+            ctx.log(
+                Level::Info,
+                "claude.json not seeded: paused",
+                &[("profile", Field::Profile(&id))],
+            );
+        } else if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
             let error = error.to_string();
             ctx.log(
                 Level::Warn,
@@ -1228,11 +1250,13 @@ impl ProfileRegistry {
                     format!("Already added: {wanted} · the new sign-in couldn't be undone"),
                 )
             };
-            self.notice = Some(undone);
+            self.notice = Some(undone.clone());
             let tag = Tag {
                 id: id.clone(),
                 then: Then::UndoSignInAgain {
                     previous_account,
+                    name: wanted,
+                    undone,
                     failed,
                 },
             };
@@ -1458,11 +1482,15 @@ fn create_folder(paths: &AppPaths) -> io::Result<(String, PathBuf)> {
 
 /// Makes the Profile folder's missing links back to `~/.claude`.
 fn link(ctx: &Context, id: &str, config_dir: &Path) {
-    match cli_switcher::ensure_links(
-        config_dir,
-        &ctx.env.home.join(".claude"),
-        ctx.share_transcripts,
-    ) {
+    if ctx.is_paused(SafetyFeature::Links) {
+        ctx.log(
+            Level::Info,
+            "links not made: paused",
+            &[("profile", Field::Profile(id))],
+        );
+        return;
+    }
+    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(
@@ -1502,39 +1530,82 @@ fn signed_out(ctx: &Context, id: &str, finished: &Finished) -> bool {
     succeeded
 }
 
+/// Why a Profile's Login wasn't put back.
+enum NotRestored {
+    /// Seeding `.claude.json` is under a Safety pause.
+    Paused,
+    /// The file isn't a JSON object: its format is unknown, so it is left
+    /// as it is (ADR 0004).
+    Unreadable,
+    Failed(io::Error),
+}
+
+impl NotRestored {
+    /// The reason, for the notice "…, but <reason>, so its Login wasn't put
+    /// back".
+    fn reason(&self, name: &str) -> String {
+        match self {
+            NotRestored::Paused => format!("{} is paused", SafetyFeature::Seeding.name()),
+            NotRestored::Unreadable => format!("{name}'s .claude.json couldn't be read"),
+            NotRestored::Failed(_) => format!("{name}'s .claude.json couldn't be written"),
+        }
+    }
+}
+
 /// Puts a Profile's `oauthAccount` back into its `.claude.json` after another
 /// Login's sign-in there was undone (sign-out deletes it), so the Profile
-/// keeps its Login. Backed up first, written atomically.
-fn restore_account(ctx: &Context, id: &str, config_dir: &Path, account: &Value) {
-    let path = config_dir.join(".claude.json");
-    let result = (|| -> io::Result<()> {
-        let mut body = match fs::read(&path) {
-            Ok(bytes) => {
-                backups::back_up(&ctx.paths.backups(), &path, ctx.env.clock.now())?;
-                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
-            Err(error) => return Err(error),
+/// keeps its Login. Backed up first, written atomically; never while
+/// Seeding is paused, and never over a file that isn't a JSON object.
+fn restore_account(
+    ctx: &Context,
+    id: &str,
+    config_dir: &Path,
+    account: &Value,
+) -> Result<(), NotRestored> {
+    let result = if ctx.is_paused(SafetyFeature::Seeding) {
+        Err(NotRestored::Paused)
+    } else {
+        write_account(ctx, &config_dir.join(".claude.json"), account)
+    };
+    if let Err(not_restored) = &result {
+        let reason = match not_restored {
+            NotRestored::Paused => "paused".to_owned(),
+            NotRestored::Unreadable => "unreadable claude.json".to_owned(),
+            NotRestored::Failed(error) => error.to_string(),
         };
-        if !body.is_object() {
-            body = Value::Object(serde_json::Map::new());
-        }
-        body.as_object_mut()
-            .expect("made an object above")
-            .insert("oauthAccount".into(), account.clone());
-        storage::write_atomically(&path, &serde_json::to_vec_pretty(&body)?)
-    })();
-    if let Err(error) = result {
-        let error = error.to_string();
         ctx.log(
-            Level::Error,
+            Level::Warn,
             "account not restored",
             &[
                 ("profile", Field::Profile(id)),
-                ("error", Field::Text(&error)),
+                ("error", Field::Text(&reason)),
             ],
         );
     }
+    result
+}
+
+fn write_account(ctx: &Context, path: &Path, account: &Value) -> Result<(), NotRestored> {
+    let mut body = match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body @ Value::Object(_)) => {
+                backups::back_up(&ctx.paths.backups(), path, ctx.env.clock.now())
+                    .map_err(NotRestored::Failed)?;
+                body
+            }
+            _ => return Err(NotRestored::Unreadable),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Value::Object(serde_json::Map::new())
+        }
+        Err(error) => return Err(NotRestored::Failed(error)),
+    };
+    body.as_object_mut()
+        .expect("an object, checked above")
+        .insert("oauthAccount".into(), account.clone());
+    let bytes =
+        serde_json::to_vec_pretty(&body).map_err(|error| NotRestored::Failed(error.into()))?;
+    storage::write_atomically(path, &bytes).map_err(NotRestored::Failed)
 }
 
 /// Deletes a Profile folder without following its links.
