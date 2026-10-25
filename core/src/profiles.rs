@@ -88,6 +88,21 @@ impl Identity {
     fn name(&self) -> String {
         format!("{} · {}", self.email, self.organization_name)
     }
+
+    /// The menu bar's short name: the email's local part.
+    fn short_label(&self) -> String {
+        self.email.split('@').next().unwrap_or_default().to_owned()
+    }
+}
+
+/// A signed-in Profile as the menu lists it.
+pub(crate) struct Listed<'a> {
+    pub id: &'a str,
+    /// The folder's absolute path, verbatim.
+    pub config_dir: &'a Path,
+    /// The menu bar's short name for it (`Perso`).
+    pub short_label: String,
+    pub row: ProfileRow,
 }
 
 /// `state/profiles.json`.
@@ -163,6 +178,8 @@ impl Profile {
         }
         ProfileRow {
             title: identity.name(),
+            badges: Vec::new(),
+            command: None,
             limits,
             note,
             offers,
@@ -461,12 +478,28 @@ impl ProfileRegistry {
         })
     }
 
-    /// One row per signed-in Profile, in order.
-    pub(crate) fn rows(&self, clock: &dyn Clock) -> Vec<ProfileRow> {
+    /// The folder of signed-in Profile `id`, verbatim.
+    pub(crate) fn config_dir(&self, id: &str) -> Option<&Path> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == id && profile.identity.is_some())
+            .map(|profile| profile.config_dir.as_path())
+    }
+
+    /// Every signed-in Profile, in order, with its row.
+    pub(crate) fn listed(&self, clock: &dyn Clock) -> Vec<Listed<'_>> {
         let (now, tz) = (clock.now(), clock.time_zone());
         self.profiles
             .iter()
-            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?, now, &tz)))
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(Listed {
+                    id: &profile.id,
+                    config_dir: &profile.config_dir,
+                    short_label: identity.short_label(),
+                    row: profile.row(identity, now, &tz),
+                })
+            })
             .collect()
     }
 
