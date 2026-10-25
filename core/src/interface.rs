@@ -31,6 +31,8 @@ pub enum Command {
     SetVerboseLogging(bool),
     /// Reveal logs in Finder, in Settings.
     RevealLogs,
+    /// The launch-at-login checkbox, in the first-run offer or in Settings.
+    SetLaunchAtLogin(bool),
 }
 
 impl Command {
@@ -42,6 +44,7 @@ impl Command {
             Command::Quit => "quit",
             Command::SetVerboseLogging(_) => "set_verbose_logging",
             Command::RevealLogs => "reveal_logs",
+            Command::SetLaunchAtLogin(_) => "set_launch_at_login",
         }
     }
 }
@@ -64,6 +67,9 @@ pub enum Effect {
     ShowAbout,
     /// Select this path in a Finder window.
     RevealInFinder(PathBuf),
+    /// Open System Settings → Login Items, where only the user can turn
+    /// launch at login back on.
+    OpenLoginItemsSettings,
     /// Quit the app. The core has already flushed what it needed to.
     Terminate,
 }
@@ -75,6 +81,27 @@ pub struct View {
     pub menu: MenuView,
     pub settings: SettingsView,
     pub about: AboutView,
+    /// The first-run window, shown while `Some` (until the user answers).
+    pub first_run: Option<FirstRunView>,
+}
+
+/// The first-run window: the one-time launch-at-login offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstRunView {
+    /// The checkbox's initial state. Closing the window or clicking its
+    /// button sends [`Command::SetLaunchAtLogin`] with the checkbox's state.
+    pub launch_at_login: bool,
+}
+
+/// The launch-at-login toggle in Settings, as macOS currently has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchAtLoginView {
+    /// Whether the toggle is on: the app opens at login right now.
+    pub on: bool,
+    /// Whether the toggle can be clicked.
+    pub enabled: bool,
+    /// An explanatory line under the toggle, when there is something to say.
+    pub note: Option<String>,
 }
 
 /// The status item in the menu bar.
@@ -111,6 +138,7 @@ pub struct SettingsView {
     pub verbose_logging: bool,
     /// The explanatory line under the switch.
     pub verbose_logging_note: String,
+    pub launch_at_login: LaunchAtLoginView,
 }
 
 /// The About panel.
