@@ -170,7 +170,7 @@ fn sidebar_entries(folder: &Path) -> Vec<(String, SystemTime)> {
 
 /// A folder name the desktop app could have made from a uuid (also keeps
 /// path separators and `..` out of joined paths).
-fn is_uuid(text: &str) -> bool {
+pub(crate) fn is_uuid(text: &str) -> bool {
     text.len() == 36 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
@@ -464,8 +464,10 @@ impl DesktopBridge {
         matches!(self.step, Some(Step::Waiting { .. }))
     }
 
-    /// "Switch desktop app to this Profile…": runs the guard, then guides.
-    pub(crate) fn start(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
+    /// "Switch desktop app to this Profile…": runs the guard. Returns the
+    /// target when nothing stands in the way: the caller syncs the sidebars
+    /// (spec step 2), then calls [`DesktopBridge::guide`].
+    pub(crate) fn start(&mut self, ctx: &Context, target: Target) -> Option<Target> {
         self.notice = None;
         let paths = DesktopPaths::new(&ctx.env.home);
         match guard(ctx.env, &paths) {
@@ -484,7 +486,7 @@ impl DesktopBridge {
                     sessions,
                     notify_when_idle: false,
                 });
-                Vec::new()
+                None
             }
             Guard::CantTell => {
                 log(
@@ -494,19 +496,20 @@ impl DesktopBridge {
                     &[("profile", Field::Profile(&target.profile_id))],
                 );
                 self.step = Some(Step::Unsure { target });
-                Vec::new()
+                None
             }
-            Guard::Clear => self.guide(ctx, target),
+            Guard::Clear => Some(target),
         }
     }
 
-    /// "Switch anyway" after "can't tell".
-    pub(crate) fn confirm(&mut self, ctx: &Context) -> Vec<Effect> {
+    /// "Switch anyway" after "can't tell": the target, as for
+    /// [`DesktopBridge::start`].
+    pub(crate) fn confirm(&mut self) -> Option<Target> {
         match self.step.take() {
-            Some(Step::Unsure { target }) => self.guide(ctx, target),
+            Some(Step::Unsure { target }) => Some(target),
             other => {
                 self.step = other;
-                Vec::new()
+                None
             }
         }
     }
@@ -626,9 +629,9 @@ impl DesktopBridge {
     }
 
     /// Brings Claude forward with the instruction and starts watching for
-    /// the result. Claude is never quit: the user signs out and in.
-    fn guide(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
-        // Spec step 2, Sidebar sync into the target, joins here (#48): `sidebar_sync::run`.
+    /// the result. Claude is never quit: the user signs out and in. The
+    /// snapshot it confirms from is taken here, after any pre-switch sync.
+    pub(crate) fn guide(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
         let paths = DesktopPaths::new(&ctx.env.home);
         let previous = desktop_account(&paths).and_then(|account| {
             account

@@ -103,6 +103,8 @@ pub struct Core {
     links: Vec<ProfileLinks>,
     /// What the last "Sync now" did, for Settings.
     sync_note: Option<String>,
+    /// The sidebars' watch while Sidebar sync is on.
+    sidebar_watch: sidebar_sync::Watch,
 }
 
 /// What the last link check found in one Profile folder.
@@ -157,6 +159,7 @@ impl Core {
             links: Vec::new(),
             sessions: SessionIndex::default(),
             sync_note: None,
+            sidebar_watch: sidebar_sync::Watch::default(),
         };
         core.log(
             Level::Info,
@@ -237,9 +240,13 @@ impl Core {
             return Duration::ZERO;
         }
         let idle = if self.profiles.signing_in() || self.desktop.waiting() {
+            // An Automatic sync waits for the switch to end (see `Tick`).
             Duration::from_secs(1)
         } else {
-            crate::driver::TICK_INTERVAL
+            let sync_due = self.sidebar_watch.until_due(self.env.clock.now());
+            sync_due.map_or(crate::driver::TICK_INTERVAL, |due| {
+                due.min(crate::driver::TICK_INTERVAL)
+            })
         };
         self.monitor
             .tick_interval(self.env.clock.now(), &self.watched(), idle)
@@ -249,7 +256,10 @@ impl Core {
     /// launch). The driver hands them to the UI with the first view;
     /// [`Core::command`] and [`Core::event`] include them in what they return.
     pub fn take_effects(&mut self) -> Vec<Effect> {
-        self.safety.take_effects()
+        let mut effects = self.safety.take_effects();
+        let sync_on = self.settings.sidebar_sync != SidebarSyncMode::Off;
+        effects.extend(self.sidebar_watch.reconcile(&self.env, sync_on));
+        effects
     }
 
     /// Handles a user intent.
@@ -358,11 +368,12 @@ impl Core {
                     return Vec::new();
                 };
                 let (desktop, ctx) = self.desktop();
-                desktop.start(&ctx, target)
+                let cleared = desktop.start(&ctx, target);
+                self.guide_desktop_switch(cleared)
             }
             Command::ConfirmDesktopSwitch => {
-                let (desktop, ctx) = self.desktop();
-                desktop.confirm(&ctx)
+                let cleared = self.desktop.confirm();
+                self.guide_desktop_switch(cleared)
             }
             Command::NotifyWhenDesktopIdle => {
                 self.desktop.notify_when_idle();
@@ -523,6 +534,15 @@ impl Core {
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
                 effects.extend(desktop.poll(&ctx, &signed_in));
+                self.sidebar_watch.notice_switch(&self.env);
+                // While a Guided switch waits, copies sync wrote would look
+                // like Claude writing the target's folder: sync waits too.
+                if self.settings.sidebar_sync == SidebarSyncMode::Automatic
+                    && !self.desktop.waiting()
+                    && self.sidebar_watch.take_due(self.env.clock.now())
+                {
+                    self.sync_sidebar();
+                }
                 self.index_sessions();
                 effects
             }
@@ -550,6 +570,10 @@ impl Core {
                         .files_changed(&self.env, &self.paths, &changed);
                     self.index_sessions();
                 }
+                Vec::new()
+            }
+            Event::SidebarFilesChanged(changed) => {
+                self.sidebar_files_changed(&changed);
                 Vec::new()
             }
             Event::WillSleep | Event::DidWake => {
@@ -831,7 +855,7 @@ impl Core {
                 },
                 sidebar_sync: SidebarSyncView {
                     mode: self.settings.sidebar_sync,
-                    sync_now: (self.settings.sidebar_sync == SidebarSyncMode::Manual)
+                    sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
                         .then_some(Command::SyncSidebarNow),
                     note: self.sync_note.clone(),
                 },
@@ -1097,7 +1121,8 @@ impl Core {
             ..Target::of(&profile)
         };
         let (desktop, ctx) = self.desktop();
-        desktop.start(&ctx, target)
+        let cleared = desktop.start(&ctx, target);
+        self.guide_desktop_switch(cleared)
     }
 
     fn log_opened(&self, id: &str, how: &'static str) {
@@ -1426,6 +1451,7 @@ impl Core {
                 Field::Word(match mode {
                     SidebarSyncMode::Off => "off",
                     SidebarSyncMode::Manual => "manual",
+                    SidebarSyncMode::Automatic => "automatic",
                 }),
             )],
         );
@@ -1439,6 +1465,7 @@ impl Core {
         if self.settings.sidebar_sync == SidebarSyncMode::Off {
             return;
         }
+        self.sidebar_watch.ran();
         self.check_sidebar_entries();
         self.settle();
         if self.safety.is_paused(SafetyFeature::SidebarSync) {
@@ -1487,20 +1514,55 @@ impl Core {
                 let whose = if count > 1 { "sidebars" } else { "sidebar" };
                 let detail =
                     format!("{count} {whose} Claude wasn't using changed since the last sync");
-                self.safety.record(
-                    CheckId::MultiAccountMode,
-                    Finding::fail(detail.clone()).blocking(
-                        SafetyFeature::SidebarSync,
-                        "Claude wrote to a Profile it isn't using",
-                    ),
-                );
+                self.pause_for_multi_account(detail);
                 self.paused_sync_note();
-                // The pause stays until Resume, which accepts the sidebars as
-                // they are; the finding itself no longer blocks.
-                self.safety
-                    .record(CheckId::MultiAccountMode, Finding::fail(detail));
             }
         }
+    }
+
+    /// The dormant multi-account mode's trace: a Safety pause of Sidebar
+    /// sync. It stays until Resume, which accepts the sidebars as they are;
+    /// the finding itself no longer blocks, so Resume shows at once.
+    fn pause_for_multi_account(&mut self, detail: String) {
+        self.safety.record(
+            CheckId::MultiAccountMode,
+            Finding::fail(detail.clone()).blocking(
+                SafetyFeature::SidebarSync,
+                "Claude wrote to a Profile it isn't using",
+            ),
+        );
+        self.settle();
+        self.safety
+            .record(CheckId::MultiAccountMode, Finding::fail(detail));
+    }
+
+    /// The sidebars' watch reported changes: Automatic mode schedules a
+    /// run, and an entry Claude wrote outside its Active Profile folder
+    /// pauses sync.
+    fn sidebar_files_changed(&mut self, changed: &[PathBuf]) {
+        let mode = self.settings.sidebar_sync;
+        let paused = self.safety.is_paused(SafetyFeature::SidebarSync);
+        if mode == SidebarSyncMode::Off {
+            return;
+        }
+        let automatic = mode == SidebarSyncMode::Automatic && !paused;
+        let elsewhere =
+            self.sidebar_watch
+                .files_changed(&self.env, &self.paths, changed, automatic);
+        if elsewhere == 0 || paused {
+            return;
+        }
+        let entries = if elsewhere == 1 { "entry" } else { "entries" };
+        self.pause_for_multi_account(format!(
+            "Claude wrote {elsewhere} Sidebar {entries} outside the Profile it's using"
+        ));
+        self.log(
+            Level::Warn,
+            "sidebar sync paused: claude wrote another profile",
+            &[("entries", Field::Number(elsewhere as i64))],
+        );
+        self.sync_note =
+            Some("Sidebar sync is paused · Claude wrote to a Profile it isn't using".into());
     }
 
     fn paused_sync_note(&mut self) {
@@ -1890,6 +1952,20 @@ impl Core {
     }
 
     /// The Desktop bridge, with what it needs from the rest of the core.
+    /// A Guided switch the guard let through: syncs the sidebars first when
+    /// Sidebar sync is on (so the target's sidebar has every Session when
+    /// Claude opens it), then brings Claude forward.
+    fn guide_desktop_switch(&mut self, cleared: Option<Target>) -> Vec<Effect> {
+        let Some(target) = cleared else {
+            return Vec::new();
+        };
+        if self.settings.sidebar_sync != SidebarSyncMode::Off {
+            self.sync_sidebar();
+        }
+        let (desktop, ctx) = self.desktop();
+        desktop.guide(&ctx, target)
+    }
+
     fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
         let verbose = self.verbose_logging();
         let ctx = profiles::Context {

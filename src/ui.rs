@@ -110,6 +110,8 @@ pub struct Ivars {
     rendering: Cell<bool>,
     /// The FSEvents watch the core asked for while All Sessions is open.
     watch: RefCell<Option<FolderWatch>>,
+    /// The FSEvents watch on the sidebars while Sidebar sync is on.
+    sidebar_watch: RefCell<Option<FolderWatch>>,
 }
 
 struct AllSessionsWindow {
@@ -137,6 +139,7 @@ struct DiagnosticsWindow {
 struct SettingsWindow {
     window: Retained<NSWindow>,
     sidebar_sync: Retained<NSButton>,
+    sidebar_sync_automatic: Retained<NSButton>,
     sync_now: Retained<NSButton>,
     sidebar_sync_note: Retained<NSTextField>,
     cli_switching: Retained<NSButton>,
@@ -306,6 +309,18 @@ define_class!(
             self.send(Command::SetSidebarSync(mode));
         }
 
+        /// The "automatically" checkbox under it: on is Automatic, off is
+        /// back to Manual.
+        #[unsafe(method(sidebarSyncAutomaticClicked:))]
+        fn sidebar_sync_automatic_clicked(&self, sender: &NSButton) {
+            let mode = if sender.state() == NSControlStateValueOn {
+                SidebarSyncMode::Automatic
+            } else {
+                SidebarSyncMode::Manual
+            };
+            self.send(Command::SetSidebarSync(mode));
+        }
+
         #[unsafe(method(syncNowClicked:))]
         fn sync_now_clicked(&self, _sender: &NSButton) {
             self.send(Command::SyncSidebarNow);
@@ -441,6 +456,7 @@ impl Ui {
             open_commands: RefCell::new(Vec::new()),
             rendering: Cell::new(false),
             watch: RefCell::new(None),
+            sidebar_watch: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -827,6 +843,22 @@ impl Ui {
             }
             Effect::StopWatchingSessionFiles => {
                 self.ivars().watch.borrow_mut().take();
+            }
+            Effect::WatchSidebarFolders(folders) => {
+                let Some(core) = self.ivars().core.get().cloned() else {
+                    return;
+                };
+                // A folder that can't be watched leaves Automatic mode to
+                // "Sync now"; the UI has no log of its own.
+                let watch = FolderWatch::start(&folders, watcher::DEBOUNCE, move |paths| {
+                    core.event(Event::SidebarFilesChanged(paths))
+                })
+                .ok()
+                .map(|(watch, _skipped)| watch);
+                *self.ivars().sidebar_watch.borrow_mut() = watch;
+            }
+            Effect::StopWatchingSidebarFolders => {
+                self.ivars().sidebar_watch.borrow_mut().take();
             }
             Effect::OpenLoginItemsSettings => unsafe {
                 objc2_service_management::SMAppService::openSystemSettingsLoginItems()
@@ -1264,6 +1296,17 @@ impl Ui {
         sidebar_sync.setFrameOrigin(NSPoint::new(20.0, 456.0));
         content.addSubview(&sidebar_sync);
 
+        let sidebar_sync_automatic = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                ns_string!("Automatically, a few seconds after each change"),
+                Some(self),
+                Some(sel!(sidebarSyncAutomaticClicked:)),
+                mtm,
+            )
+        };
+        sidebar_sync_automatic.setFrameOrigin(NSPoint::new(34.0, 434.0));
+        content.addSubview(&sidebar_sync_automatic);
+
         let sync_now = unsafe {
             NSButton::buttonWithTitle_target_action(
                 ns_string!("Sync now"),
@@ -1272,7 +1315,7 @@ impl Ui {
                 mtm,
             )
         };
-        sync_now.setFrameOrigin(NSPoint::new(34.0, 422.0));
+        sync_now.setFrameOrigin(NSPoint::new(34.0, 400.0));
         content.addSubview(&sync_now);
 
         let sidebar_sync_note = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
@@ -1280,8 +1323,8 @@ impl Ui {
             NSFont::smallSystemFontSize(),
         )));
         sidebar_sync_note.setFrame(NSRect::new(
-            NSPoint::new(140.0, 410.0),
-            NSSize::new(260.0, 44.0),
+            NSPoint::new(140.0, 396.0),
+            NSSize::new(260.0, 34.0),
         ));
         content.addSubview(&sidebar_sync_note);
 
@@ -1401,6 +1444,7 @@ impl Ui {
         SettingsWindow {
             window,
             sidebar_sync,
+            sidebar_sync_automatic,
             sync_now,
             sidebar_sync_note,
             cli_switching,
@@ -2114,11 +2158,21 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
         } else {
             NSControlStateValueOn
         });
+    settings
+        .sidebar_sync_automatic
+        .setState(if sync.mode == SidebarSyncMode::Automatic {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    settings
+        .sidebar_sync_automatic
+        .setEnabled(sync.mode != SidebarSyncMode::Off);
     settings.sync_now.setEnabled(sync.sync_now.is_some());
     let sync_text = match (&sync.note, sync.mode) {
         (Some(note), _) => note.clone(),
         (None, SidebarSyncMode::Off) => "Off: sidebars are left as they are.".to_owned(),
-        (None, SidebarSyncMode::Manual) => {
+        (None, SidebarSyncMode::Manual | SidebarSyncMode::Automatic) => {
             "Copies entries, never deletes. While Claude runs, its own Profile is left alone."
                 .to_owned()
         }
