@@ -380,6 +380,8 @@ pub(crate) struct Target {
     pub organization_uuid: String,
     /// `email · Organization`.
     pub name: String,
+    /// The Sidebar entry (`local_…`) to open once the switch is confirmed.
+    pub then_open: Option<String>,
 }
 
 impl Target {
@@ -389,6 +391,7 @@ impl Target {
             account_uuid: profile.account_uuid.clone(),
             organization_uuid: profile.organization_uuid.clone(),
             name: profile.name.clone(),
+            then_open: None,
         }
     }
 }
@@ -669,6 +672,7 @@ impl DesktopBridge {
         profiles: &[SignedInProfile],
     ) -> Vec<Effect> {
         let profile = [("profile", Field::Profile(&target.profile_id))];
+        let confirmed = matches!(outcome, Some(Outcome::Confirmed));
         let (title, text) = match outcome {
             Some(Outcome::Confirmed) => {
                 log(ctx, Level::Info, "desktop switch confirmed", &profile);
@@ -700,10 +704,16 @@ impl DesktopBridge {
         };
         self.step = None;
         self.notice = Some(text.clone());
-        vec![Effect::Notify {
+        let mut effects = vec![Effect::Notify {
             title: title.into(),
             body: text,
-        }]
+        }];
+        // "Switch Claude to …, then open…": the entry is in Claude's sidebar
+        // now.
+        if let Some(entry) = target.then_open.as_deref().filter(|_| confirmed) {
+            effects.push(Effect::OpenUrl(crate::opening::continue_url(entry)));
+        }
+        effects
     }
 }
 

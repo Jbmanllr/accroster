@@ -157,6 +157,11 @@ pub trait OsFacts: Send {
     /// (`…/Application Support/Claude/claude-code/<ver>/…/claude`): its
     /// Sessions' children.
     fn desktop_claude_code_children(&self) -> Vec<u32>;
+    /// The name of the terminal device process `pid` runs on (`ttys004`),
+    /// or `None` when it has none or isn't alive.
+    fn terminal_of(&self, _pid: u32) -> Option<String> {
+        None
+    }
     /// Whether the Claude desktop app (`/Applications/Claude.app`) is
     /// running. When the process table can't be read, it counts as running:
     /// that is the case in which fewer files get written.
@@ -378,6 +383,28 @@ impl OsFacts for SystemOsFacts {
 
     fn managed_settings(&self) -> Option<Vec<u8>> {
         std::fs::read(MANAGED_SETTINGS).ok()
+    }
+
+    fn terminal_of(&self, pid: u32) -> Option<String> {
+        let pid = i32::try_from(pid).ok()?;
+        // SAFETY: as in `process`: plain data, at most `size` bytes written.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let written = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        // No controlling terminal: `e_tdev` is NODEV (all bits set).
+        if written != size || info.e_tdev == u32::MAX {
+            return None;
+        }
+        // SAFETY: `devname` returns a pointer to a static buffer, or null.
+        let name = unsafe { libc::devname(info.e_tdev as libc::dev_t, libc::S_IFCHR) };
+        if name.is_null() {
+            return None;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) };
+        let name = name.to_str().ok()?;
+        (!name.is_empty() && name != "??").then(|| name.to_owned())
     }
 
     fn desktop_claude_code_children(&self) -> Vec<u32> {

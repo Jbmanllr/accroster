@@ -118,6 +118,20 @@ pub enum Command {
     /// "Resume <feature>" in Diagnostics, offered once the checks pass again.
     /// The only way a Safety pause ends.
     ResumeFeature(SafetyFeature),
+    /// A double-click in All Sessions, or a Session in the menu's Recent
+    /// Sessions: opens the Session (by Transcript id) in the client it was
+    /// last used in. When that would need a choice (Claude's Active Profile
+    /// has no entry for it), shows it in All Sessions instead.
+    OpenSession(String),
+    /// "Resume in Terminal" / "Show in Terminal" for a Session (by id).
+    ResumeInTerminal(String),
+    /// "Open in Claude" / "Open in Claude as <Profile>" for a Session (by
+    /// id), in the desktop app's Active Profile.
+    OpenInClaude(String),
+    /// "Switch Claude to <Profile>, then open…": a Guided switch to Profile
+    /// `profile` (by id), then opening Session `session` (by Transcript id)
+    /// from that Profile's entry.
+    SwitchClaudeThenOpen { profile: String, session: String },
     /// The Sidebar sync mode in Settings.
     SetSidebarSync(SidebarSyncMode),
     /// "Sync now" in Settings: copy every Session's Sidebar entry into every
@@ -209,6 +223,10 @@ impl Command {
             Command::RemoveProfile(_) => "remove_profile",
             Command::AskRemoveProfileWithNextCli { .. } => "ask_remove_profile_with_next_cli",
             Command::RemoveProfileWithNextCli { .. } => "remove_profile_with_next_cli",
+            Command::OpenSession(_) => "open_session",
+            Command::ResumeInTerminal(_) => "resume_in_terminal",
+            Command::OpenInClaude(_) => "open_in_claude",
+            Command::SwitchClaudeThenOpen { .. } => "switch_claude_then_open",
             Command::SetMuted { .. } => "set_muted",
             Command::SetThresholds(_) => "set_thresholds",
             Command::SetResetNotification(_) => "set_reset_notification",
@@ -301,6 +319,12 @@ pub enum Effect {
     WatchSidebarFolders(Vec<PathBuf>),
     /// Stop the watch [`Effect::WatchSidebarFolders`] started.
     StopWatchingSidebarFolders,
+    /// Open a new Terminal window and run this shell command line in it (it
+    /// is already quoted for `sh`).
+    RunInTerminal(String),
+    /// Bring the Terminal window whose tab runs on this terminal device
+    /// (`ttys004`) forward; without one, just bring Terminal forward.
+    ShowInTerminal { tty: Option<String> },
     /// Ask before an irreversible action: an alert with `title` and
     /// `message`, a destructive confirm button and Cancel. Confirming sends
     /// `confirm`; Cancel sends nothing.
@@ -620,6 +644,23 @@ pub struct SessionDetail {
     pub sidebars: Vec<SidebarPresence>,
     /// Why nothing can be opened, when the Transcript was deleted.
     pub deleted: Option<String>,
+    /// The Open section, top to bottom; empty when the Transcript was
+    /// deleted.
+    pub open: Vec<OpenChoice>,
+}
+
+/// One button of the detail pane's Open section, with what it costs spelled
+/// out under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenChoice {
+    /// For example "Resume in Terminal".
+    pub title: String,
+    /// For example "New turns count against Perso (CLI)".
+    pub note: Option<String>,
+    /// Sent when clicked.
+    pub command: Command,
+    /// Drawn disabled when `false` (`note` then says why).
+    pub enabled: bool,
 }
 
 /// Whether one Profile's Sidebar has an entry for the Session (✓ or –).
