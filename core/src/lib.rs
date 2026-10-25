@@ -6,6 +6,7 @@
 //! and [`env`] for the boundary between the core and the rest of the Mac.
 
 mod backups;
+mod checks;
 mod cli_switcher;
 mod core;
 mod desktop;
@@ -15,8 +16,10 @@ pub mod env;
 pub mod interface;
 mod limit_offers;
 mod logging;
+mod monitor;
 mod profiles;
 mod runner;
+mod safety;
 mod sessions;
 mod settings;
 mod storage;
@@ -37,6 +40,7 @@ pub use interface::{
     AllSessionsView, RunningDot, SessionDetail, SessionFilter, SessionRow, SidebarGroup,
     SidebarItem, SidebarPresence,
 };
+pub use interface::{CheckRow, CheckStatus, DiagnosticsView, PausedFeature, SafetyFeature};
 pub use interface::{
     ClaudeVersions, CliSwitchingView, DiscoveredPair, DiscoveredRow, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, NicknameTarget,

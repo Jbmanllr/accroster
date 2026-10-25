@@ -11,19 +11,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
 use crate::cli_switcher;
-use crate::env::{Clock, Environment, RunningProcess};
-use crate::interface::{
-    Command, DiscoveredPair, Effect, LimitBar, MenuItem, NicknameTarget, ProfileRow,
-};
-use crate::limit_offers;
+use crate::env::{Environment, RunningProcess};
+use crate::interface::{Command, DiscoveredPair, Effect, MenuItem, NicknameTarget, ProfileRow};
 use crate::logging::{Field, Level, Logger};
+use crate::monitor::{LimitsView, Watched};
 use crate::runner::Runner;
 use crate::settings::Settings;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
@@ -38,15 +35,23 @@ pub(crate) struct Context<'a> {
     pub paths: &'a AppPaths,
     pub logger: &'a Logger,
     pub verbose: bool,
+    /// Whether the links sharing Transcripts may be made (Transcript sharing
+    /// isn't under a Safety pause).
+    pub share_transcripts: bool,
 }
 
 impl Context<'_> {
-    fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
+    pub(crate) fn log(
+        &self,
+        level: Level,
+        message: &'static str,
+        fields: &[(&'static str, Field<'_>)],
+    ) {
         self.logger
             .write(self.env.clock.now(), self.verbose, level, message, fields);
     }
 
-    fn runner(&self) -> Runner<'_> {
+    pub(crate) fn runner(&self) -> Runner<'_> {
         Runner::new(self.env, self.paths)
     }
 }
@@ -112,6 +117,13 @@ pub(crate) struct Listed<'a> {
     pub row: ProfileRow,
 }
 
+/// A signed-in Profile's folder and the account its `oauthAccount` names.
+pub(crate) struct SignedInAccount<'a> {
+    pub config_dir: &'a Path,
+    pub email: &'a str,
+    pub organization_uuid: &'a str,
+}
+
 /// A signed-in Profile as other modules see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignedInProfile {
@@ -144,19 +156,11 @@ impl VersionedFile for RegistryFile {
     const VERSION: u64 = 1;
 }
 
-/// The outcome of the latest usage read.
-#[derive(Debug, Clone, PartialEq)]
-enum Reading {
-    Read(UsageReply),
-    Failed,
-}
-
 struct Profile {
     id: String,
     config_dir: PathBuf,
     /// `None` when the folder holds no `oauthAccount`: signed out.
     identity: Option<Identity>,
-    reading: Option<Reading>,
     /// Login expired: `rate_limits_available: false`, or `loggedIn: false`
     /// while `oauthAccount` remains. Not polled until signed in again.
     expired: bool,
@@ -165,53 +169,24 @@ struct Profile {
 impl Profile {
     /// The menu row: `title` is the nickname, else `email · Organization`;
     /// `position` and `count` decide which Move items the submenu offers.
-    fn row(
-        &self,
-        title: String,
-        position: usize,
-        count: usize,
-        now: Timestamp,
-        tz: &TimeZone,
-    ) -> ProfileRow {
-        let mut limits = Vec::new();
-        let mut note = None;
-        let mut offers = Vec::new();
+    fn row(&self, title: String, position: usize, count: usize, limits: LimitsView) -> ProfileRow {
         let mut submenu = Vec::new();
+        let mut row_limits = LimitsView::default();
         if let Some(identity) = &self.identity {
-            let mut plan = identity
-                .organization_type
-                .as_deref()
-                .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned());
-            match &self.reading {
-                None => {}
-                Some(Reading::Read(reply)) => {
-                    offers = limit_offers::lines(
-                        reply.banked_reset.as_ref(),
-                        reply.session_refill.as_ref(),
-                        now,
-                        tz,
-                    );
-                    if let Some(kind) = &reply.subscription_type {
-                        plan = Some(kind.clone());
-                    }
-                    match &reply.limits {
-                        Some(read) => {
-                            limits.extend(read.all().map(|(label, percent)| LimitBar {
-                                label: label.to_owned(),
-                                percent: percent.max(0.0).floor() as u32,
-                            }));
-                        }
-                        None => note = Some("Couldn't read limits".to_owned()),
-                    }
-                }
-                Some(Reading::Failed) => note = Some("Couldn't read limits".to_owned()),
-            }
+            let plan = limits.plan.clone().or_else(|| {
+                identity
+                    .organization_type
+                    .as_deref()
+                    .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned())
+            });
             let mut detail = identity.name();
             if let Some(plan) = plan.filter(|plan| !plan.is_empty()) {
                 detail.push_str(" · ");
                 detail.push_str(&capitalized(&plan));
             }
             submenu.push(MenuItem::Detail(detail));
+            row_limits = limits;
+            submenu.extend(row_limits.details.drain(..).map(MenuItem::Detail));
             if !self.expired {
                 submenu.push(MenuItem::Action {
                     title: "Limit resets → claude.ai".to_owned(),
@@ -219,6 +194,13 @@ impl Profile {
                 });
             }
         }
+        let LimitsView {
+            bars,
+            mut dimmed,
+            mut note,
+            offers,
+            ..
+        } = row_limits;
         let action = |title: &str, command: Command| MenuItem::Action {
             title: title.to_owned(),
             command,
@@ -226,7 +208,9 @@ impl Profile {
         if self.identity.is_none() {
             note = Some("Signed out".to_owned());
         } else if self.expired {
+            // The last reading stays, dimmed: polling stopped.
             note = Some("Login expired".to_owned());
+            dimmed = true;
         }
         if self.identity.is_none() || self.expired {
             submenu.push(action(
@@ -264,9 +248,9 @@ impl Profile {
             title,
             badges: Vec::new(),
             command: None,
-            limits,
+            limits: bars,
             note,
-            dimmed: self.expired,
+            dimmed,
             offers,
             submenu,
         }
@@ -325,6 +309,9 @@ pub(crate) struct ProfileRegistry {
     sign_in: Option<SignIn>,
     /// The outcome of the last sign-in, shown as a menu line until the next.
     notice: Option<String>,
+    /// Set when `auth status` in a newly signed-in folder named another
+    /// account than its `oauthAccount`; taken by the format checks.
+    auth_disagreed: bool,
     /// Effects (notifications) waiting for the core to hand to the UI.
     effects: Vec<Effect>,
 }
@@ -333,7 +320,8 @@ impl ProfileRegistry {
     /// Loads the Profiles at launch: recorded folders that still exist, plus
     /// any signed-in folder missing from the record (recorded now). A folder
     /// with no record and no sign-in is what an interrupted Add Profile left
-    /// behind, and is deleted. Missing links are made again.
+    /// behind, and is deleted. Links are healed separately
+    /// ([`ProfileRegistry::heal_links`]), after the format checks.
     pub(crate) fn load(ctx: &Context) -> ProfileRegistry {
         let path = ctx.paths.state().join("profiles.json");
         let file = match storage::read_versioned::<RegistryFile>(&path) {
@@ -363,7 +351,6 @@ impl ProfileRegistry {
                     identity: Identity::read(&entry.config_dir),
                     id: entry.id,
                     config_dir: entry.config_dir,
-                    reading: None,
                     expired: entry.expired,
                 });
             }
@@ -404,7 +391,6 @@ impl ProfileRegistry {
                         id,
                         config_dir,
                         identity: Some(identity),
-                        reading: None,
                         expired: false,
                     });
                     changed = true;
@@ -422,10 +408,43 @@ impl ProfileRegistry {
         if changed {
             registry.save(ctx);
         }
-        for profile in &registry.profiles {
+        registry
+    }
+
+    /// Makes every Profile's missing links again.
+    pub(crate) fn heal_links(&self, ctx: &Context) {
+        for profile in &self.profiles {
             link(ctx, &profile.id, &profile.config_dir);
         }
-        registry
+    }
+
+    /// Every Profile folder, signed in or not, with its id.
+    pub(crate) fn folders(&self) -> Vec<(&str, &Path)> {
+        self.profiles
+            .iter()
+            .map(|profile| (profile.id.as_str(), profile.config_dir.as_path()))
+            .collect()
+    }
+
+    /// Every signed-in Profile's folder with the account its `oauthAccount`
+    /// names, for the `auth status` cross-check.
+    pub(crate) fn accounts(&self) -> Vec<SignedInAccount<'_>> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInAccount {
+                    config_dir: &profile.config_dir,
+                    email: &identity.email,
+                    organization_uuid: &identity.organization_uuid,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether `auth status` contradicted a sign-in since the last call.
+    pub(crate) fn take_auth_disagreement(&mut self) -> bool {
+        std::mem::take(&mut self.auth_disagreed)
     }
 
     /// Add Profile…: creates the folder, links it, seeds `.claude.json`, and
@@ -601,9 +620,13 @@ impl ProfileRegistry {
     }
 
     /// Every Profile (signed in, expired or signed out), in the user's
-    /// order, with its row titled by nickname when there is one.
-    pub(crate) fn listed(&self, clock: &dyn Clock, settings: &Settings) -> Vec<Listed<'_>> {
-        let (now, tz) = (clock.now(), clock.time_zone());
+    /// order, with its row titled by nickname when there is one; `limits`
+    /// says what each row shows about its limits.
+    pub(crate) fn listed(
+        &self,
+        settings: &Settings,
+        limits: impl Fn(&str) -> LimitsView,
+    ) -> Vec<Listed<'_>> {
         let listed = self.ordered(&settings.profile_order);
         listed
             .iter()
@@ -620,8 +643,27 @@ impl ProfileRegistry {
                     config_dir: &profile.config_dir,
                     signed_in: profile.identity.is_some(),
                     short_label,
-                    row: profile.row(title, position, listed.len(), now, &tz),
+                    row: profile.row(title, position, listed.len(), limits(&profile.id)),
                 }
+            })
+            .collect()
+    }
+
+    /// The Profiles the Limit monitor reads, in the user's order: signed in
+    /// and not expired. `active` says, by id and folder, which are a
+    /// client's Active Profile.
+    pub(crate) fn watched(&self, active: impl Fn(&str, &Path) -> bool) -> Vec<Watched> {
+        self.profiles
+            .iter()
+            .filter(|profile| !profile.expired)
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(Watched {
+                    id: profile.id.clone(),
+                    config_dir: profile.config_dir.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    active: active(&profile.id, &profile.config_dir),
+                })
             })
             .collect()
     }
@@ -751,7 +793,7 @@ impl ProfileRegistry {
     }
 
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
-    /// otherwise records the Profile and reads its limits.
+    /// otherwise records the Profile (the Limit monitor reads it next).
     fn finish(&mut self, ctx: &Context, sign_in: SignIn) {
         let SignIn {
             id,
@@ -795,7 +837,10 @@ impl ProfileRegistry {
                 if status.logged_in
                     && status.email.as_deref() == Some(identity.email.as_str())
                     && status.org_id.as_deref() == Some(identity.organization_uuid.as_str()) => {}
-            _ => {
+            status => {
+                // A readable, logged-in answer naming another account means
+                // Claude Code didn't use this folder's login.
+                self.auth_disagreed = status.is_some_and(|status| status.logged_in);
                 ctx.log(
                     Level::Warn,
                     "sign-in not confirmed by auth status",
@@ -825,16 +870,15 @@ impl ProfileRegistry {
             "profile added",
             &[("profile", Field::Profile(&id))],
         );
-        let reply = ctx.runner().read_usage(&config_dir);
+        // The Limit monitor reads it next, and hands the result to
+        // `record_reading`.
         self.profiles.push(Profile {
-            id: id.clone(),
+            id,
             config_dir,
             identity: Some(identity),
-            reading: None,
             expired: false,
         });
         self.save(ctx);
-        self.record_reading(ctx, &id, reply);
     }
 
     /// "Sign in again…" exited successfully. The same Login and Organization
@@ -903,8 +947,7 @@ impl ProfileRegistry {
         profile.identity = Some(identity);
         profile.expired = false;
         self.save(ctx);
-        let reply = ctx.runner().read_usage(&config_dir);
-        self.record_reading(ctx, &id, reply);
+        // Watched again, so the Limit monitor reads it at once.
     }
 
     /// "Sign in again…": Claude Code's browser sign-in in the Profile's own
@@ -985,16 +1028,7 @@ impl ProfileRegistry {
         };
         if expired {
             self.expire(ctx, index);
-            return;
         }
-        if reply.is_none() {
-            ctx.log(
-                Level::Warn,
-                "limits unreadable",
-                &[("profile", Field::Profile(id))],
-            );
-        }
-        self.profiles[index].reading = Some(reply.map_or(Reading::Failed, Reading::Read));
     }
 
     /// Effects produced since the last call (notifications).
@@ -1080,7 +1114,11 @@ fn create_folder(paths: &AppPaths) -> io::Result<(String, PathBuf)> {
 
 /// Makes the Profile folder's missing links back to `~/.claude`.
 fn link(ctx: &Context, id: &str, config_dir: &Path) {
-    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
+    match cli_switcher::ensure_links(
+        config_dir,
+        &ctx.env.home.join(".claude"),
+        ctx.share_transcripts,
+    ) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(

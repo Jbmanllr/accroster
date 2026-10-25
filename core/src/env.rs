@@ -118,6 +118,9 @@ pub trait RunningProcess: Send {
     fn try_wait(&mut self) -> io::Result<Option<SpawnOutput>>;
     /// Kills the program (if still running) and waits for it to go.
     fn kill(&mut self) -> io::Result<SpawnOutput>;
+    /// Closes the program's stdin (EOF), for a program that should finish
+    /// once it has read its input.
+    fn close_stdin(&mut self);
 }
 
 /// The current time.
@@ -146,11 +149,18 @@ pub trait OsFacts: Send {
     /// `CFBundleShortVersionString` of the installed Claude desktop app, or
     /// `None` when it isn't installed or can't be read.
     fn desktop_app_version(&self) -> Option<String>;
+    /// The bytes of Claude Code's managed settings file
+    /// (`/Library/Application Support/ClaudeCode/managed-settings.json`), or
+    /// `None` when there is none or it can't be read.
+    fn managed_settings(&self) -> Option<Vec<u8>>;
     /// The pids of running Claude Code processes bundled with the desktop app
     /// (`…/Application Support/Claude/claude-code/<ver>/…/claude`): its
     /// Sessions' children.
     fn desktop_claude_code_children(&self) -> Vec<u32>;
 }
+
+/// Where Claude Code reads managed (administrator) settings.
+const MANAGED_SETTINGS: &str = "/Library/Application Support/ClaudeCode/managed-settings.json";
 
 /// Starts real processes with [`std::process::Command`].
 pub struct SystemSpawner;
@@ -269,6 +279,10 @@ impl RunningProcess for SystemProcess {
         let status = self.child.wait()?;
         Ok(self.finish(status))
     }
+
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
 }
 
 impl Drop for SystemProcess {
@@ -356,6 +370,10 @@ impl OsFacts for SystemOsFacts {
         let version = value.downcast::<NSString>().ok()?.to_string();
         let version = version.trim();
         (!version.is_empty()).then(|| version.to_owned())
+    }
+
+    fn managed_settings(&self) -> Option<Vec<u8>> {
+        std::fs::read(MANAGED_SETTINGS).ok()
     }
 
     fn desktop_claude_code_children(&self) -> Vec<u32> {

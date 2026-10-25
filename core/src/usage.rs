@@ -5,6 +5,7 @@
 //! label, falling back to `five_hour` / `seven_day` when `limits` is absent.
 //! The API's `severity` is ignored.
 
+use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::limit_offers::{self, BankedReset, SessionRefill};
@@ -19,37 +20,50 @@ pub(crate) struct UsageReply {
     pub rate_limits_available: Option<bool>,
     /// `None` when `rate_limits` was null or isn't a usage body.
     pub limits: Option<Limits>,
+    /// Whether `rate_limits` was null (or absent): with
+    /// `rate_limits_available: true` that is a failed fetch, not an
+    /// unreadable answer.
+    pub rate_limits_null: bool,
     /// `rate_limits.cedar_ember`, when present, eligible and well formed.
     pub banked_reset: Option<BankedReset>,
     /// `rate_limits.juniper_tide`, when reported.
     pub session_refill: Option<SessionRefill>,
 }
 
-/// A Profile's limits, utilization in percent (0–100, fractional).
+/// A Profile's limits.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Limits {
-    pub session: Option<f64>,
-    pub weekly: Option<f64>,
-    /// Model-specific weekly limits: display name and utilization.
-    pub models: Vec<(String, f64)>,
-    /// Limit kinds this app doesn't know yet: raw `kind` and utilization.
-    pub other: Vec<(String, f64)>,
+    pub session: Option<Limit>,
+    pub weekly: Option<Limit>,
+    /// Model-specific weekly limits, by display name.
+    pub models: Vec<(String, Limit)>,
+    /// Limit kinds this app doesn't know yet, by raw `kind`.
+    pub other: Vec<(String, Limit)>,
 }
 
 impl Limits {
     /// Every limit with its label, in display order: Session, Weekly, each
     /// model-specific weekly limit, then each unknown kind. Anything that
     /// looks for the tightest limit goes through this, so unknown kinds count.
-    pub fn all(&self) -> impl Iterator<Item = (&str, f64)> {
-        let session = self.session.map(|percent| ("Session", percent));
-        let weekly = self.weekly.map(|percent| ("Weekly", percent));
+    pub fn all(&self) -> impl Iterator<Item = (&str, &Limit)> {
+        let session = self.session.as_ref().map(|limit| ("Session", limit));
+        let weekly = self.weekly.as_ref().map(|limit| ("Weekly", limit));
         session.into_iter().chain(weekly).chain(
             self.models
                 .iter()
                 .chain(&self.other)
-                .map(|(label, percent)| (label.as_str(), *percent)),
+                .map(|(label, limit)| (label.as_str(), limit)),
         )
     }
+}
+
+/// One limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Limit {
+    /// Utilization in percent (0–100, fractional).
+    pub percent: f64,
+    /// When the window resets, when known.
+    pub resets_at: Option<Timestamp>,
 }
 
 /// Reads the `control_response` answering `request_id` from stream-json
@@ -96,6 +110,7 @@ fn reply_from_body(body: &Value) -> UsageReply {
             .map(str::to_owned),
         rate_limits_available: body.get("rate_limits_available").and_then(Value::as_bool),
         limits: body.get("rate_limits").and_then(parse_rate_limits),
+        rate_limits_null: body.get("rate_limits").is_none_or(Value::is_null),
         banked_reset: body.get("rate_limits").and_then(limit_offers::banked_reset),
         session_refill: body
             .get("rate_limits")
@@ -121,7 +136,13 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
     if !USAGE_BODY_KEYS.iter().any(|key| object.contains_key(*key)) {
         return None;
     }
-    let utilization = |key: &str| body.get(key)?.get("utilization")?.as_f64();
+    let utilization = |key: &str| {
+        let window = body.get(key)?;
+        Some(Limit {
+            percent: window.get("utilization")?.as_f64()?,
+            resets_at: resets_at(window),
+        })
+    };
     let mut limits = Limits {
         session: utilization("five_hour"),
         weekly: utilization("seven_day"),
@@ -134,29 +155,38 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
                 let Some(percent) = entry.get("percent").and_then(Value::as_f64) else {
                     continue;
                 };
+                let limit = Limit {
+                    percent,
+                    resets_at: resets_at(entry),
+                };
                 match entry.get("kind").and_then(Value::as_str) {
-                    Some("session") => limits.session = Some(percent),
-                    Some("weekly_all") => limits.weekly = Some(percent),
+                    Some("session") => limits.session = Some(limit),
+                    Some("weekly_all") => limits.weekly = Some(limit),
                     Some("weekly_scoped") => {
                         if let Some(name) = entry
                             .pointer("/scope/model/display_name")
                             .and_then(Value::as_str)
                         {
-                            limits.models.push((name.to_owned(), percent));
+                            limits.models.push((name.to_owned(), limit));
                         }
                     }
-                    Some(kind) => limits.other.push((kind.to_owned(), percent)),
+                    Some(kind) => limits.other.push((kind.to_owned(), limit)),
                     None => {}
                 }
             }
         }
         None => {
             for (key, name) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
-                if let Some(percent) = utilization(key) {
-                    limits.models.push((name.to_owned(), percent));
+                if let Some(limit) = utilization(key) {
+                    limits.models.push((name.to_owned(), limit));
                 }
             }
         }
     }
     Some(limits)
+}
+
+/// An ISO 8601 `resets_at`; `None` when absent or unreadable.
+fn resets_at(window: &Value) -> Option<Timestamp> {
+    window.get("resets_at")?.as_str()?.parse().ok()
 }

@@ -43,14 +43,20 @@ if [ "$key" = other ]; then
 fi
 
 mkdir -p "$state/calls"
+# Claim the next call number with mkdir, which fails if another stub running
+# at the same time took it first.
 n=$(( $(ls "$state/calls" | wc -l) + 1 ))
+until mkdir "$state/calls/$(printf '%04d' "$n")" 2>/dev/null; do
+  n=$((n + 1))
+done
 call="$state/calls/$(printf '%04d' "$n")"
-mkdir -p "$call"
 printf '%s\0' "$@" > "$call/args"
 /usr/bin/env -0 > "$call/env"
 printf '%s' "$stdin_line" > "$call/stdin"
 printf %s "$key" > "$call/key"
-printf %s "$$" > "$call/pid"
+# Written then renamed: a reader never sees an empty pid file.
+printf %s "$$" > "$call/pid.tmp"
+mv "$call/pid.tmp" "$call/pid"
 
 replies="$state/replies/$key"
 first=""
@@ -77,9 +83,32 @@ reply="$replies/$first"
 [ "$count" -eq 1 ] && : > "$reply/answered"
 
 # A hanging reply waits, like a sign-in nobody finishes, until killed. exec
-# keeps the pid, so killing the recorded pid kills the wait.
+# keeps the pid, so killing the recorded pid kills the wait. It is consumed
+# first, like any other reply, unless it is the last one.
 if [ -f "$reply/hang" ]; then
+  if [ "$count" -gt 1 ]; then
+    mkdir -p "$state/used/$key"
+    mv "$reply" "$state/used/$key/$first"
+  fi
   exec /bin/sleep 600
+fi
+
+# An honest `auth status --json`: answers from the folder's own
+# oauthAccount, as Claude Code does.
+if [ -f "$reply/from-folder" ]; then
+  if [ "$count" -gt 1 ]; then
+    mkdir -p "$state/used/$key"
+    mv "$reply" "$state/used/$key/$first"
+  fi
+  f="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  email=$(/usr/bin/plutil -extract oauthAccount.emailAddress raw -o - "$f" 2>/dev/null)
+  org=$(/usr/bin/plutil -extract oauthAccount.organizationUuid raw -o - "$f" 2>/dev/null)
+  if [ -n "$email" ]; then
+    printf '{"loggedIn":true,"authMethod":"claude.ai","email":"%s","orgId":"%s"}\n' "$email" "$org"
+    exit 0
+  fi
+  printf '{"loggedIn":false,"authMethod":"none"}\n'
+  exit 1
 fi
 
 if [ -d "$reply/files" ]; then

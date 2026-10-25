@@ -29,7 +29,10 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
         rows[0].limits,
         [bar("Session", 62), bar("Weekly", 41), bar("Fable", 92)]
     );
-    assert_eq!(details(&rows[0]), ["me@work.example · Work Inc · Max"]);
+    assert_eq!(
+        details(&rows[0]),
+        ["me@work.example · Work Inc · Max", "Limits as of 14:02"]
+    );
     assert!(rows[0].submenu.contains(&MenuItem::Action {
         title: "Limit resets → claude.ai".into(),
         command: Command::OpenLimitResets,
@@ -231,12 +234,34 @@ fn a_duplicate_whose_sign_out_fails_keeps_its_folder() {
 }
 
 #[test]
-fn a_sign_in_claude_code_does_not_confirm_is_kept_with_a_warning() {
+fn a_sign_in_claude_code_contradicts_is_kept_and_pauses_cli_switching() {
     let mac = FakeMac::new();
     mac.with_claude_home(&FixtureLogin::perso());
     mac.claude
         .reply(StubCall::AuthLogin, sign_in_as(&work()))
         .reply(StubCall::AuthStatus, auth_status(&FixtureLogin::perso()))
+        .reply(StubCall::GetUsage, usage_reply(limits_body()));
+    let mut core = mac.launch();
+
+    add_profile(&mut core);
+
+    assert_eq!(rows(&core).len(), 1);
+    assert_eq!(
+        warnings(&core),
+        [
+            "Claude Code didn't use a Profile folder's login · CLI switching paused",
+            "Claude Code didn't confirm the sign-in of me@work.example · Work Inc",
+        ]
+    );
+}
+
+#[test]
+fn a_sign_in_claude_code_cant_confirm_is_kept_with_a_warning_only() {
+    let mac = FakeMac::new();
+    mac.with_claude_home(&FixtureLogin::perso());
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&work()))
+        .reply(StubCall::AuthStatus, Reply::fail(1, "unexpected output"))
         .reply(StubCall::GetUsage, usage_reply(limits_body()));
     let mut core = mac.launch();
 

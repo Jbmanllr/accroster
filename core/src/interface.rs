@@ -103,6 +103,24 @@ pub enum Command {
     /// That removal confirmed: point the CLI at `next` (or delete the
     /// pointer) first, then remove the Profile.
     RemoveProfileWithNextCli { id: String, next: Option<String> },
+    /// Diagnostics… in the menu.
+    OpenDiagnostics,
+    /// "Copy report" in Diagnostics: field names and versions only.
+    CopyDiagnosticsReport,
+    /// "Resume <feature>" in Diagnostics, offered once the checks pass again.
+    /// The only way a Safety pause ends.
+    ResumeFeature(SafetyFeature),
+}
+
+/// A feature that writes Claude's files and can get a Safety pause
+/// (ADR 0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SafetyFeature {
+    /// The pointer and row clicks.
+    CliSwitching,
+    /// The Profile links that share Transcripts and resume data
+    /// (`projects`, `file-history`, `session-env`).
+    TranscriptSharing,
 }
 
 /// A Discovered Profile's identity: an account uuid and an Organization uuid.
@@ -145,6 +163,9 @@ impl Command {
             Command::UnhideDiscovered(_) => "unhide_discovered",
             Command::Rename(_) => "rename",
             Command::SetNickname { .. } => "set_nickname",
+            Command::OpenDiagnostics => "open_diagnostics",
+            Command::CopyDiagnosticsReport => "copy_diagnostics_report",
+            Command::ResumeFeature(_) => "resume_feature",
             Command::OpenAllSessions => "open_all_sessions",
             Command::SearchSessions(_) => "search_sessions",
             Command::FilterSessions(_) => "filter_sessions",
@@ -166,8 +187,18 @@ pub enum Event {
     /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
     /// the core reads the actual time from its [`crate::Clock`].
     Tick,
-    /// The status item's menu is opening.
+    /// The status item's menu is about to open.
     MenuOpened,
+    /// The Mac is going to sleep.
+    WillSleep,
+    /// The Mac woke from sleep.
+    DidWake,
+    /// The screen locked.
+    ScreenLocked,
+    /// The screen unlocked.
+    ScreenUnlocked,
+    /// The Mac gained (`true`) or lost (`false`) its network path.
+    NetworkChanged { online: bool },
     /// Files changed under the folders of [`Effect::WatchSessionFiles`]
     /// (already debounced, about a second): the paths FSEvents reported.
     SessionFilesChanged(Vec<PathBuf>),
@@ -188,6 +219,8 @@ pub enum Effect {
     /// Open System Settings → Login Items, where only the user can turn
     /// launch at login back on.
     OpenLoginItemsSettings,
+    /// Bring the Diagnostics window forward, rendering [`View::diagnostics`].
+    ShowDiagnostics,
     /// Put this text on the general pasteboard.
     CopyToClipboard(String),
     /// Bring the Claude desktop app (`com.anthropic.claudefordesktop`)
@@ -235,8 +268,50 @@ pub struct View {
     pub all_sessions: AllSessionsView,
     /// The first-run window, shown while `Some` (until the user answers).
     pub first_run: Option<FirstRunView>,
-    /// The installed Claude versions, for Diagnostics.
+    pub diagnostics: DiagnosticsView,
+}
+
+/// The Diagnostics window: every format check, the Claude versions, and the
+/// paused features with their Resume buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsView {
+    pub checks: Vec<CheckRow>,
     pub versions: ClaudeVersions,
+    pub paused: Vec<PausedFeature>,
+    /// What "Copy report" copies: check names, results, field names and
+    /// versions; never ids, emails, paths or values.
+    pub report: String,
+}
+
+/// One format check in Diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRow {
+    /// For example "Sidebar entries".
+    pub name: String,
+    pub status: CheckStatus,
+    /// What was found, in field names (for example "unknown fields: foo").
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    /// Nothing of that format was on the Mac to check.
+    NeverSeen,
+}
+
+/// A feature under a Safety pause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausedFeature {
+    pub feature: SafetyFeature,
+    /// "CLI switching paused".
+    pub title: String,
+    /// Why, for example "settings.json sets CLAUDE_CONFIG_DIR".
+    pub reason: String,
+    /// `Resume <feature>`, present only once the checks pass again:
+    /// [`Command::ResumeFeature`].
+    pub resume: Option<Command>,
 }
 
 /// The installed Claude versions, read from files (nothing is spawned).
@@ -347,10 +422,10 @@ pub struct ProfileRow {
     /// Session limit, Weekly limit, then each model-specific weekly limit, in
     /// that order; empty until the first Limit reading.
     pub limits: Vec<LimitBar>,
-    /// A short line under the bars (for example "Couldn't read limits").
+    /// A short line under the bars (for example "as of 14:02").
     pub note: Option<String>,
-    /// Draw the bars and title dimmed: the reading is not current (for
-    /// example the Login expired).
+    /// Drawn dimmed: the reading is not current (stale, unreadable, or the
+    /// Login expired).
     pub dimmed: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
@@ -368,6 +443,9 @@ pub struct LimitBar {
     /// Utilization, whole percent (0–100, rounded down like Claude Code's
     /// `/usage`).
     pub percent: u32,
+    /// The limit's reset time has passed since the reading: drawn as
+    /// "Reset" at 0%.
+    pub reset: bool,
 }
 
 /// The Settings window.

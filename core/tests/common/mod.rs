@@ -76,16 +76,45 @@ pub fn rows(core: &Core) -> Vec<ProfileRow> {
 }
 
 /// Sends ticks until the waiting line is gone (the sign-in process exited and
-/// the core noticed), failing after a few seconds of real time.
+/// the core noticed) and any usage read it started has landed, failing
+/// after a few seconds of real time.
 pub fn wait_for_sign_in(core: &mut Core) -> Vec<Effect> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut effects = Vec::new();
-    while action_titles(core).iter().any(|title| title == WAITING) {
+    while busy(core) {
         assert!(Instant::now() < deadline, "the sign-in never finished");
         std::thread::sleep(Duration::from_millis(20));
         effects.extend(core.event(Event::Tick));
     }
     effects
+}
+
+/// Whether the core is still waiting on a sign-in or a usage read: it then
+/// asks for ticks more often than once a second.
+fn busy(core: &Core) -> bool {
+    action_titles(core).iter().any(|title| title == WAITING)
+        || core.tick_interval() < Duration::from_secs(1)
+}
+
+/// Ticks until nothing the core started is still running.
+pub fn settle(core: &mut Core) {
+    core.event(Event::Tick);
+    wait_for_sign_in(core);
+}
+
+/// Moves the fake clock on by `by`, then lets the core act on it.
+pub fn pass(mac: &FakeMac, core: &mut Core, by: jiff::SignedDuration) {
+    mac.clock.advance(by);
+    settle(core);
+}
+
+/// How many usage reads (`get_usage` requests) Claude Code has received.
+pub fn usage_reads(mac: &FakeMac) -> usize {
+    mac.claude
+        .calls()
+        .iter()
+        .filter(|call| call.kind == StubCall::GetUsage)
+        .count()
 }
 
 /// Clicks Add Profile… and waits for the sign-in to end.
@@ -122,6 +151,7 @@ pub fn bar(label: &str, percent: u32) -> LimitBar {
     LimitBar {
         label: label.into(),
         percent,
+        reset: false,
     }
 }
 
@@ -185,6 +215,16 @@ pub fn mac_signing_in_as(login: &FixtureLogin, rate_limits: Value) -> FakeMac {
         .reply(StubCall::AuthStatus, auth_status(login))
         .reply(StubCall::GetUsage, usage_reply(rate_limits));
     mac
+}
+
+/// Makes the only Profile the CLI's Active Profile, as the CLI switcher's
+/// pointer records it (the folder's absolute path, verbatim).
+pub fn make_cli_active(mac: &FakeMac) {
+    let folder = mac.path(only_profile_folder(mac));
+    mac.write_file(
+        format!("{APP_FOLDER}/bin/cli-active-profile"),
+        folder.to_str().expect("UTF-8 path"),
+    );
 }
 
 /// Clicks the item titled `title` in the hover submenu of the row at `row`,

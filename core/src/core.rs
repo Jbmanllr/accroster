@@ -8,17 +8,21 @@ use std::time::Duration;
 use jiff::SignedDuration;
 
 use crate::backups;
+use crate::checks;
 use crate::cli_switcher::{self, TurnedOff};
 use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, CliSwitchingView, Command, DiscoveredPair, Effect, Event, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    SettingsView, View,
+    AboutView, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect, Event,
+    FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
+    NicknameTarget, SafetyFeature, SettingsView, View,
 };
 use crate::logging::{Field, Level, Logger};
+use crate::monitor::{LimitMonitor, Watched};
 use crate::profiles::{self, ProfileRegistry, SignInTarget};
+use crate::runner::Runner;
+use crate::safety::{self, CheckId, Finding, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
@@ -74,6 +78,7 @@ pub struct Core {
     /// Menu warning lines for this run.
     warnings: Vec<String>,
     profiles: ProfileRegistry,
+    monitor: LimitMonitor,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
@@ -81,6 +86,34 @@ pub struct Core {
     discovered: Vec<Evidence>,
     /// The All Sessions list and the Session index behind it.
     sessions: SessionIndex,
+    /// Format check results and Safety pauses.
+    safety: Safety,
+    /// The Claude versions as of the last check (launch, menu open).
+    versions: ClaudeVersions,
+    /// Each Profile's links as of the last check, by Profile id.
+    links: Vec<ProfileLinks>,
+}
+
+/// What the last link check found in one Profile folder.
+struct ProfileLinks {
+    id: String,
+    /// Links whose place holds something else.
+    replaced: Vec<&'static str>,
+    /// Whether every shared-Transcript link is in place.
+    transcripts_shared: bool,
+}
+
+/// An account as `(email, Organization uuid)`.
+type Account = (Option<String>, Option<String>);
+
+/// When a self-check runs Claude Code's `auth status` in every Profile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthCheck {
+    /// Only when the Claude versions changed since the last self-check:
+    /// a short-lived `claude` can start a token refresh and exit before
+    /// saving it, so the cross-check stays rare.
+    IfVersionsChanged,
+    Always,
 }
 
 impl Core {
@@ -93,6 +126,7 @@ impl Core {
             .ensure_layout()
             .map_err(fail(paths.root().to_path_buf()))?;
         let logger = Logger::new(paths.app_log(), env.home.clone());
+        let paths_for_safety = paths.clone();
         let loaded =
             settings::load(&paths.settings(), env.clock.now()).map_err(fail(paths.settings()))?;
         let mut core = Core {
@@ -102,9 +136,13 @@ impl Core {
             settings: loaded.settings,
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
+            monitor: LimitMonitor::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
             discovered: Vec::new(),
+            safety: Safety::load(&paths_for_safety),
+            versions: ClaudeVersions::default(),
+            links: Vec::new(),
             sessions: SessionIndex::default(),
         };
         core.log(
@@ -151,6 +189,11 @@ impl Core {
         }
         let (profiles, ctx) = core.profiles();
         *profiles = ProfileRegistry::load(&ctx);
+        // Checks first: a Safety pause stops a feature before it writes.
+        core.self_check(AuthCheck::IfVersionsChanged);
+        let (profiles, ctx) = core.profiles();
+        profiles.heal_links(&ctx);
+        core.check_links();
         match cli_switcher::heal_shim(&core.paths) {
             Ok(false) => {}
             Ok(true) => core.log(Level::Info, "cli shim rewritten", &[]),
@@ -164,21 +207,33 @@ impl Core {
             }
         }
         core.rescan_discovered();
+        core.monitor = LimitMonitor::load(&core.context());
         Ok(core)
     }
 
     /// How soon the driver should send the next [`Event::Tick`]: every second
-    /// while a sign-in is waiting (so its end shows at once), otherwise
+    /// while a sign-in is waiting (so its end shows at once), more often
+    /// while a usage read runs, by the time the next read is due, and at most
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
         if self.sessions.busy() {
             // The next batch of the Session index, as soon as input allows.
-            Duration::ZERO
-        } else if self.profiles.signing_in() || self.desktop.waiting() {
+            return Duration::ZERO;
+        }
+        let idle = if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
-        }
+        };
+        self.monitor
+            .tick_interval(self.env.clock.now(), &self.watched(), idle)
+    }
+
+    /// Effects the core queued outside an input (a Safety pause noticed at
+    /// launch). The driver hands them to the UI with the first view;
+    /// [`Core::command`] and [`Core::event`] include them in what they return.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        self.safety.take_effects()
     }
 
     /// Handles a user intent.
@@ -188,6 +243,12 @@ impl Core {
             "command",
             &[("name", Field::Word(command.name()))],
         );
+        let mut effects = self.handle(command);
+        effects.extend(self.take_effects());
+        effects
+    }
+
+    fn handle(&mut self, command: Command) -> Vec<Effect> {
         match command {
             Command::OpenSettings => vec![Effect::ShowSettings],
             Command::OpenAbout => vec![Effect::ShowAbout],
@@ -297,6 +358,14 @@ impl Core {
                 Vec::new()
             }
             Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
+            Command::OpenDiagnostics => vec![Effect::ShowDiagnostics],
+            Command::CopyDiagnosticsReport => {
+                vec![Effect::CopyToClipboard(self.diagnostics().report)]
+            }
+            Command::ResumeFeature(feature) => {
+                self.resume(feature);
+                Vec::new()
+            }
             Command::Rename(NicknameTarget::Profile(id)) => self
                 .profiles
                 .nickname_prompt(&id, &self.settings)
@@ -381,14 +450,25 @@ impl Core {
 
     /// Handles something that happened outside the core.
     pub fn event(&mut self, event: Event) -> Vec<Effect> {
-        match event {
+        let mut effects = match event {
             Event::Tick => {
                 if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
                     self.set_verbose_logging_until(None);
                 }
+                let was_signing_in = self.profiles.signing_in();
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
                 let mut effects = profiles.take_effects();
+                if self.profiles.take_auth_disagreement() {
+                    let finding = self.config_dir_disagreement("in a new Profile");
+                    self.safety.record(CheckId::ConfigDirHonoured, finding);
+                }
+                if was_signing_in && !self.profiles.signing_in() {
+                    self.check_links();
+                }
+                if !self.self_check_if_versions_changed() {
+                    self.settle();
+                }
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
                 effects.extend(desktop.poll(&ctx, &signed_in));
@@ -397,6 +477,13 @@ impl Core {
             }
             Event::MenuOpened => {
                 self.rescan_discovered();
+                if !self.self_check_if_versions_changed() {
+                    self.safety.check_settings_env(&self.env, true);
+                    self.check_links();
+                    self.settle();
+                }
+                let watched = self.watched();
+                self.monitor.menu_opened(self.env.clock.now(), &watched);
                 // While the window is closed nothing is watched: a stat-only
                 // rescan keeps the index current.
                 if !self.sessions.window_open() {
@@ -414,23 +501,102 @@ impl Core {
                 }
                 Vec::new()
             }
+            Event::WillSleep | Event::DidWake => {
+                let watched = self.watched();
+                self.monitor.set_asleep(event == Event::WillSleep, &watched);
+                Vec::new()
+            }
+            Event::ScreenLocked | Event::ScreenUnlocked => {
+                let watched = self.watched();
+                self.monitor
+                    .set_locked(event == Event::ScreenLocked, &watched);
+                Vec::new()
+            }
+            Event::NetworkChanged { online } => {
+                self.monitor.set_online(online);
+                Vec::new()
+            }
+        };
+        effects.extend(self.run_monitor());
+        effects.extend(self.take_effects());
+        effects
+    }
+
+    /// Lets the Limit monitor collect a finished read and start the next.
+    /// Finished reads go to the Profile registry, which notices an expired
+    /// Login; returns the notifications that produced.
+    fn run_monitor(&mut self) -> Vec<Effect> {
+        let watched = self.watched();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        };
+        // A finished read is handed over before the next starts, so the
+        // registry's `auth status` check never overlaps a usage read.
+        if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
         }
+        let watched = self.watched();
+        if let Some(done) = self.monitor.start_due(&ctx, &watched) {
+            self.profiles.record_reading(&ctx, &done.id, done.reply);
+        }
+        self.profiles.take_effects()
+    }
+
+    /// The signed-in Profiles the Limit monitor reads, with which are a
+    /// client's Active Profile: the CLI's (its pointer) or the desktop app's.
+    fn watched(&self) -> Vec<Watched> {
+        let cli_active = cli_switcher::pointer(&self.paths);
+        let desktop_active =
+            desktop::desktop_account(&DesktopPaths::new(&self.env.home)).and_then(|account| {
+                let signed_in = self.profiles.signed_in();
+                account
+                    .profile(&signed_in)
+                    .map(|profile| profile.id.clone())
+            });
+        self.profiles.watched(|id, config_dir| {
+            cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
+        })
     }
 
     /// Everything the UI shows right now.
     pub fn view(&self) -> View {
         let login_item = self.env.login_item.status();
+        let ctx = self.context();
+        let watched = self.watched();
         let mut items: Vec<MenuItem> = self
-            .warnings
-            .iter()
-            .map(String::as_str)
-            .chain(self.profiles.notice())
-            .map(|text| MenuItem::Warning(text.to_owned()))
+            .monitor
+            .offline_line(&ctx, &watched)
+            .into_iter()
+            .chain(
+                self.warnings
+                    .iter()
+                    .cloned()
+                    .chain(self.safety.warning_lines())
+                    .chain(self.profiles.notice().map(str::to_owned)),
+            )
+            .map(MenuItem::Warning)
             .collect();
-        let mut listed = self
-            .profiles
-            .listed(self.env.clock.as_ref(), &self.settings);
-        let cli = cli_switcher::present(&self.paths, &mut listed);
+        let mut listed = self.profiles.listed(&self.settings, |id| {
+            let active = watched.iter().any(|w| w.id == id && w.active);
+            self.monitor.view(&ctx, id, active)
+        });
+        for profile in &mut listed {
+            self.annotate_links(profile.id, &mut profile.row);
+        }
+        let cli = cli_switcher::present(
+            &self.paths,
+            &mut listed,
+            self.safety.is_paused(SafetyFeature::CliSwitching),
+        );
+        let pointer = cli_switcher::pointer(&self.paths);
+        // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
+        let menu_bar_dimmed = listed
+            .iter()
+            .any(|profile| Some(profile.config_dir) == pointer.as_deref() && profile.row.dimmed);
         items.extend(self.desktop.menu_items());
         if !items.is_empty() {
             items.push(MenuItem::Separator);
@@ -503,6 +669,10 @@ impl Core {
                 command: Command::OpenSettings,
             },
             MenuItem::Action {
+                title: "Diagnostics…".into(),
+                command: Command::OpenDiagnostics,
+            },
+            MenuItem::Action {
                 title: "About".into(),
                 command: Command::OpenAbout,
             },
@@ -515,7 +685,7 @@ impl Core {
         View {
             menu_bar: MenuBarView {
                 label: cli.label.unwrap_or_else(|| "AccRoster".into()),
-                dimmed: false,
+                dimmed: menu_bar_dimmed,
             },
             menu: MenuView { items },
             settings: SettingsView {
@@ -552,7 +722,291 @@ impl Core {
                 .then_some(FirstRunView {
                     launch_at_login: true,
                 }),
-            versions: desktop::versions(&self.env),
+            diagnostics: self.diagnostics(),
+        }
+    }
+
+    /// The Diagnostics window: every check, the versions, the pauses.
+    fn diagnostics(&self) -> crate::interface::DiagnosticsView {
+        let usage = self.monitor.usage_summary();
+        let mut finding = if usage.unreadable > 0 {
+            Finding::fail(format!(
+                "{} of {} last answers couldn't be read",
+                usage.unreadable,
+                usage.unreadable + usage.read
+            ))
+        } else if usage.read > 0 {
+            Finding::pass()
+        } else {
+            Finding::never_seen()
+        };
+        if !usage.new_kinds.is_empty() {
+            let kinds: Vec<String> = usage
+                .new_kinds
+                .iter()
+                .map(|kind| safety::reportable(kind))
+                .collect();
+            let line = format!("New limit kind seen: {}", kinds.join(", "));
+            finding.detail = Some(match finding.detail.take() {
+                Some(detail) => format!("{detail}; {line}"),
+                None => line,
+            });
+        }
+        self.safety.diagnostics(self.versions.clone(), finding)
+    }
+
+    /// "Transcripts not shared" under a Profile whose shared-Transcript links
+    /// aren't in place, and a detail line per other replaced link.
+    fn annotate_links(&self, id: &str, row: &mut crate::interface::ProfileRow) {
+        let Some(links) = self.links.iter().find(|links| links.id == id) else {
+            return;
+        };
+        if !links.transcripts_shared {
+            row.note = Some(match row.note.take() {
+                Some(note) => format!("{note} · Transcripts not shared"),
+                None => "Transcripts not shared".to_owned(),
+            });
+        }
+        for name in links
+            .replaced
+            .iter()
+            .filter(|name| !cli_switcher::TRANSCRIPT_LINKS.contains(name))
+        {
+            row.submenu.push(MenuItem::Detail(format!(
+                "{name} link replaced · not shared"
+            )));
+        }
+    }
+
+    /// Runs the full self-check when a Claude version changed since the last
+    /// one. Returns whether it ran.
+    fn self_check_if_versions_changed(&mut self) -> bool {
+        if !self.safety.versions_changed(&desktop::versions(&self.env)) {
+            return false;
+        }
+        self.log(Level::Info, "claude versions changed", &[]);
+        self.self_check(AuthCheck::IfVersionsChanged);
+        true
+    }
+
+    /// The full self-check: settings `env`, accounts, links, Sidebar entries,
+    /// live-process files and Transcript records, plus `auth status` per
+    /// `auth`; then pauses whatever a failed check blocks.
+    fn self_check(&mut self, auth: AuthCheck) {
+        let versions = desktop::versions(&self.env);
+        let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
+        self.versions = versions;
+        self.safety.check_settings_env(&self.env, false);
+        self.check_accounts();
+        self.check_links();
+        if run_auth {
+            self.check_config_dir_honoured();
+        }
+        let home = self.env.home.clone();
+        self.safety
+            .record(CheckId::SidebarEntries, checks::sidebar_entries(&home));
+        let mut session_dirs = vec![home.join(".claude")];
+        session_dirs.extend(
+            self.profiles
+                .folders()
+                .into_iter()
+                .map(|(_, dir)| dir.to_path_buf()),
+        );
+        self.safety.record(
+            CheckId::LiveProcesses,
+            checks::live_processes(&session_dirs),
+        );
+        self.safety.record(
+            CheckId::TranscriptRecords,
+            checks::transcript_records(&home),
+        );
+        self.safety.mark_checked(&self.versions);
+        self.settle();
+    }
+
+    /// Pauses whatever a current finding blocks, and logs each new pause.
+    fn settle(&mut self) {
+        for feature in self.safety.settle() {
+            self.log(
+                Level::Warn,
+                "safety pause",
+                &[("feature", Field::Word(feature_word(feature)))],
+            );
+        }
+    }
+
+    fn check_accounts(&mut self) {
+        let folders: Vec<&Path> = self
+            .profiles
+            .folders()
+            .into_iter()
+            .map(|(_, dir)| dir)
+            .collect();
+        let (accounts, caches) =
+            checks::accounts(&folders, &safety::claude_code_name(&self.versions));
+        self.safety.record(CheckId::OauthAccount, accounts);
+        self.safety.record(CheckId::CachedUsage, caches);
+    }
+
+    /// Checks every Profile folder's links: a replaced shared-Transcript link
+    /// blocks Transcript sharing; other replaced links are only reported.
+    fn check_links(&mut self) {
+        let claude_home = self.env.home.join(".claude");
+        self.links = self
+            .profiles
+            .folders()
+            .into_iter()
+            .map(|(id, dir)| ProfileLinks {
+                id: id.to_owned(),
+                replaced: cli_switcher::replaced_links(dir, &claude_home),
+                transcripts_shared: cli_switcher::TRANSCRIPT_LINKS.iter().all(|name| {
+                    std::fs::read_link(dir.join(name)).ok() == Some(claude_home.join(name))
+                }),
+            })
+            .collect();
+        if self.links.is_empty() {
+            return;
+        }
+        let summary = |transcript: bool| -> Option<String> {
+            let mut names: Vec<&str> = Vec::new();
+            let mut profiles = 0;
+            for links in &self.links {
+                let hit: Vec<&str> = links
+                    .replaced
+                    .iter()
+                    .copied()
+                    .filter(|name| cli_switcher::TRANSCRIPT_LINKS.contains(name) == transcript)
+                    .collect();
+                if !hit.is_empty() {
+                    profiles += 1;
+                }
+                for name in hit {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            (profiles > 0).then(|| {
+                let plural = if names.len() > 1 { "links" } else { "link" };
+                let whose = if profiles > 1 { "Profiles" } else { "Profile" };
+                format!(
+                    "{} {plural} replaced in {profiles} {whose}",
+                    names.join(", ")
+                )
+            })
+        };
+        let transcripts = match summary(true) {
+            Some(text) => {
+                Finding::fail(text.clone()).blocking(SafetyFeature::TranscriptSharing, text)
+            }
+            None => Finding::pass(),
+        };
+        let others = match summary(false) {
+            Some(text) => Finding::fail(text),
+            None => Finding::pass(),
+        };
+        self.safety.record(CheckId::TranscriptLinks, transcripts);
+        self.safety.record(CheckId::OtherLinks, others);
+    }
+
+    /// Runs `claude auth status --json` in every signed-in Profile and
+    /// compares it with the folder's `oauthAccount`. Unreadable answers say
+    /// nothing either way.
+    fn check_config_dir_honoured(&mut self) {
+        let runner = Runner::new(&self.env, &self.paths);
+        // Per signed-in Profile: the (email, Organization) its folder holds,
+        // and what a readable, logged-in `auth status` said, if anything.
+        let answers: Vec<(Account, Option<Account>)> = self
+            .profiles
+            .accounts()
+            .into_iter()
+            .map(|account| {
+                let said = runner
+                    .auth_status(account.config_dir)
+                    .filter(|status| status.logged_in)
+                    .map(|status| (status.email, status.org_id));
+                let held = (
+                    Some(account.email.to_owned()),
+                    Some(account.organization_uuid.to_owned()),
+                );
+                (held, said)
+            })
+            .collect();
+        let said: Vec<&Account> = answers
+            .iter()
+            .filter_map(|(_, said)| said.as_ref())
+            .collect();
+        if said.is_empty() {
+            return;
+        }
+        let one_identity = answers.len() > 1
+            && said.len() == answers.len()
+            && said.iter().all(|account| *account == said[0]);
+        let disagreeing = answers
+            .iter()
+            .filter(|(held, said)| said.as_ref().is_some_and(|said| said != held))
+            .count();
+        let finding = if one_identity {
+            let reason = format!(
+                "{} ignores Profile folders",
+                safety::claude_code_name(&self.versions)
+            );
+            Finding::fail("every Profile reports one account")
+                .blocking(SafetyFeature::CliSwitching, reason)
+        } else if disagreeing > 0 {
+            let whose = if disagreeing > 1 {
+                "Profiles"
+            } else {
+                "Profile"
+            };
+            self.config_dir_disagreement(&format!("in {disagreeing} {whose}"))
+        } else {
+            Finding::pass()
+        };
+        self.safety.record(CheckId::ConfigDirHonoured, finding);
+    }
+
+    /// `auth status` named another account than `oauthAccount`.
+    fn config_dir_disagreement(&self, where_: &str) -> Finding {
+        Finding::fail(format!("auth status names another account {where_}")).blocking(
+            SafetyFeature::CliSwitching,
+            format!(
+                "{} didn't use a Profile folder's login",
+                safety::claude_code_name(&self.versions)
+            ),
+        )
+    }
+
+    /// "Resume <feature>": runs the feature's checks again and ends its
+    /// pause if none fails.
+    fn resume(&mut self, feature: SafetyFeature) {
+        match feature {
+            SafetyFeature::CliSwitching => {
+                self.versions = desktop::versions(&self.env);
+                self.safety.check_settings_env(&self.env, false);
+                self.check_accounts();
+                self.check_config_dir_honoured();
+            }
+            SafetyFeature::TranscriptSharing => self.check_links(),
+        }
+        self.settle();
+        if !self.safety.resume(feature) {
+            self.log(
+                Level::Info,
+                "safety pause kept",
+                &[("feature", Field::Word(feature_word(feature)))],
+            );
+            return;
+        }
+        self.log(
+            Level::Info,
+            "safety pause resumed",
+            &[("feature", Field::Word(feature_word(feature)))],
+        );
+        if feature == SafetyFeature::TranscriptSharing {
+            let (profiles, ctx) = self.profiles();
+            profiles.heal_links(&ctx);
+            self.check_links();
         }
     }
 
@@ -590,16 +1044,17 @@ impl Core {
         let signed_in = self.profiles.signed_in();
         let mut sidebars: Vec<SidebarProfile> = self
             .profiles
-            .listed(self.env.clock.as_ref(), &self.settings)
+            .ordered_ids(&self.settings.profile_order)
             .into_iter()
-            .filter_map(|listed| {
-                let profile = signed_in.iter().find(|profile| profile.id == listed.id)?;
+            .filter_map(|id| {
+                let profile = signed_in.iter().find(|profile| profile.id == id)?;
                 Some(SidebarProfile {
                     pair: DiscoveredPair {
                         account_uuid: profile.account_uuid.clone(),
                         organization_uuid: profile.organization_uuid.clone(),
                     },
-                    name: listed.row.title,
+                    name: (self.settings.nicknames.get(&id).cloned())
+                        .unwrap_or_else(|| profile.name.clone()),
                     signed_in: true,
                 })
             })
@@ -716,6 +1171,14 @@ impl Core {
     fn remove_profile(&mut self, id: &str) {
         let (profiles, ctx) = self.profiles();
         if profiles.remove(&ctx, id) {
+            let ctx = profiles::Context {
+                env: &self.env,
+                paths: &self.paths,
+                logger: &self.logger,
+                verbose: self.verbose_logging(),
+                share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+            };
+            self.monitor.forget(&ctx, id);
             self.forget_profile_settings(id);
         }
     }
@@ -837,6 +1300,11 @@ impl Core {
     /// the shim; off removes them and the pointer, or lists the lines of an
     /// edited block for the user to remove.
     fn set_cli_switching(&mut self, on: bool) {
+        if on && self.safety.is_paused(SafetyFeature::CliSwitching) {
+            self.cli_note =
+                Some("CLI switching is paused · see Diagnostics for why and to resume it".into());
+            return;
+        }
         let now = self.env.clock.now();
         let result = if on {
             cli_switcher::turn_on(&self.paths, &self.env.home, now).map(|()| TurnedOff::Clean)
@@ -888,6 +1356,14 @@ impl Core {
         if !cli_switcher::is_on(&self.paths) {
             return;
         }
+        // The shared settings may have changed since the menu opened.
+        if self.safety.check_settings_env(&self.env, true) {
+            self.settle();
+        }
+        if self.safety.is_paused(SafetyFeature::CliSwitching) {
+            self.log(Level::Info, "cli profile not chosen: paused", &[]);
+            return;
+        }
         let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
             return;
         };
@@ -919,6 +1395,7 @@ impl Core {
             paths: &self.paths,
             logger: &self.logger,
             verbose,
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
         };
         (&mut self.desktop, ctx)
     }
@@ -931,8 +1408,20 @@ impl Core {
             paths: &self.paths,
             logger: &self.logger,
             verbose,
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
         };
         (&mut self.profiles, ctx)
+    }
+
+    /// What the registry and the monitor need from the rest of the core.
+    fn context(&self) -> profiles::Context<'_> {
+        profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose: self.verbose_logging(),
+            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
+        }
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
@@ -943,6 +1432,13 @@ impl Core {
             message,
             fields,
         );
+    }
+}
+
+fn feature_word(feature: SafetyFeature) -> &'static str {
+    match feature {
+        SafetyFeature::CliSwitching => "cli_switching",
+        SafetyFeature::TranscriptSharing => "transcript_sharing",
     }
 }
 

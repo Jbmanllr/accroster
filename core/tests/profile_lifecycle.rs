@@ -351,6 +351,9 @@ fn sign_in_again_in_the_same_folder_with_the_email_fixes_an_expired_login() {
     mac.claude
         .reply(StubCall::AuthLogin, sign_in_as(&work()))
         .reply(StubCall::GetUsage, usage_reply(limits_body()));
+    // A browser sign-in takes a while; one Profile is never read twice
+    // within a minute.
+    mac.clock.advance(jiff::SignedDuration::from_mins(1));
 
     click_in_row(&mut core, 0, "Sign in again…");
     let effects = wait_for_sign_in(&mut core);
