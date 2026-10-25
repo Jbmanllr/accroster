@@ -685,9 +685,9 @@ impl DesktopBridge {
                 log(ctx, Level::Warn, "desktop switch mismatch", &profile);
                 let actual = account
                     .profile(profiles)
-                    .map_or("another account", |profile| &profile.name);
+                    .map_or("another Profile", |profile| &profile.name);
                 (
-                    "Claude signed in to another account",
+                    "Claude signed in to another Profile",
                     format!("Claude signed in as {actual}, not {}", target.name),
                 )
             }

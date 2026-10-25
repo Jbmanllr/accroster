@@ -533,7 +533,7 @@ pub struct DiscoveredRow {
     /// `email · Organization`, else "Unknown Login".
     pub title: String,
     /// A second line for an Unknown Login: Session count, last activity and
-    /// "Desktop's last account" when it applies.
+    /// "Desktop's last Login" when it applies.
     pub subtitle: Option<String>,
     /// Sent when the row is clicked: [`Command::SignInDiscovered`].
     pub command: Command,

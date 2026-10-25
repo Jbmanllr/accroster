@@ -376,6 +376,7 @@ impl Core {
         for id in self.profiles.take_removed() {
             self.forget_removed(&id);
         }
+        self.carry_over_nicknames();
         if let Some(answers) = self.profiles.take_cross_check() {
             self.cross_checked(&answers);
         }
@@ -407,9 +408,10 @@ impl Core {
                 let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
                     return Vec::new();
                 };
+                let nickname = self.choice(&pair).and_then(|c| c.nickname.as_deref());
                 let target = SignInTarget {
                     email: evidence.email().map(str::to_owned),
-                    name: evidence.known_name(),
+                    name: evidence.name(nickname),
                     pair,
                 };
                 let (profiles, ctx) = self.profiles();
@@ -834,12 +836,18 @@ impl Core {
         let desktop_profile = desktop_account
             .as_ref()
             .and_then(|account| account.profile(&signed_in));
-        // The CLI part comes first.
-        let mut header: Vec<String> = cli.header.into_iter().collect();
-        if desktop_account.is_some() {
-            let name = desktop_profile.map_or("another account", |profile| &profile.name);
-            header.push(format!("Desktop: {name}"));
-        }
+        // Each client's Active Profile by its short name, the CLI's first:
+        // without CLI switching that is Default, said when the desktop's is.
+        let desktop_part = desktop_account.as_ref().map(|_| {
+            let name = desktop_profile
+                .and_then(|desktop| listed.iter().find(|listed| listed.id == desktop.id))
+                .map_or("another Profile", |listed| listed.short_label.as_str());
+            format!("Desktop: {name}")
+        });
+        let cli_part = cli
+            .header
+            .or_else(|| desktop_part.as_ref().map(|_| "CLI: Default".to_owned()));
+        let header: Vec<String> = cli_part.into_iter().chain(desktop_part).collect();
         if !header.is_empty() {
             items.push(MenuItem::Detail(header.join("    ")));
         }
@@ -970,7 +978,8 @@ impl Core {
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
                     .map(|(evidence, choice)| HiddenDiscovered {
-                        title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                        title: evidence
+                            .hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
                         restore: Command::UnhideDiscovered(evidence.pair.clone()),
                     })
                     .collect(),
@@ -1715,7 +1724,10 @@ impl Core {
             if !sidebars.iter().any(|sidebar| sidebar.pair == evidence.pair) {
                 sidebars.push(SidebarProfile {
                     pair: evidence.pair.clone(),
-                    name: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                    name: evidence.hidden_title(
+                        choice.and_then(|c| c.nickname.as_deref()),
+                        &self.env.clock.time_zone(),
+                    ),
                     signed_in: false,
                 });
             }
@@ -1751,6 +1763,33 @@ impl Core {
             choice.account_uuid == pair.account_uuid
                 && choice.organization_uuid == pair.organization_uuid
         })
+    }
+
+    /// A Discovered Profile that became a Profile (the exact pair signed
+    /// in) hands its nickname over, unless the Profile already has one.
+    fn carry_over_nicknames(&mut self) {
+        let signed_in = self.profiles.signed_in();
+        let mut updated = self.settings.clone();
+        for choice in &mut updated.discovered_profiles {
+            let Some(profile) = signed_in.iter().find(|profile| {
+                profile.account_uuid == choice.account_uuid
+                    && profile.organization_uuid == choice.organization_uuid
+            }) else {
+                continue;
+            };
+            if let Some(nickname) = choice.nickname.take() {
+                updated
+                    .nicknames
+                    .entry(profile.id.clone())
+                    .or_insert(nickname);
+            }
+        }
+        updated
+            .discovered_profiles
+            .retain(|choice| choice.hidden || choice.nickname.is_some());
+        if updated != self.settings && self.save_settings(updated) {
+            self.log(Level::Info, "discovered nickname carried over", &[]);
+        }
     }
 
     /// Changes the saved choice for `pair` (creating it), dropping choices

@@ -58,29 +58,46 @@ impl Evidence {
             .filter(|email| !email.is_empty())
     }
 
-    /// `email · Organization`, else "Unknown Login (account 55555555)".
+    /// `email · Organization`, else "Unknown Login". A uuid appears only in
+    /// hover detail.
     pub fn known_name(&self) -> String {
         match &self.login {
             Some(login) => format!("{} · {}", login.email, login.organization_name),
-            None => format!("Unknown Login (account {})", short(&self.pair.account_uuid)),
+            None => "Unknown Login".to_owned(),
         }
     }
 
     /// The nickname, else `email · Organization`, else "Unknown Login".
-    fn name(&self, nickname: Option<&str>) -> String {
-        match (nickname, &self.login) {
-            (Some(nickname), _) => nickname.to_owned(),
-            (None, Some(login)) => format!("{} · {}", login.email, login.organization_name),
-            (None, None) => "Unknown Login".to_owned(),
+    pub fn name(&self, nickname: Option<&str>) -> String {
+        nickname.map_or_else(|| self.known_name(), str::to_owned)
+    }
+
+    /// The Settings > Hidden entry's title: the name, with what tells an
+    /// Unknown Login apart ("Unknown Login · 3 Sessions · last active Oct
+    /// 24"), dates in `tz`.
+    pub fn hidden_title(&self, nickname: Option<&str>, tz: &TimeZone) -> String {
+        match (nickname, self.evidence_line(tz)) {
+            (None, Some(line)) => format!("{} · {line}", self.known_name()),
+            _ => self.name(nickname),
         }
     }
 
-    /// The Settings > Hidden entry's title.
-    pub fn hidden_title(&self, nickname: Option<&str>) -> String {
-        match nickname {
-            Some(nickname) => nickname.to_owned(),
-            None => self.known_name(),
-        }
+    /// What tells an Unknown Login apart: its Sessions, last activity and
+    /// whether it is the desktop's last Login. `None` for a named Login.
+    fn evidence_line(&self, tz: &TimeZone) -> Option<String> {
+        self.login.is_none().then(|| {
+            let mut parts = vec![match self.sessions {
+                1 => "1 Session".to_owned(),
+                n => format!("{n} Sessions"),
+            }];
+            if let Some(last) = self.last_activity {
+                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
+            }
+            if self.desktop_last {
+                parts.push("Desktop's last Login".to_owned());
+            }
+            parts.join(" · ")
+        })
     }
 
     /// The menu row, with dates in `tz`.
@@ -93,19 +110,7 @@ impl Evidence {
             ),
             _ => format!("Sign in to {name}…"),
         };
-        let subtitle = self.login.is_none().then(|| {
-            let mut parts = vec![match self.sessions {
-                1 => "1 Session".to_owned(),
-                n => format!("{n} Sessions"),
-            }];
-            if let Some(last) = self.last_activity {
-                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
-            }
-            if self.desktop_last {
-                parts.push("Desktop's last account".to_owned());
-            }
-            parts.join(" · ")
-        });
+        let subtitle = self.evidence_line(tz);
         let mut submenu = Vec::new();
         if let Some(as_of) = self.login.as_ref().and_then(|login| login.as_of) {
             submenu.push(MenuItem::Detail(format!(

@@ -1179,7 +1179,7 @@ impl ProfileRegistry {
                 &[("profile", Field::Profile(&id))],
             );
             self.notice = Some(format!(
-                "Signed in as {}, not {} · to add it, pick that account and Organization in the browser",
+                "Signed in as {}, not {} · to add it, pick that Login and Organization in the browser",
                 identity.name(),
                 target.name
             ));
