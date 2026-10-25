@@ -13,7 +13,10 @@
 //!   folder, for the running dots.
 //!
 //! Building runs in batches ([`SessionIndex::step`]) so the list fills in while
-//! the core keeps handling input. Nothing here writes outside the app's own
+//! the core keeps handling input. While the All Sessions window is open,
+//! FSEvents paths ([`SessionIndex::files_changed`]) re-stat only their
+//! sources; while it is closed nothing is watched, and a menu open does a
+//! stat-only [`SessionIndex::rescan`]. Either way only changed files are read. Nothing here writes outside the app's own
 //! `index/` folder, and titles and prompts are never logged.
 
 use std::collections::{BTreeMap, HashMap};
@@ -28,7 +31,10 @@ use serde_json::Value;
 
 use crate::desktop::{self, DesktopAccount, DesktopPaths};
 use crate::env::Environment;
-use crate::interface::{AllSessionsView, RunningDot, SessionRow};
+use crate::interface::{
+    AllSessionsView, DiscoveredPair, RunningDot, SessionDetail, SessionFilter, SessionRow,
+    SidebarGroup, SidebarItem, SidebarPresence,
+};
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// Transcripts read per [`SessionIndex::step`].
@@ -207,6 +213,7 @@ struct EntryFile {
     cli_session_id: Option<String>,
     title: Option<String>,
     title_source: Option<String>,
+    is_archived: Option<bool>,
     last_activity_at: Option<i64>,
     cwd: Option<String>,
     ssh_config: Option<Value>,
@@ -237,18 +244,19 @@ impl EntryFile {
 /// One Sidebar entry, in one Profile's folder.
 #[derive(Debug, Clone)]
 struct SidebarEntry {
-    account: String,
-    org: String,
+    pair: DiscoveredPair,
     cli_session_id: String,
     title: Option<String>,
     /// `titleSource` is set and isn't `auto` (an entry with no `titleSource`
     /// counts as automatic).
     user_title: bool,
+    archived: bool,
     last_activity_at: i64,
+    cwd: Option<String>,
 }
 
 /// A live-process file's fields.
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveFile {
     pid: u32,
@@ -258,33 +266,61 @@ struct LiveFile {
     status: Option<String>,
 }
 
+/// A file's size and mtime (ns): when either changes, it is read again.
+type Stamp = (u64, u64);
+
+/// A small source file as last read: its stamp and what it held (`None`
+/// when unreadable or skipped).
+type Cached<T> = BTreeMap<PathBuf, (Stamp, Option<T>)>;
+
 /// What a finished build found, for the log.
 pub(crate) struct Built {
     pub transcripts: usize,
     pub read: usize,
 }
 
-/// The Session index and the All Sessions list's state.
+/// A Profile's Sidebar as the All Sessions window names it.
+pub(crate) struct SidebarProfile {
+    pub pair: DiscoveredPair,
+    /// The nickname, else `email · Organization`, else "Unknown Login …".
+    pub name: String,
+    /// It is a signed-in Profile in AccRoster.
+    pub signed_in: bool,
+}
+
+/// The Session index and the All Sessions window's state.
 #[derive(Default)]
 pub(crate) struct SessionIndex {
-    /// By path. Loaded from `index/sessions.json` on first open.
+    home: PathBuf,
+    /// By path. Loaded from `index/sessions.json` on the first rescan.
     transcripts: BTreeMap<PathBuf, Transcript>,
     loaded: bool,
-    /// Transcripts still to read in this build, with their size and mtime.
+    /// Transcripts still to read, with their size and mtime.
     pending: Vec<(PathBuf, u64, u64)>,
+    /// A full rescan is reading its batches (the list is filling in).
     building: bool,
+    /// Transcripts read since the index was last saved.
     read: usize,
-    entries: Vec<SidebarEntry>,
+    entries: Cached<SidebarEntry>,
+    live: Cached<LiveFile>,
     running: HashMap<String, RunningDot>,
-    /// The desktop's account and Organization, for title precedence.
+    /// The desktop's account and Organization, for title precedence and
+    /// "desktop now".
     desktop: Option<DesktopAccount>,
+    /// The All Sessions window is open (its folders are watched).
+    window_open: bool,
     search: String,
+    filter: SessionFilter,
+    selected: Option<String>,
 }
 
 impl SessionIndex {
-    /// Starts a build: rereads Sidebar entries, live processes and the
-    /// desktop's account, and queues every new or changed Transcript.
-    pub(crate) fn open(&mut self, env: &Environment, paths: &AppPaths) {
+    /// A stat-only rescan of every source: re-reads only the Sidebar entries
+    /// and live-process files that changed, and queues every new or changed
+    /// Transcript for [`SessionIndex::step`], which saves the index once the
+    /// last batch is read.
+    pub(crate) fn rescan(&mut self, env: &Environment, paths: &AppPaths) {
+        self.home = env.home.clone();
         if !self.loaded {
             self.loaded = true;
             // Disposable: an unreadable index is rebuilt from scratch.
@@ -296,30 +332,83 @@ impl SessionIndex {
                     .collect();
             }
         }
-        let found = transcript_files(&env.home);
-        self.transcripts.retain(|path, _| found.contains_key(path));
-        self.pending = found
-            .into_iter()
-            .filter(|(path, (size, mtime))| {
-                self.transcripts
-                    .get(path)
-                    .is_none_or(|t| t.size != *size || t.mtime_ns != *mtime)
-            })
-            .map(|(path, (size, mtime))| (path, size, mtime))
-            .collect();
+        self.restat_transcripts();
+        self.restat_entries();
+        self.restat_live(env, paths);
         self.building = true;
-        self.read = 0;
-        self.entries = sidebar_entries(&env.home);
-        self.running = running(env, paths);
-        self.desktop = desktop::desktop_account(&DesktopPaths::new(&env.home));
+    }
+
+    /// Opens the All Sessions window: a rescan, then the folders to watch
+    /// while it stays open (only the first open asks for them).
+    pub(crate) fn open(&mut self, env: &Environment, paths: &AppPaths) -> Option<Vec<PathBuf>> {
+        self.rescan(env, paths);
+        if self.window_open {
+            return None;
+        }
+        self.window_open = true;
+        Some(watched_folders(&env.home, paths))
+    }
+
+    /// The window closed: nothing is watched any more. Saves what was read
+    /// since the last save.
+    pub(crate) fn close(&mut self, paths: &AppPaths) -> io::Result<bool> {
+        self.window_open = false;
+        self.selected = None;
+        self.save_if_read(paths)
+    }
+
+    pub(crate) fn window_open(&self) -> bool {
+        self.window_open
+    }
+
+    /// FSEvents reported `changed`: re-stats only the sources those paths
+    /// belong to (a path outside every source re-stats them all). A
+    /// Transcript path is re-stated alone; the changed ones are read from
+    /// their stored offset by the next [`SessionIndex::step`].
+    pub(crate) fn files_changed(
+        &mut self,
+        env: &Environment,
+        paths: &AppPaths,
+        changed: &[PathBuf],
+    ) {
+        let projects = projects_root(&env.home);
+        let sidebar = sidebar_root(&env.home);
+        let live_roots = [env.home.join(".claude").join("sessions"), paths.profiles()];
+        let mut transcripts = Vec::new();
+        let (mut all_transcripts, mut entries, mut live) = (false, false, false);
+        for path in changed {
+            if let Ok(inside) = path.strip_prefix(&projects) {
+                if inside.components().count() == 2 && is_jsonl(path) {
+                    transcripts.push(path.clone());
+                } else {
+                    all_transcripts = true;
+                }
+            } else if path.starts_with(&sidebar) {
+                entries = true;
+            } else if live_roots.iter().any(|root| path.starts_with(root)) {
+                live = true;
+            } else {
+                (all_transcripts, entries, live) = (true, true, true);
+            }
+        }
+        if all_transcripts {
+            self.restat_transcripts();
+        } else {
+            for path in transcripts {
+                self.restat_transcript(path);
+            }
+        }
+        if entries {
+            self.restat_entries();
+        }
+        if live {
+            self.restat_live(env, paths);
+        }
     }
 
     /// Reads the next batch of Transcripts. Returns what was built once the
-    /// last batch is done and the index is saved.
+    /// last batch of a full rescan is read and the index is saved.
     pub(crate) fn step(&mut self, paths: &AppPaths) -> Option<io::Result<Built>> {
-        if !self.building {
-            return None;
-        }
         let split = self.pending.len().saturating_sub(BATCH);
         for (path, size, mtime) in self.pending.split_off(split) {
             let Some(id) = path
@@ -342,31 +431,159 @@ impl SessionIndex {
             self.read += 1;
             self.transcripts.insert(path, transcript);
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.building {
             return None;
         }
         self.building = false;
-        let file = IndexFile {
-            transcripts: self.transcripts.values().cloned().collect(),
-        };
-        Some(
-            storage::write_versioned(&index_file(paths), &file).map(|()| Built {
-                transcripts: self.transcripts.len(),
-                read: self.read,
-            }),
-        )
+        let read = self.read;
+        Some(self.save_if_read(paths).map(|_| Built {
+            transcripts: self.transcripts.len(),
+            read,
+        }))
     }
 
-    pub(crate) fn building(&self) -> bool {
-        self.building
+    /// Transcripts are waiting to be read.
+    pub(crate) fn busy(&self) -> bool {
+        self.building || !self.pending.is_empty()
     }
 
     pub(crate) fn set_search(&mut self, search: String) {
         self.search = search;
     }
 
-    /// The All Sessions list as of `now`.
-    pub(crate) fn view(&self, now: Timestamp) -> AllSessionsView {
+    pub(crate) fn set_filter(&mut self, filter: SessionFilter) {
+        self.filter = filter;
+    }
+
+    pub(crate) fn select(&mut self, id: Option<String>) {
+        self.selected = id;
+    }
+
+    fn save_if_read(&mut self, paths: &AppPaths) -> io::Result<bool> {
+        if self.read == 0 {
+            return Ok(false);
+        }
+        self.save(paths).map(|()| true)
+    }
+
+    fn save(&mut self, paths: &AppPaths) -> io::Result<()> {
+        self.read = 0;
+        let file = IndexFile {
+            transcripts: self.transcripts.values().cloned().collect(),
+        };
+        storage::write_versioned(&index_file(paths), &file)
+    }
+
+    /// Stats every Transcript: drops vanished ones, queues new or changed
+    /// ones.
+    fn restat_transcripts(&mut self) {
+        let found = transcript_files(&self.home);
+        self.transcripts.retain(|path, _| found.contains_key(path));
+        self.pending = found
+            .into_iter()
+            .filter(|(path, (size, mtime))| {
+                self.transcripts
+                    .get(path)
+                    .is_none_or(|t| t.size != *size || t.mtime_ns != *mtime)
+            })
+            .map(|(path, (size, mtime))| (path, size, mtime))
+            .collect();
+    }
+
+    /// Stats one Transcript path FSEvents named.
+    fn restat_transcript(&mut self, path: PathBuf) {
+        self.pending.retain(|(queued, ..)| *queued != path);
+        let Some((size, mtime)) = regular_file_stamp(&path) else {
+            self.transcripts.remove(&path);
+            return;
+        };
+        let known = self
+            .transcripts
+            .get(&path)
+            .is_some_and(|t| t.size == size && t.mtime_ns == mtime);
+        if !known {
+            self.pending.push((path, size, mtime));
+        }
+    }
+
+    /// Re-reads the Sidebar entries whose files changed, and the desktop's
+    /// account (it follows the Sidebar folder written last).
+    fn restat_entries(&mut self) {
+        let files = entry_files(&self.home);
+        refresh_cached(&mut self.entries, files, |path, inside| {
+            let [account, org, _] = inside else {
+                return None;
+            };
+            let entry = read_entry(path)?;
+            Some(SidebarEntry {
+                pair: DiscoveredPair {
+                    account_uuid: account.clone(),
+                    organization_uuid: org.clone(),
+                },
+                cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
+                title: entry.title.filter(|title| !title.trim().is_empty()),
+                user_title: entry.title_source.is_some_and(|source| source != "auto"),
+                archived: entry.is_archived == Some(true),
+                last_activity_at: entry.last_activity_at.unwrap_or(0),
+                cwd: entry.cwd,
+            })
+        });
+        self.desktop = desktop::desktop_account(&DesktopPaths::new(&self.home));
+    }
+
+    /// Re-reads the live-process files that changed, then which of their
+    /// processes still run.
+    fn restat_live(&mut self, env: &Environment, paths: &AppPaths) {
+        let files = live_files(&env.home, paths);
+        refresh_cached(&mut self.live, files, |path, _| {
+            serde_json::from_slice::<LiveFile>(&fs::read(path).ok()?).ok()
+        });
+        self.running = running(
+            env,
+            self.live.values().filter_map(|(_, live)| live.as_ref()),
+        );
+    }
+
+    /// The All Sessions window as of `now`, with `profiles` naming the
+    /// Sidebars (signed-in Profiles first, in the user's order).
+    pub(crate) fn view(&self, now: Timestamp, profiles: &[SidebarProfile]) -> AllSessionsView {
+        let sessions = self.sessions();
+        let profiles = self.sidebar_profiles(profiles);
+        let words: Vec<String> = self
+            .search
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        let rows: Vec<SessionRow> = sessions
+            .iter()
+            .filter(|session| self.filter_admits(session))
+            .filter(|session| {
+                words
+                    .iter()
+                    .all(|word| session.haystack.contains(word.as_str()))
+            })
+            .map(|session| session.row(now))
+            .collect();
+        let detail = self
+            .selected
+            .as_deref()
+            .filter(|id| rows.iter().any(|row| row.id == *id))
+            .and_then(|id| sessions.iter().find(|session| session.id == id))
+            .map(|session| self.detail(session, now, &profiles));
+        AllSessionsView {
+            rows,
+            search: self.search.clone(),
+            loading: self.building,
+            sidebar: sidebar(&sessions, &profiles),
+            filter: self.filter.clone(),
+            detail,
+        }
+    }
+
+    /// Every Session, newest first: one per Transcript id (the newest file
+    /// when an id is in two project folders), plus one per id that only
+    /// Sidebar entries still name.
+    fn sessions(&self) -> Vec<Session<'_>> {
         let mut by_id: HashMap<&str, &Transcript> = HashMap::new();
         for transcript in self.transcripts.values() {
             let newer = by_id
@@ -377,55 +594,170 @@ impl SessionIndex {
             }
         }
         let mut entries: HashMap<&str, Vec<&SidebarEntry>> = HashMap::new();
-        for entry in &self.entries {
+        for entry in self
+            .entries
+            .values()
+            .filter_map(|(_, entry)| entry.as_ref())
+        {
             entries
                 .entry(entry.cli_session_id.as_str())
                 .or_default()
                 .push(entry);
         }
-        let words: Vec<String> = self
-            .search
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect();
-        let mut rows: Vec<(i64, SessionRow)> = by_id
-            .into_values()
-            .filter_map(|transcript| {
-                let joined = entries
-                    .get(transcript.id.as_str())
-                    .map_or(&[][..], Vec::as_slice);
-                let title = self.title(transcript, joined);
-                let project = project(transcript);
-                let haystack = [
-                    title.as_str(),
-                    transcript.first_prompt.as_deref().unwrap_or(""),
-                    project,
-                    transcript.branch.as_deref().unwrap_or(""),
-                ]
-                .join("\n")
-                .to_lowercase();
-                if !words.iter().all(|word| haystack.contains(word.as_str())) {
-                    return None;
-                }
-                let last = transcript
-                    .last_activity_ms
-                    .unwrap_or((transcript.mtime_ns / 1_000_000) as i64);
-                Some((
-                    last,
-                    SessionRow {
-                        id: transcript.id.clone(),
-                        subtitle: format!("{project} · {}", age(now, last)),
-                        title,
-                        dot: self.running.get(&transcript.id).copied(),
-                    },
-                ))
+        let mut ids: Vec<&str> = by_id.keys().copied().collect();
+        ids.extend(entries.keys().filter(|id| !by_id.contains_key(*id)));
+        let mut sessions: Vec<Session> = ids
+            .into_iter()
+            .map(|id| {
+                let joined = entries.remove(id).unwrap_or_default();
+                self.session(id, by_id.get(id).copied(), joined)
             })
             .collect();
-        rows.sort_by(|(a_at, a), (b_at, b)| b_at.cmp(a_at).then_with(|| a.id.cmp(&b.id)));
-        AllSessionsView {
-            rows: rows.into_iter().map(|(_, row)| row).collect(),
-            search: self.search.clone(),
-            loading: self.building,
+        sessions.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.id.cmp(b.id)));
+        sessions
+    }
+
+    fn session<'a>(
+        &self,
+        id: &'a str,
+        transcript: Option<&'a Transcript>,
+        entries: Vec<&'a SidebarEntry>,
+    ) -> Session<'a> {
+        let title = self.title(transcript, &entries);
+        let newest_entry = entries.iter().max_by_key(|entry| entry.last_activity_at);
+        let cwd = match transcript {
+            Some(transcript) => transcript.cwd.as_deref(),
+            None => newest_entry.and_then(|entry| entry.cwd.as_deref()),
+        };
+        let last_ms = match transcript {
+            Some(t) => t
+                .last_activity_ms
+                .unwrap_or((t.mtime_ns / 1_000_000) as i64),
+            None => newest_entry.map_or(0, |entry| entry.last_activity_at),
+        };
+        let project = project(cwd);
+        let haystack = [
+            title.as_str(),
+            transcript
+                .and_then(|t| t.first_prompt.as_deref())
+                .unwrap_or(""),
+            project,
+            transcript.and_then(|t| t.branch.as_deref()).unwrap_or(""),
+        ]
+        .join("\n")
+        .to_lowercase();
+        Session {
+            id,
+            transcript,
+            archived: !entries.is_empty() && entries.iter().all(|entry| entry.archived),
+            entries,
+            title,
+            cwd,
+            last_ms,
+            haystack,
+            dot: transcript.and_then(|_| self.running.get(id).copied()),
+        }
+    }
+
+    fn filter_admits(&self, session: &Session) -> bool {
+        match &self.filter {
+            SessionFilter::All => !session.archived,
+            SessionFilter::Running => session.dot.is_some(),
+            SessionFilter::Project(folder) => session.cwd == Some(folder.as_str()),
+            SessionFilter::Sidebar(pair) => session.entries.iter().any(|e| e.pair == *pair),
+            SessionFilter::CliOnly => session.entries.is_empty(),
+        }
+    }
+
+    /// The Sidebars to list: `known` (each marked when not signed in), then
+    /// any other account/Organization folder holding an entry.
+    fn sidebar_profiles(&self, known: &[SidebarProfile]) -> Vec<(DiscoveredPair, String)> {
+        let mut listed: Vec<(DiscoveredPair, String)> = known
+            .iter()
+            .map(|profile| {
+                let name = if profile.signed_in {
+                    profile.name.clone()
+                } else {
+                    format!("{} {NOT_SIGNED_IN}", profile.name)
+                };
+                (profile.pair.clone(), name)
+            })
+            .collect();
+        for entry in self
+            .entries
+            .values()
+            .filter_map(|(_, entry)| entry.as_ref())
+        {
+            if !listed.iter().any(|(pair, _)| *pair == entry.pair) {
+                let account = &entry.pair.account_uuid;
+                let short = account.get(..8).unwrap_or(account);
+                let name = format!("Unknown Login (account {short}) {NOT_SIGNED_IN}");
+                listed.push((entry.pair.clone(), name));
+            }
+        }
+        listed
+    }
+
+    fn detail(
+        &self,
+        session: &Session,
+        now: Timestamp,
+        profiles: &[(DiscoveredPair, String)],
+    ) -> SessionDetail {
+        let transcript = session.transcript;
+        let client = transcript
+            .and_then(|t| t.entrypoint.as_deref())
+            .map(|e| match e {
+                DESKTOP_ENTRYPOINT => "Claude desktop",
+                "cli" => "the CLI",
+                other => other,
+            });
+        let age = age(now, session.last_ms);
+        let last_used = match client {
+            Some(client) => format!("Last used in {client}, {age}"),
+            None => format!("Last active {age}"),
+        };
+        let sidebars = profiles
+            .iter()
+            .map(|(pair, name)| {
+                let entry = session.entries.iter().find(|entry| entry.pair == *pair);
+                SidebarPresence {
+                    profile: name.clone(),
+                    has_entry: entry.is_some(),
+                    archived: entry.is_some_and(|entry| entry.archived),
+                    desktop_now: self.desktop.as_ref().is_some_and(|desktop| {
+                        desktop.account_uuid == pair.account_uuid
+                            && desktop.organization_uuid.as_deref()
+                                == Some(pair.organization_uuid.as_str())
+                    }),
+                }
+            })
+            .collect();
+        SessionDetail {
+            id: session.id.to_owned(),
+            title: session.title.clone(),
+            folder: session.cwd.map(|cwd| self.tilde(cwd)),
+            branch: transcript.and_then(|t| t.branch.clone()),
+            last_used,
+            turns: transcript.map(|t| t.turns),
+            first_prompt: transcript.and_then(|t| t.first_prompt.clone()),
+            dot: session.dot,
+            sidebars,
+            deleted: transcript.is_none().then(|| {
+                "The Transcript was deleted (Claude Code removes old ones after \
+                 cleanupPeriodDays). Its Sidebar entry is still listed, but there is \
+                 nothing to open or resume."
+                    .to_owned()
+            }),
+        }
+    }
+
+    /// `cwd` with the home folder as `~`.
+    fn tilde(&self, cwd: &str) -> String {
+        match Path::new(cwd).strip_prefix(&self.home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => cwd.to_owned(),
         }
     }
 
@@ -433,7 +765,7 @@ impl SessionIndex {
     /// (the desktop's Active Profile's entry first, then the newest), then
     /// the Transcript's `custom-title`, then entries' automatic titles (same
     /// order), the Transcript's `ai-title`, and the first prompt in quotes.
-    fn title(&self, transcript: &Transcript, entries: &[&SidebarEntry]) -> String {
+    fn title(&self, transcript: Option<&Transcript>, entries: &[&SidebarEntry]) -> String {
         let best = |user: bool| {
             entries
                 .iter()
@@ -443,19 +775,135 @@ impl SessionIndex {
                 .map(|(_, title)| title.to_owned())
         };
         best(true)
-            .or_else(|| transcript.custom_title.clone())
+            .or_else(|| transcript.and_then(|t| t.custom_title.clone()))
             .or_else(|| best(false))
-            .or_else(|| transcript.ai_title.clone())
-            .or_else(|| transcript.first_prompt.as_deref().map(quoted))
+            .or_else(|| transcript.and_then(|t| t.ai_title.clone()))
+            .or_else(|| {
+                transcript
+                    .and_then(|t| t.first_prompt.as_deref())
+                    .map(quoted)
+            })
             .unwrap_or_else(|| "Untitled Session".into())
     }
 
     fn is_desktop(&self, entry: &SidebarEntry) -> bool {
         self.desktop.as_ref().is_some_and(|desktop| {
-            desktop.account_uuid == entry.account
-                && desktop.organization_uuid.as_deref() == Some(entry.org.as_str())
+            desktop.account_uuid == entry.pair.account_uuid
+                && desktop.organization_uuid.as_deref()
+                    == Some(entry.pair.organization_uuid.as_str())
         })
     }
+}
+
+/// Marks a Sidebar whose account and Organization isn't a signed-in Profile.
+const NOT_SIGNED_IN: &str = "(not signed in)";
+
+/// One Session as the window lists it.
+struct Session<'a> {
+    /// The Transcript id.
+    id: &'a str,
+    /// `None` once the Transcript is deleted.
+    transcript: Option<&'a Transcript>,
+    entries: Vec<&'a SidebarEntry>,
+    /// Archived in every Profile that has an entry (never without entries).
+    archived: bool,
+    title: String,
+    cwd: Option<&'a str>,
+    last_ms: i64,
+    /// Lowercased title, first prompt, project and branch, for search.
+    haystack: String,
+    dot: Option<RunningDot>,
+}
+
+impl Session<'_> {
+    fn row(&self, now: Timestamp) -> SessionRow {
+        let mut subtitle = format!("{} · {}", project(self.cwd), age(now, self.last_ms));
+        if self.transcript.is_none() {
+            subtitle.push_str(" · transcript deleted");
+        }
+        if self.archived {
+            subtitle.push_str(" · archived");
+        }
+        SessionRow {
+            id: self.id.to_owned(),
+            title: self.title.clone(),
+            subtitle,
+            dot: self.dot,
+            deleted: self.transcript.is_none(),
+        }
+    }
+}
+
+/// The sidebar: All Sessions and Running; each working folder; each
+/// Profile's Sidebar, then CLI only.
+fn sidebar(sessions: &[Session], profiles: &[(DiscoveredPair, String)]) -> Vec<SidebarGroup> {
+    let item = |title: &str, filter| SidebarItem {
+        title: title.to_owned(),
+        filter,
+    };
+    let mut folders: Vec<&str> = sessions.iter().filter_map(|session| session.cwd).collect();
+    folders.sort_by_key(|cwd| (project(Some(cwd)).to_lowercase(), *cwd));
+    folders.dedup();
+    let mut groups = vec![SidebarGroup {
+        title: None,
+        items: vec![
+            item("All Sessions", SessionFilter::All),
+            item("Running", SessionFilter::Running),
+        ],
+    }];
+    if !folders.is_empty() {
+        groups.push(SidebarGroup {
+            title: Some("Projects".into()),
+            items: folders
+                .into_iter()
+                .map(|cwd| item(project(Some(cwd)), SessionFilter::Project(cwd.to_owned())))
+                .collect(),
+        });
+    }
+    let mut sidebars: Vec<SidebarItem> = profiles
+        .iter()
+        .map(|(pair, name)| item(name, SessionFilter::Sidebar(pair.clone())))
+        .collect();
+    sidebars.push(item("CLI only (no Sidebar entry)", SessionFilter::CliOnly));
+    groups.push(SidebarGroup {
+        title: Some("Sidebars".into()),
+        items: sidebars,
+    });
+    groups
+}
+
+/// Brings `cache` up to date with `files` (path, stamp, path components
+/// below the source's root): drops vanished files and re-reads only new or
+/// changed ones with `read`.
+fn refresh_cached<T>(
+    cache: &mut Cached<T>,
+    files: Vec<(PathBuf, Stamp, Vec<String>)>,
+    read: impl Fn(&Path, &[String]) -> Option<T>,
+) {
+    let mut fresh = BTreeMap::new();
+    for (path, stamp, inside) in files {
+        let value = match cache.remove(&path) {
+            Some((known, value)) if known == stamp => value,
+            _ => read(&path, &inside),
+        };
+        fresh.insert(path, (stamp, value));
+    }
+    *cache = fresh;
+}
+
+/// The folders FSEvents watches while the window is open: `projects/`,
+/// every `sessions/` and `claude-code-sessions/`, those that exist.
+fn watched_folders(home: &Path, paths: &AppPaths) -> Vec<PathBuf> {
+    let mut folders = vec![projects_root(home), home.join(".claude").join("sessions")];
+    folders.extend(
+        real_children(&paths.profiles())
+            .into_iter()
+            .filter(|(_, kind)| kind.is_dir())
+            .map(|(profile, _)| profile.join("sessions")),
+    );
+    folders.push(sidebar_root(home));
+    folders.retain(|folder| folder.is_dir());
+    folders
 }
 
 fn index_file(paths: &AppPaths) -> PathBuf {
@@ -472,11 +920,8 @@ fn quoted(prompt: &str) -> String {
 }
 
 /// The project: the last folder of the Session's working directory.
-fn project(transcript: &Transcript) -> &str {
-    transcript
-        .cwd
-        .as_deref()
-        .and_then(|cwd| Path::new(cwd).file_name())
+fn project(cwd: Option<&str>) -> &str {
+    cwd.and_then(|cwd| Path::new(cwd).file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("unknown folder")
 }
@@ -495,28 +940,44 @@ fn age(now: Timestamp, at_ms: i64) -> String {
     }
 }
 
+fn projects_root(home: &Path) -> PathBuf {
+    home.join(".claude").join("projects")
+}
+
+fn is_jsonl(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+}
+
+/// The size and mtime of a regular file that isn't a link.
+fn regular_file_stamp(path: &Path) -> Option<Stamp> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos() as u64);
+    Some((meta.len(), mtime))
+}
+
 /// Every top-level `~/.claude/projects/<project>/<id>.jsonl`, with its size
 /// and mtime. Links (folders or files) aren't followed, and subagent
 /// Transcripts, one folder deeper, aren't reached.
-fn transcript_files(home: &Path) -> BTreeMap<PathBuf, (u64, u64)> {
+fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
     let mut found = BTreeMap::new();
-    for project in real_children(&home.join(".claude").join("projects")) {
-        if !project.1.is_dir() {
+    for (project, kind) in real_children(&projects_root(home)) {
+        if !kind.is_dir() {
             continue;
         }
-        for (path, kind) in real_children(&project.0) {
-            if !kind.is_file() || path.extension().is_none_or(|ext| ext != "jsonl") {
+        for (path, kind) in real_children(&project) {
+            if !kind.is_file() || !is_jsonl(&path) {
                 continue;
             }
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |since| since.as_nanos() as u64);
-            found.insert(path, (meta.len(), mtime));
+            if let Some(stamp) = regular_file_stamp(&path) {
+                found.insert(path, stamp);
+            }
         }
     }
     found
@@ -538,8 +999,9 @@ fn sidebar_root(home: &Path) -> PathBuf {
     home.join("Library/Application Support/Claude/claude-code-sessions")
 }
 
-/// Every readable Sidebar entry in every account/Organization folder.
-fn sidebar_entries(home: &Path) -> Vec<SidebarEntry> {
+/// Every `claude-code-sessions/<account>/<org>/local_*.json`, with its stamp
+/// and `[account, org, file name]`.
+fn entry_files(home: &Path) -> Vec<(PathBuf, Stamp, Vec<String>)> {
     let mut found = Vec::new();
     for (account_dir, kind) in real_children(&sidebar_root(home)) {
         if !kind.is_dir() {
@@ -549,26 +1011,18 @@ fn sidebar_entries(home: &Path) -> Vec<SidebarEntry> {
             if !kind.is_dir() {
                 continue;
             }
-            for (path, kind) in real_children(&org_dir) {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !kind.is_file() || !name.starts_with("local_") || !name.ends_with(".json") {
+            for (path, _) in real_children(&org_dir) {
+                let name = file_name(&path);
+                if !name.starts_with("local_") || !name.ends_with(".json") {
                     continue;
                 }
-                let Some(entry) = read_entry(&path) else {
-                    continue;
-                };
-                found.push(SidebarEntry {
-                    account: file_name(&account_dir),
-                    org: file_name(&org_dir),
-                    cli_session_id: entry.cli_session_id.clone().unwrap_or_default(),
-                    title: entry.title.filter(|title| !title.trim().is_empty()),
-                    user_title: entry.title_source.is_some_and(|source| source != "auto"),
-                    last_activity_at: entry.last_activity_at.unwrap_or(0),
-                });
+                if let Some(stamp) = regular_file_stamp(&path) {
+                    let inside = vec![file_name(&account_dir), file_name(&org_dir), name];
+                    found.push((path, stamp, inside));
+                }
             }
         }
     }
-    found.retain(|entry| !entry.cli_session_id.is_empty());
     found
 }
 
@@ -589,35 +1043,41 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Running dots by Transcript id, from the live-process files of live
-/// processes in `~/.claude/sessions/` and every Profile's `sessions/`. A
-/// file whose pid is dead, or whose pid now belongs to a process started at
-/// another time, is stale and ignored.
-fn running(env: &Environment, paths: &AppPaths) -> HashMap<String, RunningDot> {
-    let mut folders = vec![env.home.join(".claude").join("sessions")];
+/// Every `<digits>.json` in `~/.claude/sessions/` and every Profile's
+/// `sessions/` (never the `.key` files beside them).
+fn live_files(home: &Path, paths: &AppPaths) -> Vec<(PathBuf, Stamp, Vec<String>)> {
+    let mut folders = vec![home.join(".claude").join("sessions")];
     folders.extend(
         real_children(&paths.profiles())
             .into_iter()
             .filter(|(_, kind)| kind.is_dir())
             .map(|(profile, _)| profile.join("sessions")),
     );
+    folders
+        .iter()
+        .flat_map(|folder| real_children(folder))
+        .filter_map(|(path, _)| {
+            let name = file_name(&path);
+            let is_pid_file = name
+                .strip_suffix(".json")
+                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()));
+            let stamp = regular_file_stamp(&path).filter(|_| is_pid_file)?;
+            Some((path, stamp, Vec::new()))
+        })
+        .collect()
+}
+
+/// Running dots by Transcript id, from live-process files. A file whose pid
+/// is dead, or whose pid now belongs to a process started at another time,
+/// is stale and ignored.
+fn running<'a>(
+    env: &Environment,
+    lives: impl Iterator<Item = &'a LiveFile>,
+) -> HashMap<String, RunningDot> {
     let time_zone = env.clock.time_zone();
     let mut dots = HashMap::new();
-    for (path, kind) in folders.iter().flat_map(|folder| real_children(folder)) {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let is_pid_file = name
-            .strip_suffix(".json")
-            .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()));
-        if !kind.is_file() || !is_pid_file {
-            continue;
-        }
-        let Some(live) = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<LiveFile>(&bytes).ok())
-        else {
-            continue;
-        };
-        let Some(session_id) = live.session_id else {
+    for live in lives {
+        let Some(session_id) = live.session_id.clone() else {
             continue;
         };
         let alive = env.os.process(live.pid).is_some_and(|facts| {

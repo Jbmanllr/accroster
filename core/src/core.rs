@@ -23,7 +23,7 @@ use crate::monitor::{LimitMonitor, Watched};
 use crate::profiles::{self, ProfileRegistry, SignInTarget};
 use crate::runner::Runner;
 use crate::safety::{self, CheckId, Finding, Safety};
-use crate::sessions::SessionIndex;
+use crate::sessions::{SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings};
 use crate::storage::{self, AppPaths};
 
@@ -216,7 +216,7 @@ impl Core {
     /// while a usage read runs, by the time the next read is due, and at most
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
-        if self.sessions.building() {
+        if self.sessions.busy() {
             // The next batch of the Session index, as soon as input allows.
             return Duration::ZERO;
         }
@@ -417,12 +417,33 @@ impl Core {
                 Vec::new()
             }
             Command::OpenAllSessions => {
-                self.sessions.open(&self.env, &self.paths);
-                vec![Effect::ShowAllSessions]
+                let watch = self.sessions.open(&self.env, &self.paths);
+                let mut effects = vec![Effect::ShowAllSessions];
+                effects.extend(watch.map(Effect::WatchSessionFiles));
+                effects
             }
             Command::SearchSessions(text) => {
                 self.sessions.set_search(text);
                 Vec::new()
+            }
+            Command::FilterSessions(filter) => {
+                self.sessions.set_filter(filter);
+                Vec::new()
+            }
+            Command::SelectSession(id) => {
+                self.sessions.select(id);
+                Vec::new()
+            }
+            Command::CloseAllSessions => {
+                if let Err(error) = self.sessions.close(&self.paths) {
+                    let error = error.to_string();
+                    self.log(
+                        Level::Warn,
+                        "session index not saved",
+                        &[("error", Field::Text(&error))],
+                    );
+                }
+                vec![Effect::StopWatchingSessionFiles]
             }
         }
     }
@@ -463,6 +484,21 @@ impl Core {
                 }
                 let watched = self.watched();
                 self.monitor.menu_opened(self.env.clock.now(), &watched);
+                // While the window is closed nothing is watched: a stat-only
+                // rescan keeps the index current.
+                if !self.sessions.window_open() {
+                    self.sessions.rescan(&self.env, &self.paths);
+                }
+                Vec::new()
+            }
+            Event::SessionFilesChanged(changed) => {
+                // A late batch after the window closed is left to the next
+                // rescan.
+                if self.sessions.window_open() {
+                    self.sessions
+                        .files_changed(&self.env, &self.paths, &changed);
+                    self.index_sessions();
+                }
                 Vec::new()
             }
             Event::WillSleep | Event::DidWake => {
@@ -676,7 +712,9 @@ impl Core {
                 tagline: TAGLINE.into(),
                 disclaimer: DISCLAIMER.into(),
             },
-            all_sessions: self.sessions.view(self.env.clock.now()),
+            all_sessions: self
+                .sessions
+                .view(self.env.clock.now(), &self.sidebar_profiles()),
             // Offered once: only until answered, and only while it's ours to
             // offer (not already on, not turned off in System Settings).
             first_run: (self.settings.launch_at_login.is_none()
@@ -977,7 +1015,12 @@ impl Core {
         match self.sessions.step(&self.paths) {
             None => {}
             Some(Ok(built)) => self.log(
-                Level::Info,
+                // Menu opens rescan often; only a build that read is news.
+                if built.read > 0 {
+                    Level::Info
+                } else {
+                    Level::Debug
+                },
                 "session index built",
                 &[
                     ("transcripts", Field::Number(built.transcripts as i64)),
@@ -993,6 +1036,39 @@ impl Core {
                 );
             }
         }
+    }
+
+    /// The Sidebars All Sessions names: signed-in Profiles in the user's
+    /// order (by nickname when set), then Discovered Profiles.
+    fn sidebar_profiles(&self) -> Vec<SidebarProfile> {
+        let signed_in = self.profiles.signed_in();
+        let mut sidebars: Vec<SidebarProfile> = self
+            .profiles
+            .ordered_ids(&self.settings.profile_order)
+            .into_iter()
+            .filter_map(|id| {
+                let profile = signed_in.iter().find(|profile| profile.id == id)?;
+                Some(SidebarProfile {
+                    pair: DiscoveredPair {
+                        account_uuid: profile.account_uuid.clone(),
+                        organization_uuid: profile.organization_uuid.clone(),
+                    },
+                    name: (self.settings.nicknames.get(&id).cloned())
+                        .unwrap_or_else(|| profile.name.clone()),
+                    signed_in: true,
+                })
+            })
+            .collect();
+        for (evidence, choice) in self.shown_discovered() {
+            if !sidebars.iter().any(|sidebar| sidebar.pair == evidence.pair) {
+                sidebars.push(SidebarProfile {
+                    pair: evidence.pair.clone(),
+                    name: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                    signed_in: false,
+                });
+            }
+        }
+        sidebars
     }
 
     /// Re-reads the Mac's evidence of Discovered Profiles. New pairs simply
