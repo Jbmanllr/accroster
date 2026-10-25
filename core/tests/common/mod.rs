@@ -96,16 +96,70 @@ fn busy(core: &Core) -> bool {
         || core.tick_interval() < Duration::from_secs(1)
 }
 
-/// Ticks until nothing the core started is still running.
-pub fn settle(core: &mut Core) {
-    core.event(Event::Tick);
-    wait_for_sign_in(core);
+/// Ticks until nothing the core started is still running, returning the
+/// effects those ticks asked for.
+pub fn settle(core: &mut Core) -> Vec<Effect> {
+    let mut effects = core.event(Event::Tick);
+    effects.extend(wait_for_sign_in(core));
+    effects
+}
+
+/// Runs `act` on another thread and fails unless it returns within a few
+/// seconds: the core never waits on a Claude Code run that doesn't end.
+pub fn promptly<T: Send + 'static>(act: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(act());
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the core waited on a Claude Code run that never ends")
+}
+
+/// Sends `command` and fails unless the core answers within a few seconds.
+pub fn command_promptly(core: Core, command: accroster_core::Command) -> (Core, Vec<Effect>) {
+    promptly(move || {
+        let mut core = core;
+        let effects = core.command(command);
+        (core, effects)
+    })
+}
+
+/// Sends `event` and fails unless the core answers within a few seconds.
+pub fn event_promptly(core: Core, event: Event) -> (Core, Vec<Effect>) {
+    promptly(move || {
+        let mut core = core;
+        let effects = core.event(event);
+        (core, effects)
+    })
+}
+
+/// Waits until the stub has received `count` calls of `kind` (the last of
+/// them may still be running), failing after a few seconds.
+pub fn wait_for_calls(mac: &FakeMac, kind: StubCall, count: usize) -> Vec<RecordedCall> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let calls: Vec<RecordedCall> = mac
+            .claude
+            .calls()
+            .into_iter()
+            .filter(|call| call.kind == kind)
+            .collect();
+        if calls.len() >= count {
+            return calls;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{kind:?} never ran {count} times"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Moves the fake clock on by `by`, then lets the core act on it.
-pub fn pass(mac: &FakeMac, core: &mut Core, by: jiff::SignedDuration) {
+pub fn pass(mac: &FakeMac, core: &mut Core, by: jiff::SignedDuration) -> Vec<Effect> {
     mac.clock.advance(by);
-    settle(core);
+    settle(core)
 }
 
 /// How many usage reads (`get_usage` requests) Claude Code has received.

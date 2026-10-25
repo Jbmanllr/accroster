@@ -37,42 +37,29 @@ fn mac_with_two_profiles(then: Vec<Reply>) -> FakeMac {
     mac
 }
 
-/// Sends a few ticks without waiting for reads to finish.
-fn tick_a_few_times(core: &mut accroster_core::Core) {
-    for _ in 0..5 {
-        core.event(Event::Tick);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
 #[test]
 fn reads_never_run_two_at_once() {
     let mac = mac_with_two_profiles(vec![Reply::hanging(), usage_reply(limits_body())]);
 
-    // After a relaunch both Profiles are due at once.
+    // After a relaunch both Profiles are due at once, at 14:02.
     let mut core = mac.launch();
     core.event(Event::Tick);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while usage_reads(&mac) < 3 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the read never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    tick_a_few_times(&mut core);
-    let reads: Vec<_> = mac
-        .claude
-        .calls()
-        .into_iter()
-        .filter(|call| call.kind == StubCall::GetUsage)
-        .collect();
-    assert_eq!(reads.len(), 3, "the second Profile waits for the first");
+    let reads = wait_for_calls(&mac, StubCall::GetUsage, 3);
     assert!(reads[2].still_running());
+    for _ in 0..5 {
+        core.event(Event::Tick);
+    }
 
     // A read that never answers is given up on after a while.
     pass(&mac, &mut core, SignedDuration::from_mins(2));
     assert!(!reads[2].still_running());
+    // The fake clock stood at 14:02 while the first read hung: a second
+    // read started then would be as of 14:02.
+    assert!(
+        details(&rows(&core)[1]).contains(&"Limits as of 14:04".to_owned()),
+        "the second Profile waited for the first: {:?}",
+        details(&rows(&core)[1])
+    );
     assert!(
         mac.claude
             .calls()
@@ -739,7 +726,7 @@ fn an_expired_profile_is_no_longer_read_and_keeps_its_last_reading_dimmed() {
 }
 
 #[test]
-fn removing_a_profile_forgets_its_backoff() {
+fn a_removed_profiles_backoff_doesnt_hold_back_the_login_added_again() {
     let mac = mac_signing_in_as(&work(), body(62, 41));
     mac.claude
         .reply(StubCall::GetUsage, failed_fetch())
@@ -747,12 +734,9 @@ fn removing_a_profile_forgets_its_backoff() {
     let mut core = mac.launch();
     add_profile(&mut core);
     at(&mac, &mut core, "14:17");
-    let backoff = format!("{APP_FOLDER}/state/backoff.json");
-    let id = mac.list(PROFILES).remove(0);
-    assert!(
-        mac.read_json(&backoff).unwrap()["profiles"]
-            .get(&id)
-            .is_some()
+    assert_eq!(
+        rows(&core)[0].note.as_deref(),
+        Some("Couldn't refresh · next try 14:22")
     );
 
     let confirm = click_in_row(&mut core, 0, "Remove…")
@@ -763,12 +747,21 @@ fn removing_a_profile_forgets_its_backoff() {
         })
         .expect("a removal confirmation");
     core.command(confirm);
-
+    settle(&mut core);
     assert!(rows(&core).is_empty());
-    assert_eq!(
-        mac.read_json(&backoff).unwrap()["profiles"],
-        serde_json::json!({})
-    );
+
+    // The same Login, added again before 14:22, is read at once.
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&work()))
+        .reply(StubCall::GetUsage, usage_reply(body(70, 43)));
+    let reads = usage_reads(&mac);
+    add_profile(&mut core);
+    assert_eq!(usage_reads(&mac), reads + 1);
+    let row = rows(&core).remove(0);
+    assert_eq!(row.note, None, "no next try");
+    assert_eq!(row.limits, [bar("Session", 70), bar("Weekly", 43)]);
+    drop(core);
+    assert_eq!(rows(&mac.launch())[0].note, None, "nor after a relaunch");
 }
 
 #[test]

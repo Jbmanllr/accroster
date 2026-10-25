@@ -22,15 +22,23 @@ fn run(
             .iter()
             .map(|(n, v)| (OsString::from(n), OsString::from(v))),
     );
-    env.spawner
-        .run(&SpawnRequest {
+    let mut process = env
+        .spawner
+        .start(&SpawnRequest {
             program: "claude".into(),
             args: args.iter().map(OsString::from).collect(),
             env: vars,
             cwd: None,
             stdin: stdin.map(|text| text.as_bytes().to_vec()),
         })
-        .expect("the stub runs")
+        .expect("the stub runs");
+    process.close_stdin();
+    loop {
+        if let Some(output) = process.try_wait().expect("the stub can be waited for") {
+            return output;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]

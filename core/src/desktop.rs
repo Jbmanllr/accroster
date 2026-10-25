@@ -28,7 +28,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 use crate::env::Environment;
-use crate::interface::{ClaudeVersions, Command, Effect, MenuItem};
+use crate::interface::{ClaudeVersions, Command, Effect, MenuItem, ProfileKey};
 use crate::logging::{Field, Level};
 use crate::profiles::{Context, SignedInProfile};
 
@@ -84,6 +84,20 @@ pub(crate) struct DesktopAccount {
 }
 
 impl DesktopAccount {
+    /// The Profile the desktop uses, when its Organization is known.
+    pub(crate) fn key(&self) -> Option<ProfileKey> {
+        Some(ProfileKey {
+            account_uuid: self.account_uuid.clone(),
+            organization_uuid: self.organization_uuid.clone()?,
+        })
+    }
+
+    /// Whether the desktop uses Profile `key`.
+    pub(crate) fn is(&self, key: &ProfileKey) -> bool {
+        self.account_uuid == key.account_uuid
+            && self.organization_uuid.as_deref() == Some(key.organization_uuid.as_str())
+    }
+
     /// The signed-in Profile this is, if any. With no folder written yet, an
     /// account that only one Profile has is enough.
     pub(crate) fn profile<'a>(
@@ -93,10 +107,10 @@ impl DesktopAccount {
         let same_account = || {
             profiles
                 .iter()
-                .filter(|profile| profile.account_uuid == self.account_uuid)
+                .filter(|profile| profile.key.account_uuid == self.account_uuid)
         };
         match &self.organization_uuid {
-            Some(org) => same_account().find(|profile| &profile.organization_uuid == org),
+            Some(org) => same_account().find(|profile| &profile.key.organization_uuid == org),
             None => {
                 let mut matches = same_account();
                 let only = matches.next()?;
@@ -114,12 +128,19 @@ struct DesktopConfig {
     last_known_account_uuid: Option<String>,
 }
 
+/// `lastKnownAccountUuid` in the desktop's `config.json`: the one reader of
+/// it. `None` when the file is missing or unreadable, or the value isn't a
+/// uuid.
+pub(crate) fn last_known_account(paths: &DesktopPaths) -> Option<String> {
+    let bytes = fs::read(paths.config()).ok()?;
+    let config: DesktopConfig = serde_json::from_slice(&bytes).ok()?;
+    config.last_known_account_uuid.filter(|id| is_uuid(id))
+}
+
 /// The desktop's account, or `None` when its `config.json` is missing,
 /// unreadable or names no account.
 pub(crate) fn desktop_account(paths: &DesktopPaths) -> Option<DesktopAccount> {
-    let bytes = fs::read(paths.config()).ok()?;
-    let config: DesktopConfig = serde_json::from_slice(&bytes).ok()?;
-    let account_uuid = config.last_known_account_uuid.filter(|id| is_uuid(id))?;
+    let account_uuid = last_known_account(paths)?;
     let organization_uuid = newest_org_folder(&paths.sidebar_root().join(&account_uuid));
     Some(DesktopAccount {
         account_uuid,
@@ -376,8 +397,7 @@ fn is_sidebar_id(id: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
     pub profile_id: String,
-    pub account_uuid: String,
-    pub organization_uuid: String,
+    pub key: ProfileKey,
     /// `email · Organization`.
     pub name: String,
     /// The Sidebar entry (`local_…`) to open once the switch is confirmed.
@@ -388,8 +408,7 @@ impl Target {
     pub(crate) fn of(profile: &SignedInProfile) -> Target {
         Target {
             profile_id: profile.id.clone(),
-            account_uuid: profile.account_uuid.clone(),
-            organization_uuid: profile.organization_uuid.clone(),
+            key: profile.key.clone(),
             name: profile.name.clone(),
             then_open: None,
         }
@@ -397,7 +416,7 @@ impl Target {
 }
 
 /// An `<account>/<org>` Sidebar folder.
-type Folder = (String, String);
+type Folder = ProfileKey;
 
 /// Every Sidebar entry's modification time, by folder.
 type Snapshot = BTreeMap<Folder, BTreeMap<String, SystemTime>>;
@@ -421,7 +440,10 @@ fn snapshot(paths: &DesktopPaths) -> Snapshot {
                 continue;
             };
             folders.insert(
-                (account_uuid.clone(), org_uuid),
+                ProfileKey {
+                    account_uuid: account_uuid.clone(),
+                    organization_uuid: org_uuid,
+                },
                 sidebar_entries(&org.path()).into_iter().collect(),
             );
         }
@@ -636,7 +658,10 @@ impl DesktopBridge {
         let previous = desktop_account(&paths).and_then(|account| {
             account
                 .organization_uuid
-                .map(|org| (account.account_uuid, org))
+                .map(|organization_uuid| ProfileKey {
+                    account_uuid: account.account_uuid,
+                    organization_uuid,
+                })
         });
         let log_offset = fs::metadata(paths.main_log()).map_or(0, |meta| meta.len());
         log(
@@ -685,9 +710,9 @@ impl DesktopBridge {
                 log(ctx, Level::Warn, "desktop switch mismatch", &profile);
                 let actual = account
                     .profile(profiles)
-                    .map_or("another account", |profile| &profile.name);
+                    .map_or("another Profile", |profile| &profile.name);
                 (
-                    "Claude signed in to another account",
+                    "Claude signed in to another Profile",
                     format!("Claude signed in as {actual}, not {}", target.name),
                 )
             }
@@ -741,10 +766,6 @@ fn confirmation(
     before: &Snapshot,
     log_offset: u64,
 ) -> Option<Outcome> {
-    let target_folder = (
-        target.account_uuid.clone(),
-        target.organization_uuid.clone(),
-    );
     let now = snapshot(paths);
     let mut written: Vec<(SystemTime, &Folder)> = now
         .iter()
@@ -760,28 +781,29 @@ fn confirmation(
         })
         .collect();
     written.sort();
-    if written.iter().any(|(_, folder)| **folder == target_folder) {
+    if written.iter().any(|(_, folder)| **folder == target.key) {
         return Some(Outcome::Confirmed);
     }
-    if let Some((_, (account, org))) = written.last() {
+    if let Some((_, folder)) = written.last() {
         return Some(Outcome::Other(DesktopAccount {
-            account_uuid: account.clone(),
-            organization_uuid: Some(org.clone()),
+            account_uuid: folder.account_uuid.clone(),
+            organization_uuid: Some(folder.organization_uuid.clone()),
         }));
     }
     if !log_signed_in_since(&paths.main_log(), log_offset) {
         return None;
     }
     let account = desktop_account(paths)?;
-    if account.account_uuid != target.account_uuid {
+    if account.account_uuid != target.key.account_uuid {
         return Some(Outcome::Other(DesktopAccount {
             organization_uuid: None,
             ..account
         }));
     }
-    let other_org = now
-        .keys()
-        .any(|(acc, org)| *acc == target.account_uuid && *org != target.organization_uuid);
+    let other_org = now.keys().any(|folder| {
+        folder.account_uuid == target.key.account_uuid
+            && folder.organization_uuid != target.key.organization_uuid
+    });
     (!other_org).then_some(Outcome::Confirmed)
 }
 

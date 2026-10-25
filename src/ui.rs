@@ -13,8 +13,8 @@ use accroster_core::watcher::{self, FolderWatch};
 use crate::notifications;
 use accroster_core::{
     AllSessionsView, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect, Event,
-    LimitBar, MenuItem, ProfileRow, RunningDot, SessionDetail, SessionFilter, SessionRow,
-    SettingsView, SidebarGroup, SidebarSyncMode, View,
+    LimitBar, MenuItem, ProfileRow, ProfileSettings, RunningDot, SafetyFeature, SessionDetail,
+    SessionFilter, SessionRow, SettingsView, SidebarGroup, SidebarSyncMode, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -44,6 +44,13 @@ use objc2_foundation::{
 
 /// Width of a Profile row in the menu.
 const ROW_WIDTH: f64 = 300.0;
+
+/// The Settings window without its Profiles section, which sits on top and
+/// grows the window by its own height.
+const SETTINGS_WIDTH: f64 = 420.0;
+const SETTINGS_HEIGHT: f64 = 552.0;
+/// One line of Settings > Profiles.
+const PROFILE_LINE: f64 = 26.0;
 
 thread_local! {
     /// The one [`Ui`], reachable from main-queue blocks.
@@ -98,6 +105,9 @@ pub struct Ivars {
     shown_menu: RefCell<Vec<MenuItem>>,
     /// Settings > Hidden (n)…: each entry's title and Restore command, by tag.
     hidden: RefCell<Vec<(String, Command)>>,
+    /// Settings > Profiles as last drawn, and its buttons' commands by tag.
+    profile_settings: RefCell<Option<Vec<ProfileSettings>>>,
+    profile_commands: RefCell<Vec<Command>>,
     all_sessions: OnceCell<AllSessionsWindow>,
     /// The rows the All Sessions table shows (its data source).
     session_rows: RefCell<Vec<SessionRow>>,
@@ -149,6 +159,9 @@ struct SettingsWindow {
     verbose_logging: Retained<NSButton>,
     verbose_logging_note: Retained<NSTextField>,
     hidden: Retained<NSButton>,
+    /// Settings > Profiles, above everything else; rebuilt when the
+    /// Profiles change.
+    profiles: Retained<NSView>,
     thresholds: Retained<NSTextField>,
     reset_notification: Retained<NSButton>,
     retry_uninstall: Retained<NSButton>,
@@ -385,6 +398,17 @@ define_class!(
             menu.popUpMenuPositioningItem_atLocation_inView(None, origin, Some(sender));
         }
 
+        /// A Settings > Profiles button (↑, ↓, Rename…, Mute).
+        #[unsafe(method(profileSettingClicked:))]
+        fn profile_setting_clicked(&self, sender: &NSButton) {
+            let command = usize::try_from(sender.tag())
+                .ok()
+                .and_then(|tag| self.ivars().profile_commands.borrow().get(tag).cloned());
+            if let Some(command) = command {
+                self.send(command);
+            }
+        }
+
         #[unsafe(method(restoreHiddenClicked:))]
         fn restore_hidden_clicked(&self, sender: &NSMenuItem) {
             let command = usize::try_from(sender.tag())
@@ -463,6 +487,8 @@ impl Ui {
             pending_menu: RefCell::new(None),
             shown_menu: RefCell::new(Vec::new()),
             hidden: RefCell::new(Vec::new()),
+            profile_settings: RefCell::new(None),
+            profile_commands: RefCell::new(Vec::new()),
             all_sessions: OnceCell::new(),
             session_rows: RefCell::new(Vec::new()),
             session_detail: RefCell::new(None),
@@ -556,6 +582,7 @@ impl Ui {
             .collect();
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
+            self.render_profile_settings(settings, &view.settings.profiles);
         }
         if let Some(diagnostics) = self.ivars().diagnostics.get() {
             self.render_diagnostics(diagnostics, &view.diagnostics);
@@ -784,6 +811,7 @@ impl Ui {
                     .settings
                     .get_or_init(|| self.make_settings_window());
                 render_settings(settings, &view.settings);
+                self.render_profile_settings(settings, &view.settings.profiles);
                 settings.window.center();
                 settings.window.makeKeyAndOrderFront(None);
                 app.activate();
@@ -1166,7 +1194,7 @@ impl Ui {
     /// a Resume button per resumable pause, and Copy report.
     fn make_diagnostics_window(&self) -> DiagnosticsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 440.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(860.0, 440.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1187,7 +1215,7 @@ impl Ui {
         )));
         text.setFrame(NSRect::new(
             NSPoint::new(20.0, 64.0),
-            NSSize::new(680.0, 360.0),
+            NSSize::new(820.0, 360.0),
         ));
         content.addSubview(&text);
 
@@ -1202,9 +1230,10 @@ impl Ui {
         copy.setFrameOrigin(NSPoint::new(14.0, 20.0));
         content.addSubview(&copy);
 
-        let resume = [140.0, 330.0, 530.0]
-            .into_iter()
-            .map(|x| {
+        // Placed side by side as they are shown (`render_diagnostics`).
+        let resume = SafetyFeature::ALL
+            .iter()
+            .map(|_| {
                 let button = unsafe {
                     NSButton::buttonWithTitle_target_action(
                         ns_string!("Resume"),
@@ -1213,7 +1242,6 @@ impl Ui {
                         mtm,
                     )
                 };
-                button.setFrameOrigin(NSPoint::new(x, 20.0));
                 button.setHidden(true);
                 content.addSubview(&button);
                 button
@@ -1284,15 +1312,18 @@ impl Ui {
             .iter()
             .filter_map(|paused| {
                 let command = paused.resume.clone()?;
-                let feature = paused.title.trim_end_matches(" paused");
-                Some((format!("Resume {feature}"), command))
+                Some((format!("Resume {}", paused.feature.name()), command))
             })
             .collect();
+        // Right of Copy report, side by side.
+        let mut x = 140.0;
         for (index, button) in diagnostics.resume.iter().enumerate() {
             match resumable.get(index) {
                 Some((title, _)) => {
                     button.setTitle(&NSString::from_str(title));
                     button.sizeToFit();
+                    button.setFrameOrigin(NSPoint::new(x, 20.0));
+                    x += button.frame().size.width + 8.0;
                     button.setTag(index as isize);
                     button.setHidden(false);
                 }
@@ -1305,7 +1336,10 @@ impl Ui {
 
     fn make_settings_window(&self) -> SettingsWindow {
         let mtm = self.mtm();
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 552.0));
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(SETTINGS_WIDTH, SETTINGS_HEIGHT),
+        );
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1473,8 +1507,15 @@ impl Ui {
                 mtm,
             )
         };
-        hidden.setFrameOrigin(NSPoint::new(230.0, 88.0));
-        content.addSubview(&hidden);
+        // Placed in the Profiles section by `render_profile_settings`.
+        let profiles = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, SETTINGS_HEIGHT),
+                NSSize::new(SETTINGS_WIDTH, 0.0),
+            ),
+        );
+        content.addSubview(&profiles);
 
         let uninstall = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -1521,6 +1562,7 @@ impl Ui {
             verbose_logging,
             verbose_logging_note,
             hidden,
+            profiles,
             thresholds,
             reset_notification,
             retry_uninstall,
@@ -1704,6 +1746,99 @@ impl SidebarSource {
 fn line_index(item: &AnyObject) -> Option<usize> {
     let number = item.downcast_ref::<NSNumber>()?;
     usize::try_from(number.as_isize()).ok()
+}
+
+impl Ui {
+    /// Settings > Profiles: a heading, one line per Profile (its name, ↑ and
+    /// ↓, Rename…, Mute) and Hidden (n)…. Rebuilt only when the Profiles
+    /// changed; the window grows by the section's height.
+    fn render_profile_settings(&self, settings: &SettingsWindow, profiles: &[ProfileSettings]) {
+        if self.ivars().profile_settings.borrow().as_deref() == Some(profiles) {
+            return;
+        }
+        *self.ivars().profile_settings.borrow_mut() = Some(profiles.to_vec());
+        let mtm = self.mtm();
+        let section = &settings.profiles;
+        for view in section.subviews() {
+            view.removeFromSuperview();
+        }
+        let mut commands = Vec::new();
+        let height = 28.0 + PROFILE_LINE * profiles.len() as f64 + 36.0;
+        section.setFrame(NSRect::new(
+            NSPoint::new(0.0, SETTINGS_HEIGHT),
+            NSSize::new(SETTINGS_WIDTH, height),
+        ));
+        let heading = NSTextField::labelWithString(ns_string!("Profiles"), mtm);
+        heading.setFont(Some(
+            &NSFont::boldSystemFontOfSize(NSFont::systemFontSize()),
+        ));
+        heading.setFrameOrigin(NSPoint::new(20.0, height - 24.0));
+        heading.sizeToFit();
+        section.addSubview(&heading);
+        let mut button =
+            |title: &str, command: Option<&Command>, x: f64, y: f64, check: Option<bool>| {
+                let title = NSString::from_str(title);
+                let button = unsafe {
+                    match check {
+                        Some(_) => NSButton::checkboxWithTitle_target_action(
+                            &title,
+                            Some(self),
+                            Some(sel!(profileSettingClicked:)),
+                            mtm,
+                        ),
+                        None => NSButton::buttonWithTitle_target_action(
+                            &title,
+                            Some(self),
+                            Some(sel!(profileSettingClicked:)),
+                            mtm,
+                        ),
+                    }
+                };
+                button.setControlSize(NSControlSize::Small);
+                button.sizeToFit();
+                button.setFrameOrigin(NSPoint::new(x, y));
+                if let Some(on) = check {
+                    button.setState(if on {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
+                }
+                match command {
+                    Some(command) => {
+                        button.setTag(commands.len() as isize);
+                        commands.push(command.clone());
+                    }
+                    None => button.setEnabled(false),
+                }
+                section.addSubview(&button);
+            };
+        for (index, profile) in profiles.iter().enumerate() {
+            let y = height - 28.0 - PROFILE_LINE * (index + 1) as f64;
+            let name = NSTextField::labelWithString(&NSString::from_str(&profile.title), mtm);
+            name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            name.setFrame(NSRect::new(
+                NSPoint::new(20.0, y + 3.0),
+                NSSize::new(170.0, 18.0),
+            ));
+            if let Some(detail) = &profile.detail {
+                name.setToolTip(Some(&NSString::from_str(detail)));
+            }
+            section.addSubview(&name);
+            button("↑", profile.move_up.as_ref(), 194.0, y, None);
+            button("↓", profile.move_down.as_ref(), 226.0, y, None);
+            button("Rename…", Some(&profile.rename), 258.0, y, None);
+            if let Some(mute) = &profile.mute {
+                button("Mute", Some(&mute.command), 340.0, y + 3.0, Some(mute.on));
+            }
+        }
+        *self.ivars().profile_commands.borrow_mut() = commands;
+        settings.hidden.setFrameOrigin(NSPoint::new(14.0, 4.0));
+        section.addSubview(&settings.hidden);
+        settings
+            .window
+            .setContentSize(NSSize::new(SETTINGS_WIDTH, SETTINGS_HEIGHT + height));
+    }
 }
 
 /// Refills the detail pane: title, folder and branch, last client and age,

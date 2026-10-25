@@ -3,7 +3,7 @@
 
 mod common;
 
-use accroster_core::{Command, Core, Effect, NicknameTarget};
+use accroster_core::{Command, Core, Effect, Event, MenuItem, NicknameTarget, ProfileSettings};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use serde_json::json;
@@ -70,8 +70,12 @@ fn titles(core: &Core) -> Vec<String> {
     rows(core).into_iter().map(|row| row.title).collect()
 }
 
+fn settings_profiles(core: &Core) -> Vec<ProfileSettings> {
+    core.view().settings.profiles
+}
+
 #[test]
-fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
+fn settings_lists_the_profiles_to_reorder_rename_and_mute() {
     let mac = mac_with_two_sign_ins();
     let mut core = mac.launch();
     add_profile(&mut core);
@@ -82,28 +86,42 @@ fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
         [
             "Copy shell override",
             "Limit resets → claude.ai",
-            "Move Down",
             "Rename…",
             "Remove…"
-        ]
+        ],
+        "ordering lives in Settings, not the row"
     );
-    assert_eq!(
-        row_actions(&rows(&core)[1]),
-        [
-            "Copy shell override",
-            "Limit resets → claude.ai",
-            "Move Up",
-            "Rename…",
-            "Remove…"
-        ]
-    );
+    let listed = settings_profiles(&core);
+    let listed_titles: Vec<&str> = listed.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(listed_titles, [WORK, PERSO]);
+    assert!(listed[0].move_up.is_none() && listed[1].move_down.is_none());
+    assert!(!listed[1].mute.as_ref().expect("signed in").on);
 
-    click_in_row(&mut core, 1, "Move Up");
-
+    core.command(listed[1].move_up.clone().expect("the second moves up"));
     assert_eq!(titles(&core), [PERSO, WORK]);
+
+    let effects = core.command(settings_profiles(&core)[0].rename.clone());
+    let (target, name, _) = nickname_prompt(effects);
+    assert_eq!(name, PERSO);
+    core.command(Command::SetNickname {
+        target,
+        nickname: Some("Perso".into()),
+    });
+    let mute = settings_profiles(&core)[0].mute.clone().expect("signed in");
+    core.command(mute.command);
+
+    let listed = settings_profiles(&core);
+    assert_eq!(listed[0].title, "Perso");
+    assert_eq!(listed[0].detail.as_deref(), Some(PERSO));
+    assert!(listed[0].mute.as_ref().unwrap().on);
+    let menu_check = rows(&core)[0].submenu.iter().any(|item| {
+        matches!(item, MenuItem::Check { title, checked: true, .. } if title == "Mute notifications")
+    });
+    assert!(menu_check, "the row's Mute notifications agrees");
     drop(core);
     let core = mac.launch();
-    assert_eq!(titles(&core), [PERSO, WORK], "kept in settings.json");
+    assert_eq!(titles(&core), ["Perso", WORK], "kept in settings.json");
+    assert!(settings_profiles(&core)[0].mute.as_ref().unwrap().on);
 }
 
 /// Clicks Remove… on the row at `row` and returns the confirmation's
@@ -144,6 +162,7 @@ fn remove_signs_out_then_deletes_the_folder_but_never_shared_transcripts() {
         "nothing happens before the confirmation"
     );
     core.command(confirm);
+    settle(&mut core);
 
     assert!(mac.list(PROFILES).is_empty(), "the folder is gone");
     assert!(rows(&core).is_empty());
@@ -181,6 +200,7 @@ fn a_failed_sign_out_keeps_the_profile_and_its_folder() {
 
     let (_, confirm) = removal_prompt(&mut core, 0);
     core.command(confirm);
+    settle(&mut core);
 
     assert_eq!(
         mac.list(PROFILES).len(),
@@ -194,6 +214,35 @@ fn a_failed_sign_out_keeps_the_profile_and_its_folder() {
     );
     drop(core);
     assert_eq!(titles(&mac.launch()), [WORK]);
+}
+
+#[test]
+fn a_sign_out_that_never_ends_doesnt_hold_up_the_menu_and_keeps_the_profile() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    mac.claude.reply(StubCall::AuthLogout, Reply::hanging());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    let (_, confirm) = removal_prompt(&mut core, 0);
+
+    let (core, _) = command_promptly(core, confirm);
+    let logout = wait_for_calls(&mac, StubCall::AuthLogout, 1).remove(0);
+    let (mut core, _) = event_promptly(core, Event::Tick);
+    let rows_now = rows(&core);
+    assert_eq!(rows_now[0].note.as_deref(), Some("Signing out…"));
+    assert!(
+        !row_actions(&rows_now[0]).contains(&"Remove…".to_owned()),
+        "{rows_now:?}"
+    );
+
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(1));
+
+    assert!(!logout.still_running(), "given up on");
+    assert_eq!(mac.list(PROFILES).len(), 1, "kept without a sign-out");
+    assert_eq!(titles(&core), [WORK]);
+    assert_eq!(
+        warnings(&core),
+        ["Couldn't sign out me@work.example · Work Inc · nothing was removed"]
+    );
 }
 
 /// A `get_usage` answer for a Login whose token Claude Code blanked.
@@ -281,6 +330,63 @@ fn logged_out_while_the_account_remains_means_login_expired() {
 
     assert_expired(&core);
     assert_eq!(notifications(&effects), [EXPIRED_NOTICE]);
+}
+
+fn auth_status_calls(mac: &FakeMac) -> usize {
+    mac.claude
+        .calls()
+        .iter()
+        .filter(|call| call.kind == StubCall::AuthStatus)
+        .count()
+}
+
+#[test]
+fn failing_reads_ask_auth_status_once_per_run_of_failures() {
+    let mac = mac_signing_in_work_reading(Reply::fail(1, "boom"));
+    mac.claude
+        .reply(StubCall::SlashUsage, Reply::fail(1, "boom"));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    let after_first_failure = auth_status_calls(&mac);
+    assert_eq!(after_first_failure, 2, "the sign-in's, then the failure's");
+
+    for _ in 0..3 {
+        pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    }
+    assert!(usage_reads(&mac) >= 4, "polling went on");
+    assert_eq!(auth_status_calls(&mac), 2, "not on every failing poll");
+    assert_eq!(rows(&core)[0].note.as_deref(), Some("Couldn't read limits"));
+
+    // A good read ends the run; the next failure asks once more.
+    mac.claude
+        .reply(StubCall::GetUsage, usage_reply(limits_body()))
+        .reply(StubCall::GetUsage, Reply::fail(1, "boom"));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    assert_eq!(auth_status_calls(&mac), 3);
+}
+
+#[test]
+fn unreadable_answers_and_reads_that_never_end_never_ask_auth_status() {
+    let mac = mac_signing_in_work_reading(Reply::ok("{\"type\":\"something new\"}\n"));
+    mac.claude.reply(
+        StubCall::SlashUsage,
+        Reply::ok("Usage looks different now\n"),
+    );
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(15));
+    assert_eq!(rows(&core)[0].note.as_deref(), Some("Couldn't read limits"));
+    assert_eq!(auth_status_calls(&mac), 1, "only the sign-in's");
+
+    mac.claude.reply(StubCall::GetUsage, Reply::hanging());
+    let reads = usage_reads(&mac);
+    mac.clock.advance(jiff::SignedDuration::from_mins(15));
+    core.event(Event::Tick);
+    wait_for_calls(&mac, StubCall::GetUsage, reads + 1);
+    pass(&mac, &mut core, jiff::SignedDuration::from_mins(2));
+    assert_eq!(auth_status_calls(&mac), 1, "a timed-out read asks nothing");
 }
 
 #[test]
@@ -431,6 +537,89 @@ fn signing_in_again_as_another_login_is_undone_and_the_profile_stays_expired() {
     );
     drop(core);
     assert_expired(&mac.launch());
+}
+
+#[test]
+fn an_unreadable_claude_json_is_never_overwritten_when_undoing_another_logins_sign_in() {
+    let (mac, mut core) = mac_with_expired_work();
+    let folder = only_profile_folder(&mac);
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&FixtureLogin::perso()))
+        .reply(
+            StubCall::AuthLogout,
+            signed_out().writing(".claude.json", "{ not json"),
+        );
+
+    click_in_row(&mut core, 0, "Sign in again…");
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(
+        mac.read_file(format!("{folder}/.claude.json")).as_deref(),
+        Some("{ not json"),
+        "left as it is"
+    );
+    assert_eq!(
+        warnings(&core),
+        [format!(
+            "Signed in as {PERSO}, not {WORK} · that sign-in was undone, but {WORK}'s .claude.json couldn't be read, so its Login wasn't put back"
+        )]
+    );
+}
+
+/// The Profile folder whose `.claude.json` names `email`.
+fn folder_of(mac: &FakeMac, email: &str) -> String {
+    mac.list(PROFILES)
+        .into_iter()
+        .map(|id| format!("{PROFILES}/{id}"))
+        .find(|folder| {
+            mac.read_json(format!("{folder}/.claude.json"))
+                .is_some_and(|body| body["oauthAccount"]["emailAddress"] == json!(email))
+        })
+        .expect("a folder for that email")
+}
+
+#[test]
+fn while_seeding_is_paused_undoing_another_logins_sign_in_writes_nothing() {
+    let mac = mac_signing_in_work_reading(rate_limits_unavailable());
+    let team = FixtureLogin::new(
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "me@team.example",
+        "Team Co",
+    );
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&team))
+        .reply(StubCall::AuthStatus, auth_status(&team));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    add_profile(&mut core);
+    drop(core);
+    let work = folder_of(&mac, "me@work.example");
+    // Claude Code changed the account format in the other Profile's file.
+    mac.write_json(
+        format!("{}/.claude.json", folder_of(&mac, "me@team.example")),
+        &json!({ "oauthAccount": { "accountUuid": 7, "organizationUuid": "o", "emailAddress": "me@team.example" } }),
+    );
+    let mut core = mac.launch();
+    mac.claude
+        .reply(StubCall::AuthLogin, sign_in_as(&FixtureLogin::perso()))
+        .reply(
+            StubCall::AuthLogout,
+            signed_out().writing(".claude.json", "{}"),
+        );
+
+    click_in_row(&mut core, 0, "Sign in again…");
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(
+        mac.read_file(format!("{work}/.claude.json")).as_deref(),
+        Some("{}"),
+        "nothing written while paused"
+    );
+    let expected = format!(
+        "Signed in as {PERSO}, not {WORK} · that sign-in was undone, but Seeding .claude.json is paused, so its Login wasn't put back"
+    );
+    assert!(warnings(&core).contains(&expected), "{:?}", warnings(&core));
 }
 
 #[test]

@@ -8,8 +8,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use accroster_core::{
-    Command, Core, DiscoveredPair, Effect, Event, OpenChoice, RunningDot, SessionDetail,
-    SessionFilter, SessionRow, SidebarPresence,
+    Command, Core, Effect, Event, OpenChoice, ProfileKey, RunningDot, SessionDetail, SessionFilter,
+    SessionRow, SidebarPresence,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin};
 use common::*;
@@ -683,8 +683,8 @@ fn archived(mut entry: Value) -> Value {
     entry
 }
 
-fn pair(account: &str, org: &str) -> DiscoveredPair {
-    DiscoveredPair {
+fn pair(account: &str, org: &str) -> ProfileKey {
+    ProfileKey {
         account_uuid: account.into(),
         organization_uuid: org.into(),
     }
@@ -859,7 +859,7 @@ fn the_sidebar_lists_projects_and_every_profiles_sidebar() {
                         &SessionFilter::Sidebar(perso_pair)
                     ),
                     (
-                        "Unknown Login (account bbbbbbbb) (not signed in)",
+                        "Unknown Login · 1 Session · last active Jan 1 (not signed in)",
                         &SessionFilter::Sidebar(pair(ACCOUNT_B, ORG_B))
                     ),
                     ("CLI only (no Sidebar entry)", &SessionFilter::CliOnly),
@@ -931,7 +931,7 @@ fn the_detail_pane_shows_where_a_session_lives() {
                     desktop_now: true,
                 },
                 SidebarPresence {
-                    profile: "Unknown Login (account bbbbbbbb) (not signed in)".into(),
+                    profile: "Unknown Login · 1 Session · last active Jan 1 (not signed in)".into(),
                     has_entry: false,
                     archived: false,
                     desktop_now: false,

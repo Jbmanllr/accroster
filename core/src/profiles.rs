@@ -16,15 +16,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
+use crate::claude_json;
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
-use crate::interface::{Command, DiscoveredPair, Effect, MenuItem, NicknameTarget, ProfileRow};
+use crate::interface::{
+    Command, Effect, MenuItem, NicknameTarget, ProfileKey, ProfileRow, SafetyFeature,
+};
 use crate::logging::{Field, Level, Logger};
-use crate::monitor::{LimitsView, Watched};
-use crate::runner::Runner;
+use crate::monitor::{Completed, LimitsView, Watched};
+use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs, Runner};
 use crate::settings::Settings;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
-use crate::usage::UsageReply;
 
 /// A sign-in still running after this long is killed.
 pub(crate) const SIGN_IN_TIMEOUT: SignedDuration = SignedDuration::from_mins(10);
@@ -35,12 +37,16 @@ pub(crate) struct Context<'a> {
     pub paths: &'a AppPaths,
     pub logger: &'a Logger,
     pub verbose: bool,
-    /// Whether the links sharing Transcripts may be made (Transcript sharing
-    /// isn't under a Safety pause).
-    pub share_transcripts: bool,
+    /// The write features under a Safety pause: nothing they write is
+    /// written.
+    pub paused: Vec<SafetyFeature>,
 }
 
 impl Context<'_> {
+    pub(crate) fn is_paused(&self, feature: SafetyFeature) -> bool {
+        self.paused.contains(&feature)
+    }
+
     pub(crate) fn log(
         &self,
         level: Level,
@@ -60,8 +66,7 @@ impl Context<'_> {
 /// folder's `.claude.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
-    account_uuid: String,
-    organization_uuid: String,
+    key: ProfileKey,
     email: String,
     organization_name: String,
     /// For example `claude_max`; the plan when no usage read has said.
@@ -72,25 +77,13 @@ impl Identity {
     /// `oauthAccount` of `<config_dir>/.claude.json`, or `None` when the
     /// folder holds no sign-in.
     fn read(config_dir: &Path) -> Option<Identity> {
-        let bytes = fs::read(config_dir.join(".claude.json")).ok()?;
-        let body: Value = serde_json::from_slice(&bytes).ok()?;
-        let account = body.get("oauthAccount")?;
-        let text = |key: &str| account.get(key).and_then(Value::as_str).map(str::to_owned);
+        let account = claude_json::read_account(&config_dir.join(".claude.json"))?;
         Some(Identity {
-            account_uuid: text("accountUuid")?,
-            organization_uuid: text("organizationUuid")?,
-            email: text("emailAddress").unwrap_or_default(),
-            organization_name: text("organizationName").unwrap_or_default(),
-            organization_type: text("organizationType"),
+            key: account.key,
+            email: account.email,
+            organization_name: account.organization_name,
+            organization_type: account.organization_type,
         })
-    }
-
-    fn same_profile(&self, other: &Identity) -> bool {
-        self.account_uuid == other.account_uuid && self.organization_uuid == other.organization_uuid
-    }
-
-    fn is(&self, pair: &DiscoveredPair) -> bool {
-        self.account_uuid == pair.account_uuid && self.organization_uuid == pair.organization_uuid
     }
 
     /// `email · Organization`.
@@ -111,25 +104,21 @@ pub(crate) struct Listed<'a> {
     pub config_dir: &'a Path,
     /// Whether its folder holds a Login (signed in or expired).
     pub signed_in: bool,
+    /// `email · Organization`, or "Signed-out Profile".
+    pub name: String,
+    /// A nickname titles its row.
+    pub nicknamed: bool,
     /// The menu bar's short name for it: the nickname, else the email's
     /// local part (`perso`).
     pub short_label: String,
     pub row: ProfileRow,
 }
 
-/// A signed-in Profile's folder and the account its `oauthAccount` names.
-pub(crate) struct SignedInAccount<'a> {
-    pub config_dir: &'a Path,
-    pub email: &'a str,
-    pub organization_uuid: &'a str,
-}
-
 /// A signed-in Profile as other modules see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignedInProfile {
     pub id: String,
-    pub account_uuid: String,
-    pub organization_uuid: String,
+    pub key: ProfileKey,
     /// `email · Organization`.
     pub name: String,
 }
@@ -167,9 +156,8 @@ struct Profile {
 }
 
 impl Profile {
-    /// The menu row: `title` is the nickname, else `email · Organization`;
-    /// `position` and `count` decide which Move items the submenu offers.
-    fn row(&self, title: String, position: usize, count: usize, limits: LimitsView) -> ProfileRow {
+    /// The menu row: `title` is the nickname, else `email · Organization`.
+    fn row(&self, title: String, limits: LimitsView) -> ProfileRow {
         let mut submenu = Vec::new();
         let mut row_limits = LimitsView::default();
         if let Some(identity) = &self.identity {
@@ -218,24 +206,6 @@ impl Profile {
                 Command::SignInAgain(self.id.clone()),
             ));
         }
-        if position > 0 {
-            submenu.push(action(
-                "Move Up",
-                Command::MoveProfile {
-                    id: self.id.clone(),
-                    to: position - 1,
-                },
-            ));
-        }
-        if position + 1 < count {
-            submenu.push(action(
-                "Move Down",
-                Command::MoveProfile {
-                    id: self.id.clone(),
-                    to: position + 1,
-                },
-            ));
-        }
         submenu.push(action(
             "Rename…",
             Command::Rename(NicknameTarget::Profile(self.id.clone())),
@@ -275,7 +245,7 @@ fn capitalized(word: &str) -> String {
 
 /// The account a sign-in started from a Discovered Profile is meant to add.
 pub(crate) struct SignInTarget {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// Passed as `--email` when known.
     pub email: Option<String>,
     /// How the menu names it ("X" in "Signed in as Y, not X").
@@ -303,16 +273,84 @@ struct Again {
     previous_account: Option<Value>,
 }
 
+/// A queued `auth status` or `auth logout` in a Profile folder, and what
+/// happens once it ends.
+struct Tag {
+    id: String,
+    then: Then,
+}
+
+enum Then {
+    /// Remove…: delete the folder and forget the Profile.
+    Remove,
+    /// A folder that must not stay (a duplicate or abandoned sign-in):
+    /// delete it once signed out. `failed` is the notice if that fails.
+    Discard { failed: Option<String> },
+    /// Another Login's sign-in into an existing Profile, undone: put the
+    /// Profile's own Login back. `undone` is the notice when that worked,
+    /// `failed` the one when the sign-out failed; `name` names the Profile.
+    UndoSignInAgain {
+        previous_account: Option<Value>,
+        name: String,
+        undone: String,
+        failed: String,
+    },
+    /// A folder under `profiles/` that isn't a Profile (Uninstall…).
+    RemoveUnlisted,
+    /// `auth status` cross-checks a new Profile's sign-in. `keep_notice`:
+    /// a mismatch notice already says more.
+    ConfirmSignIn {
+        identity: Identity,
+        keep_notice: bool,
+    },
+    /// After a failed usage read: did the Login go?
+    CheckExpiry,
+    /// The self-check's cross-check of a signed-in Profile.
+    CrossCheck { held: Account },
+}
+
+/// An account as `auth status` names it: email and Organization uuid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Account {
+    pub email: Option<String>,
+    pub organization_uuid: Option<String>,
+}
+
+/// What one Profile's `auth status` said in the self-check's cross-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrossCheckAnswer {
+    /// The account the folder's `oauthAccount` names.
+    pub held: Account,
+    /// What a readable, logged-in answer named.
+    pub said: Option<Account>,
+    /// It never answered and was killed.
+    pub timed_out: bool,
+}
+
+/// The self-check's cross-check while its answers come in.
+struct CrossCheck {
+    waiting: usize,
+    answers: Vec<CrossCheckAnswer>,
+}
+
 /// Every Profile, plus the sign-in in progress, if any.
 #[derive(Default)]
 pub(crate) struct ProfileRegistry {
     profiles: Vec<Profile>,
     sign_in: Option<SignIn>,
+    /// `auth status` and `auth logout` runs, one at a time.
+    jobs: Jobs<Tag>,
     /// The outcome of the last sign-in, shown as a menu line until the next.
     notice: Option<String>,
     /// Set when `auth status` in a newly signed-in folder named another
     /// account than its `oauthAccount`; taken by the format checks.
     auth_disagreed: bool,
+    /// Profiles removed since the core last asked.
+    removed: Vec<String>,
+    /// Unlisted folders kept because their sign-out failed, since the core
+    /// last asked.
+    unlisted_kept: usize,
+    cross_check: Option<CrossCheck>,
     /// Effects (notifications) waiting for the core to hand to the UI.
     effects: Vec<Effect>,
 }
@@ -427,25 +465,247 @@ impl ProfileRegistry {
             .collect()
     }
 
-    /// Every signed-in Profile's folder with the account its `oauthAccount`
-    /// names, for the `auth status` cross-check.
-    pub(crate) fn accounts(&self) -> Vec<SignedInAccount<'_>> {
-        self.profiles
-            .iter()
-            .filter_map(|profile| {
-                let identity = profile.identity.as_ref()?;
-                Some(SignedInAccount {
-                    config_dir: &profile.config_dir,
-                    email: &identity.email,
-                    organization_uuid: &identity.organization_uuid,
-                })
-            })
-            .collect()
+    /// Queues `claude auth status --json` in every signed-in Profile, to
+    /// compare with the account its folder's `oauthAccount` names. Returns
+    /// whether anything was queued; the answers come from
+    /// [`ProfileRegistry::take_cross_check`]. A cross-check already
+    /// running is not started again.
+    pub(crate) fn start_cross_check(&mut self, ctx: &Context) -> bool {
+        if self.cross_check.is_some() {
+            return true;
+        }
+        let mut waiting = 0;
+        for profile in &self.profiles {
+            let Some(identity) = &profile.identity else {
+                continue;
+            };
+            let held = Account {
+                email: Some(identity.email.clone()),
+                organization_uuid: Some(identity.key.organization_uuid.clone()),
+            };
+            let tag = Tag {
+                id: profile.id.clone(),
+                then: Then::CrossCheck { held },
+            };
+            self.jobs
+                .push(&profile.config_dir, JobKind::AuthStatus, tag);
+            waiting += 1;
+        }
+        if waiting == 0 {
+            return false;
+        }
+        self.cross_check = Some(CrossCheck {
+            waiting,
+            answers: Vec::new(),
+        });
+        self.run_jobs(ctx);
+        true
+    }
+
+    /// The cross-check's answers, once every one is in.
+    pub(crate) fn take_cross_check(&mut self) -> Option<Vec<CrossCheckAnswer>> {
+        if self.cross_check.as_ref()?.waiting > 0 {
+            return None;
+        }
+        self.cross_check.take().map(|check| check.answers)
     }
 
     /// Whether `auth status` contradicted a sign-in since the last call.
     pub(crate) fn take_auth_disagreement(&mut self) -> bool {
         std::mem::take(&mut self.auth_disagreed)
+    }
+
+    /// Whether an `auth status` or `auth logout` is running or waiting.
+    pub(crate) fn busy(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    /// The Profiles removed since the last call.
+    pub(crate) fn take_removed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.removed)
+    }
+
+    /// How many unlisted folders were kept since the last call.
+    pub(crate) fn take_unlisted_kept(&mut self) -> usize {
+        std::mem::take(&mut self.unlisted_kept)
+    }
+
+    /// Whether Remove… is signing Profile `id` out.
+    fn removing(&self, id: &str) -> bool {
+        self.jobs
+            .queued()
+            .any(|(_, tag)| tag.id == id && matches!(tag.then, Then::Remove))
+    }
+
+    /// Whether a run is queued in `config_dir`: the Limit monitor leaves it
+    /// alone meanwhile, so two Claude Code runs never share a folder.
+    fn in_use(&self, config_dir: &Path) -> bool {
+        self.jobs.queued().any(|(dir, _)| dir == config_dir)
+    }
+
+    /// Collects the runs that ended and starts the next.
+    pub(crate) fn run_jobs(&mut self, ctx: &Context) {
+        loop {
+            let ended = self.jobs.poll(&ctx.runner());
+            if ended.is_empty() {
+                return;
+            }
+            for ended in ended {
+                self.job_ended(ctx, ended);
+            }
+        }
+    }
+
+    fn job_ended(&mut self, ctx: &Context, ended: Ended<Tag>) {
+        let Ended {
+            config_dir,
+            tag: Tag { id, then },
+            finished,
+        } = ended;
+        let finished = &finished;
+        if matches!(finished, Finished::TimedOut) {
+            ctx.log(
+                Level::Warn,
+                "claude code run timed out",
+                &[("profile", Field::Profile(&id))],
+            );
+        }
+        match then {
+            Then::Remove => self.removal_ended(ctx, &id, finished.succeeded()),
+            Then::Discard { failed } => {
+                if signed_out(ctx, &id, finished) {
+                    remove_folder(ctx, &id, &config_dir);
+                } else if let Some(failed) = failed {
+                    self.notice = Some(failed);
+                }
+            }
+            Then::UndoSignInAgain {
+                previous_account,
+                name,
+                undone,
+                failed,
+            } => {
+                if !signed_out(ctx, &id, finished) {
+                    self.notice = Some(failed);
+                } else if let Some(account) = previous_account
+                    && let Err(not_restored) = restore_account(ctx, &id, &config_dir, &account)
+                {
+                    self.notice = Some(format!(
+                        "{undone}, but {}, so its Login wasn't put back",
+                        not_restored.reason(&name)
+                    ));
+                }
+            }
+            Then::RemoveUnlisted => {
+                if signed_out(ctx, &id, finished) {
+                    // Signed out: a folder left here goes with the app's folder.
+                    remove_folder(ctx, &id, &config_dir);
+                } else {
+                    self.unlisted_kept += 1;
+                }
+            }
+            Then::ConfirmSignIn {
+                identity,
+                keep_notice,
+            } => self.confirm_sign_in(ctx, &id, &identity, keep_notice, finished),
+            Then::CheckExpiry => {
+                let logged_out =
+                    AuthStatus::parse(finished).is_some_and(|status| !status.logged_in);
+                let index = self.profiles.iter().position(|profile| profile.id == id);
+                if let Some(index) = index.filter(|_| logged_out)
+                    && self.profiles[index].identity.is_some()
+                {
+                    self.expire(ctx, index);
+                }
+            }
+            Then::CrossCheck { held } => {
+                let said = AuthStatus::parse(finished)
+                    .filter(|status| status.logged_in)
+                    .map(|status| Account {
+                        email: status.email,
+                        organization_uuid: status.org_id,
+                    });
+                if let Some(check) = &mut self.cross_check {
+                    check.waiting -= 1;
+                    check.answers.push(CrossCheckAnswer {
+                        held,
+                        said,
+                        timed_out: matches!(finished, Finished::TimedOut),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Remove…'s sign-out ended: on success the folder is deleted and the
+    /// Profile forgotten; otherwise both stay.
+    fn removal_ended(&mut self, ctx: &Context, id: &str, signed_out: bool) {
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            return;
+        };
+        let profile = &self.profiles[index];
+        if !signed_out {
+            ctx.log(
+                Level::Warn,
+                "sign-out failed, profile kept",
+                &[("profile", Field::Profile(id))],
+            );
+            self.notice = Some(format!(
+                "Couldn't sign out {} · nothing was removed",
+                profile.name()
+            ));
+            return;
+        }
+        if !remove_folder(ctx, id, &profile.config_dir) {
+            self.notice = Some(format!(
+                "Signed out {}, but its folder couldn't be deleted",
+                profile.name()
+            ));
+        }
+        self.profiles.remove(index);
+        self.save(ctx);
+        ctx.log(
+            Level::Info,
+            "profile removed",
+            &[("profile", Field::Profile(id))],
+        );
+        self.removed.push(id.to_owned());
+    }
+
+    /// A new Profile's sign-in, cross-checked: an answer that doesn't name
+    /// the folder's account gets a notice, and a logged-in one naming
+    /// another account counts against Claude Code honouring Profile folders.
+    fn confirm_sign_in(
+        &mut self,
+        ctx: &Context,
+        id: &str,
+        identity: &Identity,
+        keep_notice: bool,
+        finished: &Finished,
+    ) {
+        let status = AuthStatus::parse(finished);
+        let confirmed = status.as_ref().is_some_and(|status| {
+            status.logged_in
+                && status.email.as_deref() == Some(identity.email.as_str())
+                && status.org_id.as_deref() == Some(identity.key.organization_uuid.as_str())
+        });
+        if confirmed {
+            return;
+        }
+        // A readable, logged-in answer naming another account means Claude
+        // Code didn't use this folder's login.
+        self.auth_disagreed |= status.is_some_and(|status| status.logged_in);
+        ctx.log(
+            Level::Warn,
+            "sign-in not confirmed by auth status",
+            &[("profile", Field::Profile(id))],
+        );
+        if !keep_notice {
+            self.notice = Some(format!(
+                "Claude Code didn't confirm the sign-in of {}",
+                identity.name()
+            ));
+        }
     }
 
     /// Add Profile…: creates the folder, links it, seeds `.claude.json`, and
@@ -476,7 +736,13 @@ impl ProfileRegistry {
             &[("profile", Field::Profile(&id))],
         );
         link(ctx, &id, &config_dir);
-        if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
+        if ctx.is_paused(SafetyFeature::Seeding) {
+            ctx.log(
+                Level::Info,
+                "claude.json not seeded: paused",
+                &[("profile", Field::Profile(&id))],
+            );
+        } else if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
             let error = error.to_string();
             ctx.log(
                 Level::Warn,
@@ -523,13 +789,15 @@ impl ProfileRegistry {
                 "sign-in cancelled",
                 &[("profile", Field::Profile(&sign_in.id))],
             );
-            abandon(ctx, sign_in);
+            self.abandon(ctx, sign_in);
+            self.run_jobs(ctx);
         }
     }
 
     /// Checks on the running sign-in: finishes it once Claude Code has exited,
-    /// or abandons it after [`SIGN_IN_TIMEOUT`].
-    pub(crate) fn poll(&mut self, ctx: &Context) {
+    /// or abandons it after [`SIGN_IN_TIMEOUT`]. Collect what that queued
+    /// with [`ProfileRegistry::run_jobs`].
+    pub(crate) fn poll_sign_in(&mut self, ctx: &Context) {
         let Some(sign_in) = self.sign_in.as_mut() else {
             return;
         };
@@ -541,7 +809,7 @@ impl ProfileRegistry {
                 &[("profile", Field::Profile(&sign_in.id))],
             );
             let again = sign_in.again.is_some();
-            abandon(ctx, sign_in);
+            self.abandon(ctx, sign_in);
             self.notice = Some(if again {
                 "Sign-in timed out after 10 minutes · nothing changed".into()
             } else {
@@ -566,7 +834,7 @@ impl ProfileRegistry {
                     self.notice = Some(if sign_in.again.is_some() {
                         "Sign-in didn't complete · nothing changed".into()
                     } else {
-                        discard(ctx, &sign_in.id, &sign_in.config_dir);
+                        self.discard(ctx, &sign_in.id, &sign_in.config_dir, None);
                         "Sign-in didn't complete · nothing was added".into()
                     });
                 } else if sign_in.again.is_some() {
@@ -586,7 +854,7 @@ impl ProfileRegistry {
                         ("error", Field::Text(&error)),
                     ],
                 );
-                abandon(ctx, sign_in);
+                self.abandon(ctx, sign_in);
                 self.notice = Some("Sign-in didn't complete · nothing was added".into());
             }
         }
@@ -603,12 +871,12 @@ impl ProfileRegistry {
     }
 
     /// Whether a signed-in Profile has this (account, Organization) pair.
-    pub(crate) fn has_signed_in(&self, pair: &DiscoveredPair) -> bool {
+    pub(crate) fn has_signed_in(&self, pair: &ProfileKey) -> bool {
         self.profiles.iter().any(|profile| {
             profile
                 .identity
                 .as_ref()
-                .is_some_and(|identity| identity.is(pair))
+                .is_some_and(|identity| identity.key == *pair)
         })
     }
 
@@ -628,41 +896,56 @@ impl ProfileRegistry {
         settings: &Settings,
         limits: impl Fn(&str) -> LimitsView,
     ) -> Vec<Listed<'_>> {
-        let listed = self.ordered(&settings.profile_order);
-        listed
-            .iter()
-            .enumerate()
-            .map(|(position, profile)| {
+        self.ordered(&settings.profile_order)
+            .into_iter()
+            .map(|profile| {
                 let nickname = settings.nicknames.get(&profile.id);
                 let title = nickname.cloned().unwrap_or_else(|| profile.name());
                 let short_label = nickname
                     .cloned()
                     .or_else(|| profile.identity.as_ref().map(Identity::short_label))
                     .unwrap_or_else(|| "Signed out".to_owned());
+                let mut row = profile.row(title, limits(&profile.id));
+                if self.removing(&profile.id) {
+                    row.note = Some("Signing out…".to_owned());
+                    row.dimmed = true;
+                    row.submenu.retain(|item| {
+                        !matches!(
+                            item,
+                            MenuItem::Action {
+                                command: Command::AskRemoveProfile(_),
+                                ..
+                            }
+                        )
+                    });
+                }
                 Listed {
                     id: &profile.id,
                     config_dir: &profile.config_dir,
                     signed_in: profile.identity.is_some(),
+                    name: profile.name(),
+                    nicknamed: nickname.is_some(),
                     short_label,
-                    row: profile.row(title, position, listed.len(), limits(&profile.id)),
+                    row,
                 }
             })
             .collect()
     }
 
-    /// The Profiles the Limit monitor reads, in the user's order: signed in
-    /// and not expired. `active` says, by id and folder, which are a
-    /// client's Active Profile.
+    /// The Profiles the Limit monitor reads, in the user's order: signed in,
+    /// not expired, and with no `auth status` or `auth logout` queued in
+    /// their folder. `active` says, by id and folder, which are a client's
+    /// Active Profile.
     pub(crate) fn watched(&self, active: impl Fn(&str, &Path) -> bool) -> Vec<Watched> {
         self.profiles
             .iter()
-            .filter(|profile| !profile.expired)
+            .filter(|profile| !profile.expired && !self.in_use(&profile.config_dir))
             .filter_map(|profile| {
                 let identity = profile.identity.as_ref()?;
                 Some(Watched {
                     id: profile.id.clone(),
                     config_dir: profile.config_dir.clone(),
-                    account_uuid: identity.account_uuid.clone(),
+                    account_uuid: identity.key.account_uuid.clone(),
                     active: active(&profile.id, &profile.config_dir),
                 })
             })
@@ -714,50 +997,28 @@ impl ProfileRegistry {
         })
     }
 
-    /// Removes Profile `id`: `claude auth logout` first, then its folder
-    /// (links are deleted, never followed, so shared Transcripts stay). A
-    /// failed sign-out keeps the folder and the Profile. Returns whether it
-    /// was removed.
-    pub(crate) fn remove(&mut self, ctx: &Context, id: &str) -> bool {
-        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
-            return false;
+    /// Starts removing Profile `id`: `claude auth logout` first, then its
+    /// folder (links are deleted, never followed, so shared Transcripts
+    /// stay). A failed sign-out keeps the folder and the Profile. Removed
+    /// Profiles come out of [`ProfileRegistry::take_removed`].
+    pub(crate) fn remove(&mut self, ctx: &Context, id: &str) {
+        let Some(config_dir) = self.profile(id).map(|profile| profile.config_dir.clone()) else {
+            return;
         };
-        if self
+        let signing_in = self
             .sign_in
             .as_ref()
-            .is_some_and(|sign_in| sign_in.id == id)
-        {
-            return false;
+            .is_some_and(|sign_in| sign_in.id == id);
+        if signing_in || self.removing(id) {
+            return;
         }
         self.notice = None;
-        let profile = &self.profiles[index];
-        let signed_out = matches!(ctx.runner().sign_out(&profile.config_dir), Ok(true));
-        if !signed_out {
-            ctx.log(
-                Level::Warn,
-                "sign-out failed, profile kept",
-                &[("profile", Field::Profile(id))],
-            );
-            self.notice = Some(format!(
-                "Couldn't sign out {} · nothing was removed",
-                profile.name()
-            ));
-            return false;
-        }
-        if !remove_folder(ctx, id, &profile.config_dir) {
-            self.notice = Some(format!(
-                "Signed out {}, but its folder couldn't be deleted",
-                profile.name()
-            ));
-        }
-        self.profiles.remove(index);
-        self.save(ctx);
-        ctx.log(
-            Level::Info,
-            "profile removed",
-            &[("profile", Field::Profile(id))],
-        );
-        true
+        let tag = Tag {
+            id: id.to_owned(),
+            then: Then::Remove,
+        };
+        self.jobs.push(&config_dir, JobKind::SignOut, tag);
+        self.run_jobs(ctx);
     }
 
     /// A Profile's name for notices: `email · Organization`, or
@@ -766,11 +1027,12 @@ impl ProfileRegistry {
         self.profile(id).map(Profile::name)
     }
 
-    /// Signs out, then deletes, every folder under `profiles/` that isn't a
-    /// Profile (a kept duplicate sign-in); a folder holding no sign-in is
-    /// just deleted. A folder whose sign-out fails is kept so its login can
-    /// still be revoked. Returns how many were kept.
-    pub(crate) fn remove_unlisted(&self, ctx: &Context) -> usize {
+    /// Starts signing out, then deleting, every folder under `profiles/`
+    /// that isn't a Profile (a kept duplicate sign-in); a folder holding no
+    /// sign-in is just deleted. A folder whose sign-out fails is kept so its
+    /// login can still be revoked, and counted by
+    /// [`ProfileRegistry::take_unlisted_kept`].
+    pub(crate) fn remove_unlisted(&mut self, ctx: &Context) {
         let unlisted: Vec<(String, PathBuf)> = fs::read_dir(ctx.paths.profiles())
             .into_iter()
             .flatten()
@@ -782,25 +1044,20 @@ impl ProfileRegistry {
                     entry.path(),
                 )
             })
-            .filter(|(id, _)| !self.has(id))
+            .filter(|(id, config_dir)| !self.has(id) && !self.in_use(config_dir))
             .collect();
-        let mut kept = 0;
         for (id, config_dir) in unlisted {
-            let signed_out = Identity::read(&config_dir).is_none()
-                || matches!(ctx.runner().sign_out(&config_dir), Ok(true));
-            if !signed_out {
-                ctx.log(
-                    Level::Warn,
-                    "sign-out failed, unlisted folder kept",
-                    &[("profile", Field::Profile(&id))],
-                );
-                kept += 1;
-            } else {
-                // Signed out: a folder left here goes with the app's folder.
+            if Identity::read(&config_dir).is_none() {
                 remove_folder(ctx, &id, &config_dir);
+            } else {
+                let tag = Tag {
+                    id,
+                    then: Then::RemoveUnlisted,
+                };
+                self.jobs.push(&config_dir, JobKind::SignOut, tag);
             }
         }
-        kept
+        self.run_jobs(ctx);
     }
 
     fn profile(&self, id: &str) -> Option<&Profile> {
@@ -828,8 +1085,7 @@ impl ProfileRegistry {
                 let identity = profile.identity.as_ref()?;
                 Some(SignedInProfile {
                     id: profile.id.clone(),
-                    account_uuid: identity.account_uuid.clone(),
-                    organization_uuid: identity.organization_uuid.clone(),
+                    key: identity.key.clone(),
                     name: identity.name(),
                 })
             })
@@ -851,7 +1107,7 @@ impl ProfileRegistry {
                 "sign-in left no account",
                 &[("profile", Field::Profile(&id))],
             );
-            discard(ctx, &id, &config_dir);
+            self.discard(ctx, &id, &config_dir, None);
             self.notice = Some("Sign-in didn't complete · nothing was added".into());
             return;
         };
@@ -869,34 +1125,24 @@ impl ProfileRegistry {
                 .as_ref()
                 .map(Identity::name)
                 .unwrap_or_default();
-            self.notice = Some(if discard(ctx, &id, &config_dir) {
-                format!("Already added: {name}")
-            } else {
-                format!("Already added: {name} · the new sign-in couldn't be undone")
-            });
+            self.notice = Some(format!("Already added: {name}"));
+            let failed = format!("Already added: {name} · the new sign-in couldn't be undone");
+            self.discard(ctx, &id, &config_dir, Some(failed));
             return;
         }
-        match ctx.runner().auth_status(&config_dir) {
-            Some(status)
-                if status.logged_in
-                    && status.email.as_deref() == Some(identity.email.as_str())
-                    && status.org_id.as_deref() == Some(identity.organization_uuid.as_str()) => {}
-            status => {
-                // A readable, logged-in answer naming another account means
-                // Claude Code didn't use this folder's login.
-                self.auth_disagreed = status.is_some_and(|status| status.logged_in);
-                ctx.log(
-                    Level::Warn,
-                    "sign-in not confirmed by auth status",
-                    &[("profile", Field::Profile(&id))],
-                );
-                self.notice = Some(format!(
-                    "Claude Code didn't confirm the sign-in of {}",
-                    identity.name()
-                ));
-            }
-        }
-        if let Some(target) = target.filter(|target| !identity.is(&target.pair)) {
+        let mismatched = target
+            .as_ref()
+            .is_some_and(|target| identity.key != target.pair);
+        // Cross-checked before the Limit monitor reads it.
+        let tag = Tag {
+            id: id.clone(),
+            then: Then::ConfirmSignIn {
+                identity: identity.clone(),
+                keep_notice: mismatched,
+            },
+        };
+        self.jobs.push(&config_dir, JobKind::AuthStatus, tag);
+        if let Some(target) = target.filter(|_| mismatched) {
             // Kept: it is a real Profile, just not the one asked for.
             ctx.log(
                 Level::Info,
@@ -904,7 +1150,7 @@ impl ProfileRegistry {
                 &[("profile", Field::Profile(&id))],
             );
             self.notice = Some(format!(
-                "Signed in as {}, not {} · to add it, pick that account and Organization in the browser",
+                "Signed in as {}, not {} · to add it, pick that Login and Organization in the browser",
                 identity.name(),
                 target.name
             ));
@@ -914,8 +1160,8 @@ impl ProfileRegistry {
             "profile added",
             &[("profile", Field::Profile(&id))],
         );
-        // The Limit monitor reads it next, and hands the result to
-        // `record_reading`.
+        // The Limit monitor reads it once the cross-check ends, and hands
+        // the result to `record_reading`.
         self.profiles.push(Profile {
             id,
             config_dir,
@@ -948,7 +1194,7 @@ impl ProfileRegistry {
             return;
         };
         let accepted = match &expected {
-            Some(expected) => expected.same_profile(&identity),
+            Some(expected) => expected.key == identity.key,
             None => self
                 .find(&identity)
                 .is_none_or(|existing| existing.id == id),
@@ -964,22 +1210,28 @@ impl ProfileRegistry {
                 "sign-in again as another login undone",
                 &[("profile", Field::Profile(&id))],
             );
-            let undone = matches!(ctx.runner().sign_out(&config_dir), Ok(true));
-            if undone && let Some(account) = &previous_account {
-                restore_account(ctx, &id, &config_dir, account);
-            }
-            self.notice = Some(match (expected.is_some(), undone) {
-                (true, true) => {
-                    format!("Signed in as {used}, not {wanted} · that sign-in was undone")
-                }
-                (true, false) => {
-                    format!("Signed in as {used}, not {wanted} · that sign-in couldn't be undone")
-                }
-                (false, true) => format!("Already added: {wanted}"),
-                (false, false) => {
-                    format!("Already added: {wanted} · the new sign-in couldn't be undone")
-                }
-            });
+            let (undone, failed) = if expected.is_some() {
+                (
+                    format!("Signed in as {used}, not {wanted} · that sign-in was undone"),
+                    format!("Signed in as {used}, not {wanted} · that sign-in couldn't be undone"),
+                )
+            } else {
+                (
+                    format!("Already added: {wanted}"),
+                    format!("Already added: {wanted} · the new sign-in couldn't be undone"),
+                )
+            };
+            self.notice = Some(undone.clone());
+            let tag = Tag {
+                id: id.clone(),
+                then: Then::UndoSignInAgain {
+                    previous_account,
+                    name: wanted,
+                    undone,
+                    failed,
+                },
+            };
+            self.jobs.push(&config_dir, JobKind::SignOut, tag);
             return;
         }
         ctx.log(
@@ -1049,29 +1301,37 @@ impl ProfileRegistry {
         }
     }
 
-    /// Takes in one usage read of Profile `id` (`None` when it failed). A
-    /// read saying `rate_limits_available: false`, or a failed read after
-    /// which `claude auth status` says `loggedIn: false` while the folder
-    /// still holds its `oauthAccount`, means the Login expired: the last
-    /// reading is kept (dimmed), polling stops and one notification goes
-    /// out per expiry.
-    pub(crate) fn record_reading(&mut self, ctx: &Context, id: &str, reply: Option<UsageReply>) {
-        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+    /// Takes in one usage read of Profile `id`. A read saying
+    /// `rate_limits_available: false`, or a failed read (`check_login`)
+    /// after which `claude auth status` says `loggedIn: false` while the
+    /// folder still holds its `oauthAccount`, means the Login expired: the
+    /// last reading is kept (dimmed), polling stops and one notification
+    /// goes out per expiry.
+    pub(crate) fn record_reading(&mut self, ctx: &Context, done: &Completed) {
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == done.id)
+        else {
             return;
         };
         let profile = &self.profiles[index];
         if profile.identity.is_none() {
             return;
         }
-        let expired = match &reply {
-            Some(reply) => reply.rate_limits_available == Some(false),
-            None => ctx
-                .runner()
-                .auth_status(&profile.config_dir)
-                .is_some_and(|status| !status.logged_in),
-        };
-        if expired {
-            self.expire(ctx, index);
+        match &done.reply {
+            Some(reply) if reply.rate_limits_available == Some(false) => self.expire(ctx, index),
+            Some(_) => {}
+            None if done.check_login => {
+                let tag = Tag {
+                    id: done.id.clone(),
+                    then: Then::CheckExpiry,
+                };
+                self.jobs
+                    .push(&profile.config_dir, JobKind::AuthStatus, tag);
+                self.run_jobs(ctx);
+            }
+            None => {}
         }
     }
 
@@ -1107,12 +1367,47 @@ impl ProfileRegistry {
             profile
                 .identity
                 .as_ref()
-                .is_some_and(|known| known.same_profile(identity))
+                .is_some_and(|known| known.key == identity.key)
         })
     }
 
     fn has(&self, id: &str) -> bool {
         self.profiles.iter().any(|profile| profile.id == id)
+    }
+
+    /// Removes a Profile folder that must not stay: signs it out first if a
+    /// login landed in it, and keeps the folder when that sign-out fails
+    /// (its Keychain item would be orphaned otherwise; `failed` is then the
+    /// notice).
+    fn discard(&mut self, ctx: &Context, id: &str, config_dir: &Path, failed: Option<String>) {
+        if Identity::read(config_dir).is_none() {
+            remove_folder(ctx, id, config_dir);
+            return;
+        }
+        let tag = Tag {
+            id: id.to_owned(),
+            then: Then::Discard { failed },
+        };
+        self.jobs.push(config_dir, JobKind::SignOut, tag);
+    }
+
+    /// Kills an unfinished sign-in and, for Add Profile…, removes what it
+    /// left.
+    fn abandon(&mut self, ctx: &Context, mut sign_in: SignIn) {
+        if let Err(error) = sign_in.process.kill() {
+            let error = error.to_string();
+            ctx.log(
+                Level::Warn,
+                "sign-in not killed",
+                &[
+                    ("profile", Field::Profile(&sign_in.id)),
+                    ("error", Field::Text(&error)),
+                ],
+            );
+        }
+        if sign_in.again.is_none() {
+            self.discard(ctx, &sign_in.id, &sign_in.config_dir, None);
+        }
     }
 
     fn save(&self, ctx: &Context) {
@@ -1158,11 +1453,15 @@ fn create_folder(paths: &AppPaths) -> io::Result<(String, PathBuf)> {
 
 /// Makes the Profile folder's missing links back to `~/.claude`.
 fn link(ctx: &Context, id: &str, config_dir: &Path) {
-    match cli_switcher::ensure_links(
-        config_dir,
-        &ctx.env.home.join(".claude"),
-        ctx.share_transcripts,
-    ) {
+    if ctx.is_paused(SafetyFeature::Links) {
+        ctx.log(
+            Level::Info,
+            "links not made: paused",
+            &[("profile", Field::Profile(id))],
+        );
+        return;
+    }
+    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(
@@ -1189,77 +1488,95 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
     }
 }
 
-/// Kills an unfinished sign-in and, for Add Profile…, removes what it left.
-fn abandon(ctx: &Context, mut sign_in: SignIn) {
-    if let Err(error) = sign_in.process.kill() {
-        let error = error.to_string();
+/// Whether a sign-out run succeeded; logs a failure.
+fn signed_out(ctx: &Context, id: &str, finished: &Finished) -> bool {
+    let succeeded = finished.succeeded();
+    if !succeeded {
         ctx.log(
             Level::Warn,
-            "sign-in not killed",
-            &[
-                ("profile", Field::Profile(&sign_in.id)),
-                ("error", Field::Text(&error)),
-            ],
+            "sign-out failed, folder kept",
+            &[("profile", Field::Profile(id))],
         );
     }
-    if sign_in.again.is_none() {
-        discard(ctx, &sign_in.id, &sign_in.config_dir);
+    succeeded
+}
+
+/// Why a Profile's Login wasn't put back.
+enum NotRestored {
+    /// Seeding `.claude.json` is under a Safety pause.
+    Paused,
+    /// The file isn't a JSON object: its format is unknown, so it is left
+    /// as it is (ADR 0004).
+    Unreadable,
+    Failed(io::Error),
+}
+
+impl NotRestored {
+    /// The reason, for the notice "…, but <reason>, so its Login wasn't put
+    /// back".
+    fn reason(&self, name: &str) -> String {
+        match self {
+            NotRestored::Paused => format!("{} is paused", SafetyFeature::Seeding.name()),
+            NotRestored::Unreadable => format!("{name}'s .claude.json couldn't be read"),
+            NotRestored::Failed(_) => format!("{name}'s .claude.json couldn't be written"),
+        }
     }
 }
 
 /// Puts a Profile's `oauthAccount` back into its `.claude.json` after another
 /// Login's sign-in there was undone (sign-out deletes it), so the Profile
-/// keeps its Login. Backed up first, written atomically.
-fn restore_account(ctx: &Context, id: &str, config_dir: &Path, account: &Value) {
-    let path = config_dir.join(".claude.json");
-    let result = (|| -> io::Result<()> {
-        let mut body = match fs::read(&path) {
-            Ok(bytes) => {
-                backups::back_up(&ctx.paths.backups(), &path, ctx.env.clock.now())?;
-                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
-            Err(error) => return Err(error),
+/// keeps its Login. Backed up first, written atomically; never while
+/// Seeding is paused, and never over a file that isn't a JSON object.
+fn restore_account(
+    ctx: &Context,
+    id: &str,
+    config_dir: &Path,
+    account: &Value,
+) -> Result<(), NotRestored> {
+    let result = if ctx.is_paused(SafetyFeature::Seeding) {
+        Err(NotRestored::Paused)
+    } else {
+        write_account(ctx, &config_dir.join(".claude.json"), account)
+    };
+    if let Err(not_restored) = &result {
+        let reason = match not_restored {
+            NotRestored::Paused => "paused".to_owned(),
+            NotRestored::Unreadable => "unreadable claude.json".to_owned(),
+            NotRestored::Failed(error) => error.to_string(),
         };
-        if !body.is_object() {
-            body = Value::Object(serde_json::Map::new());
-        }
-        body.as_object_mut()
-            .expect("made an object above")
-            .insert("oauthAccount".into(), account.clone());
-        storage::write_atomically(&path, &serde_json::to_vec_pretty(&body)?)
-    })();
-    if let Err(error) = result {
-        let error = error.to_string();
         ctx.log(
-            Level::Error,
+            Level::Warn,
             "account not restored",
             &[
                 ("profile", Field::Profile(id)),
-                ("error", Field::Text(&error)),
+                ("error", Field::Text(&reason)),
             ],
         );
     }
+    result
 }
 
-/// Removes a Profile folder that must not stay: signs it out first if a
-/// login landed in it, and keeps the folder when that sign-out fails (its
-/// Keychain item would be orphaned otherwise). Returns whether it is gone.
-fn discard(ctx: &Context, id: &str, config_dir: &Path) -> bool {
-    if Identity::read(config_dir).is_some() {
-        match ctx.runner().sign_out(config_dir) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                ctx.log(
-                    Level::Warn,
-                    "sign-out failed, folder kept",
-                    &[("profile", Field::Profile(id))],
-                );
-                return false;
+fn write_account(ctx: &Context, path: &Path, account: &Value) -> Result<(), NotRestored> {
+    let mut body = match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body @ Value::Object(_)) => {
+                backups::back_up(&ctx.paths.backups(), path, ctx.env.clock.now())
+                    .map_err(NotRestored::Failed)?;
+                body
             }
+            _ => return Err(NotRestored::Unreadable),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Value::Object(serde_json::Map::new())
         }
-    }
-    remove_folder(ctx, id, config_dir)
+        Err(error) => return Err(NotRestored::Failed(error)),
+    };
+    body.as_object_mut()
+        .expect("an object, checked above")
+        .insert("oauthAccount".into(), account.clone());
+    let bytes =
+        serde_json::to_vec_pretty(&body).map_err(|error| NotRestored::Failed(error.into()))?;
+    storage::write_atomically(path, &bytes).map_err(NotRestored::Failed)
 }
 
 /// Deletes a Profile folder without following its links.

@@ -2,35 +2,34 @@
 
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::SignedDuration;
 
 use crate::backups;
 use crate::checks;
-use crate::cli_switcher::{self, TurnedOff};
+use crate::cli_switcher;
 use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, CheckStatus, ClaudeVersions, CliSwitchingView, Command, DiscoveredPair, Effect,
-    Event, FirstRunView, HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationsView, ProfileRow, SafetyFeature, SettingsView, SidebarSyncMode,
-    SidebarSyncView, UninstallView, View,
+    AboutView, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature, SettingsView,
+    SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
-use crate::monitor::{LimitMonitor, LimitsView, Watched};
+use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
-use crate::opening::{self, Clients, DefaultOpen, DesktopClient, InClaude, NamedProfile};
+use crate::opening;
 use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
-use crate::runner::Runner;
-use crate::safety::{self, CheckId, Finding, Safety};
-use crate::sessions::{SessionFacts, SessionIndex, SidebarProfile};
+use crate::runner::Jobs;
+use crate::safety::{CheckId, Safety};
+use crate::sessions::{SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
-use crate::sidebar_sync::{self, Run};
+use crate::sidebar_sync;
 use crate::storage::{self, AppPaths};
-use crate::uninstaller;
 
 /// The tagline, shown in About and the README.
 pub const TAGLINE: &str =
@@ -106,33 +105,68 @@ pub struct Core {
     sync_note: Option<String>,
     /// The sidebars' watch while Sidebar sync is on.
     sidebar_watch: sidebar_sync::Watch,
+    /// `claude --desktop --resume` runs, by Session id.
+    openings: Jobs<String>,
+    /// A Resume whose checks wait for the `auth status` cross-check.
+    resume_waiting: Option<SafetyFeature>,
+    /// An uninstall waiting for its sign-outs, with what is left for the
+    /// user to do so far.
+    uninstalling: Option<Vec<String>>,
     /// Why the last uninstall stopped, for Settings (offers Retry).
     uninstall_note: Option<String>,
     /// The app's folder is gone: nothing is read, written or started again.
     uninstalled: bool,
 }
 
-/// What the last link check found in one Profile folder.
-struct ProfileLinks {
-    id: String,
-    /// Links whose place holds something else.
-    replaced: Vec<&'static str>,
-    /// Whether every shared-Transcript link is in place.
-    transcripts_shared: bool,
+/// What the registry, the monitor and the bridge need from the core, as
+/// [`Core::context`] gives it, borrowing only the core's `env`, `paths`,
+/// `logger`, `settings` and `safety`: the core's other parts stay free to
+/// change while it is in use.
+macro_rules! context {
+    ($core:expr) => {
+        context_of(
+            &$core.env,
+            &$core.paths,
+            &$core.logger,
+            &$core.settings,
+            &$core.safety,
+        )
+    };
 }
 
-/// An account as `(email, Organization uuid)`.
-type Account = (Option<String>, Option<String>);
-
-/// When a self-check runs Claude Code's `auth status` in every Profile.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AuthCheck {
-    /// Only when the Claude versions changed since the last self-check:
-    /// a short-lived `claude` can start a token refresh and exit before
-    /// saving it, so the cross-check stays rare.
-    IfVersionsChanged,
-    Always,
+fn context_of<'a>(
+    env: &'a Environment,
+    paths: &'a AppPaths,
+    logger: &'a Logger,
+    settings: &Settings,
+    safety: &Safety,
+) -> profiles::Context<'a> {
+    profiles::Context {
+        env,
+        paths,
+        logger,
+        verbose: verbose_logging(settings, env),
+        paused: safety.paused(),
+    }
 }
+
+/// Whether Verbose logging is on now.
+fn verbose_logging(settings: &Settings, env: &Environment) -> bool {
+    settings
+        .verbose_logging_until
+        .is_some_and(|until| until > env.clock.now())
+}
+
+/// How often the core wants a tick while a short Claude Code run is out.
+const RUN_TICK: Duration = Duration::from_millis(250);
+
+mod cli;
+mod open;
+mod self_check;
+mod sidebar;
+mod uninstaller;
+
+use self_check::{AuthCheck, ProfileLinks};
 
 impl Core {
     /// Starts the core: creates the app's folder if needed, opens the log and
@@ -165,6 +199,9 @@ impl Core {
             sessions: SessionIndex::default(),
             sync_note: None,
             sidebar_watch: sidebar_sync::Watch::default(),
+            openings: Jobs::default(),
+            resume_waiting: None,
+            uninstalling: None,
             uninstall_note: None,
             uninstalled: false,
         };
@@ -249,6 +286,10 @@ impl Core {
             // The next batch of the Session index, as soon as input allows.
             return Duration::ZERO;
         }
+        if self.profiles.busy() || !self.openings.is_empty() {
+            // Its end shows at once.
+            return RUN_TICK;
+        }
         let idle = if self.profiles.signing_in() || self.desktop.waiting() {
             // An Automatic sync waits for the switch to end (see `Tick`).
             Duration::from_secs(1)
@@ -290,7 +331,45 @@ impl Core {
             &[("name", Field::Word(command.name()))],
         );
         let mut effects = self.handle(command);
+        // A run the command started may have ended at once (it couldn't
+        // start), and an uninstall with nothing to sign out ends now.
+        effects.extend(self.act_on_runs());
         effects.extend(self.take_effects());
+        effects
+    }
+
+    /// Checks on the sign-in, then [`Core::act_on_runs`].
+    fn poll_runs(&mut self) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
+        let (profiles, ctx) = self.profiles();
+        profiles.poll_sign_in(&ctx);
+        self.act_on_runs()
+    }
+
+    /// Collects the short Claude Code runs that ended (`auth status`, `auth
+    /// logout`, `--desktop --resume`) and acts on what they say.
+    fn act_on_runs(&mut self) -> Vec<Effect> {
+        if self.uninstalled {
+            return Vec::new();
+        }
+        let (profiles, ctx) = self.profiles();
+        profiles.run_jobs(&ctx);
+        let mut effects = profiles.take_effects();
+        if self.profiles.take_auth_disagreement() {
+            let finding = checks::config_dir_disagreement(&self.versions, "in a new Profile");
+            self.safety.record(CheckId::ConfigDirHonoured, finding);
+        }
+        for id in self.profiles.take_removed() {
+            self.forget_removed(&id);
+        }
+        self.carry_over_nicknames();
+        if let Some(answers) = self.profiles.take_cross_check() {
+            self.cross_checked(&answers);
+        }
+        effects.extend(self.poll_openings());
+        effects.extend(self.continue_uninstall());
         effects
     }
 
@@ -317,9 +396,10 @@ impl Core {
                 let Some(evidence) = self.discovered.iter().find(|e| e.pair == pair) else {
                     return Vec::new();
                 };
+                let nickname = self.choice(&pair).and_then(|c| c.nickname.as_deref());
                 let target = SignInTarget {
                     email: evidence.email().map(str::to_owned),
-                    name: evidence.known_name(),
+                    name: evidence.name(nickname),
                     pair,
                 };
                 let (profiles, ctx) = self.profiles();
@@ -547,12 +627,9 @@ impl Core {
                     self.set_verbose_logging_until(None);
                 }
                 let was_signing_in = self.profiles.signing_in();
-                let (profiles, ctx) = self.profiles();
-                profiles.poll(&ctx);
-                let mut effects = profiles.take_effects();
-                if self.profiles.take_auth_disagreement() {
-                    let finding = self.config_dir_disagreement("in a new Profile");
-                    self.safety.record(CheckId::ConfigDirHonoured, finding);
+                let mut effects = self.poll_runs();
+                if self.uninstalled {
+                    return effects;
                 }
                 if was_signing_in && !self.profiles.signing_in() {
                     self.check_links();
@@ -631,21 +708,15 @@ impl Core {
     /// Login; returns the notifications that produced.
     fn run_monitor(&mut self) -> Vec<Effect> {
         let watched = self.watched();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        // A finished read is handed over before the next starts, so the
-        // registry's `auth status` check never overlaps a usage read.
+        let ctx = context!(self);
+        // A finished read is handed over before the next starts: a Profile
+        // whose `auth status` the registry queues isn't watched meanwhile.
         if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
-            self.profiles.record_reading(&ctx, &done.id, done.reply);
+            self.profiles.record_reading(&ctx, &done);
         }
         let watched = self.watched();
         if let Some(done) = self.monitor.start_due(&ctx, &watched) {
-            self.profiles.record_reading(&ctx, &done.id, done.reply);
+            self.profiles.record_reading(&ctx, &done);
         }
         let mut effects = self.profiles.take_effects();
         effects.extend(self.notify_limits());
@@ -655,13 +726,7 @@ impl Core {
     /// The limit notifications due now (thresholds crossed, warned limits
     /// that reset).
     fn notify_limits(&mut self) -> Vec<Effect> {
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
+        let ctx = context!(self);
         let watched = self.watched();
         let listed = self.profiles.listed(&self.settings, |id| {
             let active = watched.iter().any(|w| w.id == id && w.active);
@@ -702,9 +767,12 @@ impl Core {
                     .profile(&signed_in)
                     .map(|profile| profile.id.clone())
             });
-        self.profiles.watched(|id, config_dir| {
+        let mut watched = self.profiles.watched(|id, config_dir| {
             cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
-        })
+        });
+        // Two Claude Code runs never share a folder.
+        watched.retain(|w| !self.openings.queued().any(|(dir, _)| dir == w.config_dir));
+        watched
     }
 
     /// Everything the UI shows right now.
@@ -737,6 +805,7 @@ impl Core {
         for profile in &mut listed {
             self.annotate_links(profile.id, &mut profile.row);
         }
+        let profile_settings = self.profile_settings(&listed);
         let cli = cli_switcher::present(
             &self.paths,
             &mut listed,
@@ -756,12 +825,18 @@ impl Core {
         let desktop_profile = desktop_account
             .as_ref()
             .and_then(|account| account.profile(&signed_in));
-        // The CLI part comes first.
-        let mut header: Vec<String> = cli.header.into_iter().collect();
-        if desktop_account.is_some() {
-            let name = desktop_profile.map_or("another account", |profile| &profile.name);
-            header.push(format!("Desktop: {name}"));
-        }
+        // Each client's Active Profile by its short name, the CLI's first:
+        // without CLI switching that is Default, said when the desktop's is.
+        let desktop_part = desktop_account.as_ref().map(|_| {
+            let name = desktop_profile
+                .and_then(|desktop| listed.iter().find(|listed| listed.id == desktop.id))
+                .map_or("another Profile", |listed| listed.short_label.as_str());
+            format!("Desktop: {name}")
+        });
+        let cli_part = cli
+            .header
+            .or_else(|| desktop_part.as_ref().map(|_| "CLI: Default".to_owned()));
+        let header: Vec<String> = cli_part.into_iter().chain(desktop_part).collect();
         if !header.is_empty() {
             items.push(MenuItem::Detail(header.join("    ")));
         }
@@ -888,11 +963,13 @@ impl Core {
                         .then_some(Command::SyncSidebarNow),
                     note: self.sync_note.clone(),
                 },
+                profiles: profile_settings,
                 hidden_discovered: shown
                     .iter()
                     .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
                     .map(|(evidence, choice)| HiddenDiscovered {
-                        title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                        title: evidence
+                            .hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
                         restore: Command::UnhideDiscovered(evidence.pair.clone()),
                     })
                     .collect(),
@@ -900,9 +977,15 @@ impl Core {
                     thresholds: self.settings.thresholds.values().to_vec(),
                     reset_notification: self.settings.reset_notification,
                 },
-                uninstall: UninstallView {
-                    note: self.uninstall_note.clone(),
-                    retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                uninstall: match &self.uninstalling {
+                    Some(_) => UninstallView {
+                        note: Some("Uninstalling · signing every Profile out…".into()),
+                        retry: None,
+                    },
+                    None => UninstallView {
+                        note: self.uninstall_note.clone(),
+                        retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                    },
                 },
             },
             about: AboutView {
@@ -923,6 +1006,35 @@ impl Core {
         }
     }
 
+    /// Settings > Profiles: each Profile in the user's order, with what
+    /// reorders, renames and mutes it.
+    fn profile_settings(&self, listed: &[Listed<'_>]) -> Vec<ProfileSettings> {
+        let last = listed.len().saturating_sub(1);
+        listed
+            .iter()
+            .enumerate()
+            .map(|(position, profile)| {
+                let id = profile.id.to_owned();
+                let move_to = |to: usize| Command::MoveProfile { id: id.clone(), to };
+                let muted = self.settings.muted_profiles.contains(&id);
+                ProfileSettings {
+                    title: profile.row.title.clone(),
+                    detail: profile.nicknamed.then(|| profile.name.clone()),
+                    move_up: (position > 0).then(|| move_to(position - 1)),
+                    move_down: (position < last).then(|| move_to(position + 1)),
+                    rename: Command::Rename(NicknameTarget::Profile(id.clone())),
+                    mute: profile.signed_in.then(|| Toggle {
+                        on: muted,
+                        command: Command::SetMuted {
+                            id: id.clone(),
+                            muted: !muted,
+                        },
+                    }),
+                }
+            })
+            .collect()
+    }
+
     /// The All Sessions window, with the selected Session's Open section.
     fn all_sessions(&self) -> crate::interface::AllSessionsView {
         let mut view = self
@@ -934,675 +1046,6 @@ impl Core {
             detail.open = opening::choices(&facts, &self.clients());
         }
         view
-    }
-
-    /// Who could open a Session right now: the CLI's and the desktop's
-    /// Active Profiles, and the signed-in Profiles.
-    fn clients(&self) -> Clients {
-        let signed_in = self.profiles.signed_in();
-        let profiles: Vec<NamedProfile> = self
-            .profiles
-            .ordered_ids(&self.settings.profile_order)
-            .into_iter()
-            .filter_map(|id| {
-                let profile = signed_in.iter().find(|profile| profile.id == id)?;
-                Some(NamedProfile {
-                    name: (self.settings.nicknames.get(&id).cloned())
-                        .unwrap_or_else(|| profile.name.clone()),
-                    pair: DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    },
-                    id,
-                })
-            })
-            .collect();
-        let desktop = self.env.os.desktop_app_version().map(|_| {
-            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
-            let pair = account
-                .as_ref()
-                .and_then(|account| match account.profile(&signed_in) {
-                    Some(profile) => Some(DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    }),
-                    None => Some(DiscoveredPair {
-                        account_uuid: account.account_uuid.clone(),
-                        organization_uuid: account.organization_uuid.clone()?,
-                    }),
-                });
-            let name = pair.as_ref().and_then(|pair| {
-                self.sidebar_profiles()
-                    .into_iter()
-                    .find(|sidebar| sidebar.pair == *pair)
-                    .map(|sidebar| sidebar.name)
-            });
-            DesktopClient { pair, name }
-        });
-        let desktop_turn_running = desktop.is_some()
-            && matches!(
-                desktop::guard(&self.env, &DesktopPaths::new(&self.env.home)),
-                desktop::Guard::Busy(_)
-            );
-        Clients {
-            cli: self.cli_profile_name(),
-            desktop,
-            profiles,
-            desktop_turn_running,
-            can_run_claude_code: self.claude_code_folder().is_some(),
-        }
-    }
-
-    /// The CLI's pointer while CLI switching is on.
-    fn cli_pointer(&self) -> Option<PathBuf> {
-        cli_switcher::is_on(&self.paths)
-            .then(|| cli_switcher::pointer(&self.paths))
-            .flatten()
-    }
-
-    /// The CLI's Active Profile as the menu header names it: the pointer's
-    /// Profile, or Default (`~/.claude`) without one.
-    fn cli_profile_name(&self) -> String {
-        let Some(pointer) = self.cli_pointer() else {
-            return "Default".into();
-        };
-        self.profiles
-            .listed(&self.settings, |_| LimitsView::default())
-            .into_iter()
-            .find(|profile| profile.config_dir == pointer)
-            .map_or_else(
-                || "an unknown Profile".into(),
-                |profile| profile.short_label,
-            )
-    }
-
-    /// Where `claude --desktop --resume` runs (any subscription login will
-    /// do, never `~/.claude`): the CLI's Active Profile, else the desktop's,
-    /// else the first signed-in Profile.
-    fn claude_code_folder(&self) -> Option<PathBuf> {
-        let ordered = self.profiles.ordered_ids(&self.settings.profile_order);
-        let folders: Vec<(&str, &Path)> = ordered
-            .iter()
-            .filter_map(|id| Some((id.as_str(), self.profiles.config_dir(id)?)))
-            .collect();
-        let cli = self
-            .cli_pointer()
-            .filter(|pointer| folders.iter().any(|(_, dir)| *dir == pointer.as_path()));
-        let desktop = || {
-            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home))?;
-            let profile = account.profile(&self.profiles.signed_in())?.id.clone();
-            let (_, dir) = folders.iter().find(|(id, _)| *id == profile)?;
-            Some(dir.to_path_buf())
-        };
-        let first = || folders.first().map(|(_, dir)| dir.to_path_buf());
-        cli.or_else(desktop).or_else(first)
-    }
-
-    /// A double-click or a Recent Sessions item: the client the Session was
-    /// last used in. When Claude's Active Profile has no entry for it, the
-    /// Session is shown in All Sessions, where the choices are spelled out.
-    fn open_session(&mut self, id: String) -> Vec<Effect> {
-        let Some(facts) = self.sessions.facts(&id) else {
-            return Vec::new();
-        };
-        match opening::default_open(&facts, &self.clients()) {
-            None => Vec::new(),
-            Some(DefaultOpen::Terminal) => self.open_in_terminal(&id),
-            Some(DefaultOpen::Claude) => self.open_in_claude(&id),
-            Some(DefaultOpen::Choose) => {
-                let effects = self.handle(Command::OpenAllSessions);
-                self.sessions.set_filter(Default::default());
-                self.sessions.set_search(String::new());
-                self.sessions.select(Some(id));
-                effects
-            }
-        }
-    }
-
-    /// Resume in Terminal, or Show in Terminal when it already runs there.
-    fn open_in_terminal(&mut self, id: &str) -> Vec<Effect> {
-        let Some(effect) = self
-            .sessions
-            .facts(id)
-            .and_then(|facts| opening::terminal(&facts, &*self.env.os))
-        else {
-            return Vec::new();
-        };
-        let how = match effect {
-            Effect::ShowInTerminal { .. } => "show_in_terminal",
-            _ => "resume_in_terminal",
-        };
-        self.log_opened(id, how);
-        vec![effect]
-    }
-
-    /// Open in Claude: its entry in the desktop's Active Profile, else
-    /// `claude --desktop --resume`.
-    fn open_in_claude(&mut self, id: &str) -> Vec<Effect> {
-        let Some(facts) = self.sessions.facts(id) else {
-            return Vec::new();
-        };
-        let clients = self.clients();
-        match opening::in_claude(&facts, &clients) {
-            None => Vec::new(),
-            Some(InClaude::Entry(entry)) => {
-                self.log_opened(id, "claude_entry");
-                vec![Effect::OpenUrl(opening::continue_url(&entry))]
-            }
-            Some(InClaude::Resume) => {
-                if opening::resume_blocked(&facts, &clients).is_some() {
-                    return Vec::new();
-                }
-                self.resume_in_claude(&facts)
-            }
-        }
-    }
-
-    /// `claude --desktop --resume <id>` in a Profile folder.
-    fn resume_in_claude(&mut self, facts: &SessionFacts) -> Vec<Effect> {
-        let Some(folder) = self.claude_code_folder() else {
-            return Vec::new();
-        };
-        let runner = Runner::new(&self.env, &self.paths);
-        let error = match runner.open_in_desktop(&folder, &facts.id, facts.cwd.as_deref()) {
-            Ok(true) => {
-                self.log_opened(&facts.id, "claude_resume");
-                return Vec::new();
-            }
-            Ok(false) => "claude exited with an error".to_owned(),
-            Err(error) => error.to_string(),
-        };
-        self.log(
-            Level::Warn,
-            "session not opened in claude",
-            &[
-                ("session", Field::SessionId(&facts.id)),
-                ("error", Field::Text(&error)),
-            ],
-        );
-        vec![Effect::Notify {
-            title: "Couldn't open the Session in Claude".into(),
-            body:
-                "Claude Code couldn't hand it over. Check that Claude is signed in, then try again."
-                    .into(),
-        }]
-    }
-
-    /// "Switch Claude to <Profile>, then open…": a Guided switch that opens
-    /// the Profile's entry once confirmed.
-    fn switch_claude_then_open(&mut self, profile_id: &str, session: &str) -> Vec<Effect> {
-        let Some(facts) = self.sessions.facts(session) else {
-            return Vec::new();
-        };
-        let Some(profile) = self
-            .profiles
-            .signed_in()
-            .into_iter()
-            .find(|profile| profile.id == profile_id)
-        else {
-            return Vec::new();
-        };
-        let pair = DiscoveredPair {
-            account_uuid: profile.account_uuid.clone(),
-            organization_uuid: profile.organization_uuid.clone(),
-        };
-        let Some(entry) = opening::switch_entry(&facts, &pair) else {
-            return Vec::new();
-        };
-        let target = Target {
-            then_open: Some(entry.entry_id.clone()),
-            ..Target::of(&profile)
-        };
-        let (desktop, ctx) = self.desktop();
-        let cleared = desktop.start(&ctx, target);
-        self.guide_desktop_switch(cleared)
-    }
-
-    fn log_opened(&self, id: &str, how: &'static str) {
-        self.log(
-            Level::Info,
-            "session opened",
-            &[("session", Field::SessionId(id)), ("how", Field::Word(how))],
-        );
-    }
-
-    /// The Diagnostics window: every check, the versions, the pauses.
-    fn diagnostics(&self) -> crate::interface::DiagnosticsView {
-        let usage = self.monitor.usage_summary();
-        let mut finding = if usage.unreadable > 0 {
-            Finding::fail(format!(
-                "{} of {} last answers couldn't be read",
-                usage.unreadable,
-                usage.unreadable + usage.read
-            ))
-        } else if usage.read > 0 {
-            Finding::pass()
-        } else {
-            Finding::never_seen()
-        };
-        if !usage.new_kinds.is_empty() {
-            let kinds: Vec<String> = usage
-                .new_kinds
-                .iter()
-                .map(|kind| safety::reportable(kind))
-                .collect();
-            let line = format!("New limit kind seen: {}", kinds.join(", "));
-            finding.detail = Some(match finding.detail.take() {
-                Some(detail) => format!("{detail}; {line}"),
-                None => line,
-            });
-        }
-        self.safety.diagnostics(self.versions.clone(), finding)
-    }
-
-    /// "Transcripts not shared" under a Profile whose shared-Transcript links
-    /// aren't in place, and a detail line per other replaced link.
-    fn annotate_links(&self, id: &str, row: &mut crate::interface::ProfileRow) {
-        let Some(links) = self.links.iter().find(|links| links.id == id) else {
-            return;
-        };
-        if !links.transcripts_shared {
-            row.note = Some(match row.note.take() {
-                Some(note) => format!("{note} · Transcripts not shared"),
-                None => "Transcripts not shared".to_owned(),
-            });
-        }
-        for name in links
-            .replaced
-            .iter()
-            .filter(|name| !cli_switcher::TRANSCRIPT_LINKS.contains(name))
-        {
-            row.submenu.push(MenuItem::Detail(format!(
-                "{name} link replaced · not shared"
-            )));
-        }
-    }
-
-    /// Runs the full self-check when a Claude version changed since the last
-    /// one. Returns whether it ran.
-    fn self_check_if_versions_changed(&mut self) -> bool {
-        if !self.safety.versions_changed(&desktop::versions(&self.env)) {
-            return false;
-        }
-        self.log(Level::Info, "claude versions changed", &[]);
-        self.self_check(AuthCheck::IfVersionsChanged);
-        true
-    }
-
-    /// The full self-check: settings `env`, accounts, links, Sidebar entries,
-    /// live-process files and Transcript records, plus `auth status` per
-    /// `auth`; then pauses whatever a failed check blocks.
-    fn self_check(&mut self, auth: AuthCheck) {
-        let versions = desktop::versions(&self.env);
-        let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
-        self.versions = versions;
-        self.safety.check_settings_env(&self.env, false);
-        self.check_accounts();
-        self.check_links();
-        if run_auth {
-            self.check_config_dir_honoured();
-        }
-        let home = self.env.home.clone();
-        self.check_sidebar_entries();
-        let mut session_dirs = vec![home.join(".claude")];
-        session_dirs.extend(
-            self.profiles
-                .folders()
-                .into_iter()
-                .map(|(_, dir)| dir.to_path_buf()),
-        );
-        self.safety.record(
-            CheckId::LiveProcesses,
-            checks::live_processes(&session_dirs),
-        );
-        self.safety.record(
-            CheckId::TranscriptRecords,
-            checks::transcript_records(&home),
-        );
-        self.safety.mark_checked(&self.versions);
-        self.settle();
-    }
-
-    /// Pauses whatever a current finding blocks, and logs each new pause.
-    fn settle(&mut self) {
-        for feature in self.safety.settle() {
-            self.log(
-                Level::Warn,
-                "safety pause",
-                &[("feature", Field::Word(feature_word(feature)))],
-            );
-        }
-    }
-
-    fn check_accounts(&mut self) {
-        let folders: Vec<&Path> = self
-            .profiles
-            .folders()
-            .into_iter()
-            .map(|(_, dir)| dir)
-            .collect();
-        let (accounts, caches) =
-            checks::accounts(&folders, &safety::claude_code_name(&self.versions));
-        self.safety.record(CheckId::OauthAccount, accounts);
-        self.safety.record(CheckId::CachedUsage, caches);
-    }
-
-    /// Checks every Profile folder's links: a replaced shared-Transcript link
-    /// blocks Transcript sharing; other replaced links are only reported.
-    fn check_links(&mut self) {
-        let claude_home = self.env.home.join(".claude");
-        self.links = self
-            .profiles
-            .folders()
-            .into_iter()
-            .map(|(id, dir)| ProfileLinks {
-                id: id.to_owned(),
-                replaced: cli_switcher::replaced_links(dir, &claude_home),
-                transcripts_shared: cli_switcher::TRANSCRIPT_LINKS.iter().all(|name| {
-                    std::fs::read_link(dir.join(name)).ok() == Some(claude_home.join(name))
-                }),
-            })
-            .collect();
-        if self.links.is_empty() {
-            return;
-        }
-        let summary = |transcript: bool| -> Option<String> {
-            let mut names: Vec<&str> = Vec::new();
-            let mut profiles = 0;
-            for links in &self.links {
-                let hit: Vec<&str> = links
-                    .replaced
-                    .iter()
-                    .copied()
-                    .filter(|name| cli_switcher::TRANSCRIPT_LINKS.contains(name) == transcript)
-                    .collect();
-                if !hit.is_empty() {
-                    profiles += 1;
-                }
-                for name in hit {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
-                }
-            }
-            (profiles > 0).then(|| {
-                let plural = if names.len() > 1 { "links" } else { "link" };
-                let whose = if profiles > 1 { "Profiles" } else { "Profile" };
-                format!(
-                    "{} {plural} replaced in {profiles} {whose}",
-                    names.join(", ")
-                )
-            })
-        };
-        let transcripts = match summary(true) {
-            Some(text) => {
-                Finding::fail(text.clone()).blocking(SafetyFeature::TranscriptSharing, text)
-            }
-            None => Finding::pass(),
-        };
-        let others = match summary(false) {
-            Some(text) => Finding::fail(text),
-            None => Finding::pass(),
-        };
-        self.safety.record(CheckId::TranscriptLinks, transcripts);
-        self.safety.record(CheckId::OtherLinks, others);
-    }
-
-    /// Runs `claude auth status --json` in every signed-in Profile and
-    /// compares it with the folder's `oauthAccount`. Unreadable answers say
-    /// nothing either way.
-    fn check_config_dir_honoured(&mut self) {
-        let runner = Runner::new(&self.env, &self.paths);
-        // Per signed-in Profile: the (email, Organization) its folder holds,
-        // and what a readable, logged-in `auth status` said, if anything.
-        let answers: Vec<(Account, Option<Account>)> = self
-            .profiles
-            .accounts()
-            .into_iter()
-            .map(|account| {
-                let said = runner
-                    .auth_status(account.config_dir)
-                    .filter(|status| status.logged_in)
-                    .map(|status| (status.email, status.org_id));
-                let held = (
-                    Some(account.email.to_owned()),
-                    Some(account.organization_uuid.to_owned()),
-                );
-                (held, said)
-            })
-            .collect();
-        let said: Vec<&Account> = answers
-            .iter()
-            .filter_map(|(_, said)| said.as_ref())
-            .collect();
-        if said.is_empty() {
-            return;
-        }
-        let one_identity = answers.len() > 1
-            && said.len() == answers.len()
-            && said.iter().all(|account| *account == said[0]);
-        let disagreeing = answers
-            .iter()
-            .filter(|(held, said)| said.as_ref().is_some_and(|said| said != held))
-            .count();
-        let finding = if one_identity {
-            let reason = format!(
-                "{} ignores Profile folders",
-                safety::claude_code_name(&self.versions)
-            );
-            Finding::fail("every Profile reports one account")
-                .blocking(SafetyFeature::CliSwitching, reason)
-        } else if disagreeing > 0 {
-            let whose = if disagreeing > 1 {
-                "Profiles"
-            } else {
-                "Profile"
-            };
-            self.config_dir_disagreement(&format!("in {disagreeing} {whose}"))
-        } else {
-            Finding::pass()
-        };
-        self.safety.record(CheckId::ConfigDirHonoured, finding);
-    }
-
-    /// `auth status` named another account than `oauthAccount`.
-    fn config_dir_disagreement(&self, where_: &str) -> Finding {
-        Finding::fail(format!("auth status names another account {where_}")).blocking(
-            SafetyFeature::CliSwitching,
-            format!(
-                "{} didn't use a Profile folder's login",
-                safety::claude_code_name(&self.versions)
-            ),
-        )
-    }
-
-    /// "Resume <feature>": runs the feature's checks again and ends its
-    /// pause if none fails.
-    fn resume(&mut self, feature: SafetyFeature) {
-        match feature {
-            SafetyFeature::CliSwitching => {
-                self.versions = desktop::versions(&self.env);
-                self.safety.check_settings_env(&self.env, false);
-                self.check_accounts();
-                self.check_config_dir_honoured();
-            }
-            SafetyFeature::TranscriptSharing => self.check_links(),
-            SafetyFeature::SidebarSync => self.check_sidebar_entries(),
-        }
-        self.settle();
-        if !self.safety.resume(feature) {
-            self.log(
-                Level::Info,
-                "safety pause kept",
-                &[("feature", Field::Word(feature_word(feature)))],
-            );
-            return;
-        }
-        self.log(
-            Level::Info,
-            "safety pause resumed",
-            &[("feature", Field::Word(feature_word(feature)))],
-        );
-        if feature == SafetyFeature::TranscriptSharing {
-            let (profiles, ctx) = self.profiles();
-            profiles.heal_links(&ctx);
-            self.check_links();
-        }
-        if feature == SafetyFeature::SidebarSync {
-            // The user accepts the sidebars as they are now.
-            sidebar_sync::accept_current(&self.env, &self.paths);
-            self.sync_note = None;
-        }
-    }
-
-    /// The Sidebar entries check. A failure pauses Sidebar sync only while
-    /// sync is on: with it off, nothing would be written anyway.
-    fn check_sidebar_entries(&mut self) {
-        let mut finding = checks::sidebar_entries(&self.env.home);
-        if finding.status == CheckStatus::Fail && self.settings.sidebar_sync != SidebarSyncMode::Off
-        {
-            let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
-            finding = finding.blocking(SafetyFeature::SidebarSync, reason);
-        }
-        self.safety.record(CheckId::SidebarEntries, finding);
-    }
-
-    /// The Sidebar sync mode in Settings. Turning sync on checks the Sidebar
-    /// entries first, so a changed format pauses it before any write.
-    fn set_sidebar_sync(&mut self, mode: SidebarSyncMode) {
-        let mut updated = self.settings.clone();
-        updated.sidebar_sync = mode;
-        if !self.save_settings(updated) {
-            return;
-        }
-        self.sync_note = None;
-        self.log(
-            Level::Info,
-            "sidebar sync mode",
-            &[(
-                "mode",
-                Field::Word(match mode {
-                    SidebarSyncMode::Off => "off",
-                    SidebarSyncMode::Manual => "manual",
-                    SidebarSyncMode::Automatic => "automatic",
-                }),
-            )],
-        );
-        self.check_sidebar_entries();
-        self.settle();
-    }
-
-    /// "Sync now": checks the Sidebar entries again, then copies every entry
-    /// into every other Profile's sidebar (ADR 0003).
-    fn sync_sidebar(&mut self) {
-        if self.settings.sidebar_sync == SidebarSyncMode::Off {
-            return;
-        }
-        self.sidebar_watch.ran();
-        self.check_sidebar_entries();
-        self.settle();
-        if self.safety.is_paused(SafetyFeature::SidebarSync) {
-            self.sync_note =
-                Some("Sidebar sync is paused · see Diagnostics for why and to resume it".into());
-            self.log(Level::Info, "sidebar sync not run: paused", &[]);
-            return;
-        }
-        match sidebar_sync::run(&self.env, &self.paths) {
-            Run::Synced(report) => {
-                self.safety
-                    .record(CheckId::MultiAccountMode, Finding::pass());
-                self.log(
-                    Level::Info,
-                    "sidebar synced",
-                    &[
-                        ("entries", Field::Number(report.written as i64)),
-                        ("folders", Field::Number(report.folders as i64)),
-                        ("not_backed_up", Field::Number(report.not_backed_up as i64)),
-                    ],
-                );
-                self.sync_note = Some(sync_note(&report));
-            }
-            Run::DesktopAccountUnknown => {
-                self.log(
-                    Level::Info,
-                    "sidebar sync not run: desktop account unknown",
-                    &[],
-                );
-                self.sync_note =
-                    Some("Couldn't tell which Profile Claude is using · nothing was synced".into());
-            }
-            Run::UnknownFields(fields) => {
-                let detail = format!(
-                    "unknown fields: {}",
-                    fields.into_iter().collect::<Vec<_>>().join(", ")
-                );
-                let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
-                self.safety.record(
-                    CheckId::SidebarEntries,
-                    Finding::fail(detail).blocking(SafetyFeature::SidebarSync, reason),
-                );
-                self.paused_sync_note();
-            }
-            Run::FoldersChanged(count) => {
-                let whose = if count > 1 { "sidebars" } else { "sidebar" };
-                let detail =
-                    format!("{count} {whose} Claude wasn't using changed since the last sync");
-                self.pause_for_multi_account(detail);
-                self.paused_sync_note();
-            }
-        }
-    }
-
-    /// The dormant multi-account mode's trace: a Safety pause of Sidebar
-    /// sync. It stays until Resume, which accepts the sidebars as they are;
-    /// the finding itself no longer blocks, so Resume shows at once.
-    fn pause_for_multi_account(&mut self, detail: String) {
-        self.safety.record(
-            CheckId::MultiAccountMode,
-            Finding::fail(detail.clone()).blocking(
-                SafetyFeature::SidebarSync,
-                "Claude wrote to a Profile it isn't using",
-            ),
-        );
-        self.settle();
-        self.safety
-            .record(CheckId::MultiAccountMode, Finding::fail(detail));
-    }
-
-    /// The sidebars' watch reported changes: Automatic mode schedules a
-    /// run, and an entry Claude wrote outside its Active Profile folder
-    /// pauses sync.
-    fn sidebar_files_changed(&mut self, changed: &[PathBuf]) {
-        let mode = self.settings.sidebar_sync;
-        let paused = self.safety.is_paused(SafetyFeature::SidebarSync);
-        if mode == SidebarSyncMode::Off {
-            return;
-        }
-        let automatic = mode == SidebarSyncMode::Automatic && !paused;
-        let elsewhere =
-            self.sidebar_watch
-                .files_changed(&self.env, &self.paths, changed, automatic);
-        if elsewhere == 0 || paused {
-            return;
-        }
-        let entries = if elsewhere == 1 { "entry" } else { "entries" };
-        self.pause_for_multi_account(format!(
-            "Claude wrote {elsewhere} Sidebar {entries} outside the Profile it's using"
-        ));
-        self.log(
-            Level::Warn,
-            "sidebar sync paused: claude wrote another profile",
-            &[("entries", Field::Number(elsewhere as i64))],
-        );
-        self.sync_note =
-            Some("Sidebar sync is paused · Claude wrote to a Profile it isn't using".into());
-    }
-
-    fn paused_sync_note(&mut self) {
-        self.settle();
-        self.log(Level::Warn, "sidebar sync stopped before writing", &[]);
-        self.sync_note =
-            Some("Sidebar sync is paused · nothing was written · see Diagnostics".into());
     }
 
     /// Reads the next batch of the Session index while a build runs.
@@ -1644,10 +1087,7 @@ impl Core {
             .filter_map(|id| {
                 let profile = signed_in.iter().find(|profile| profile.id == id)?;
                 Some(SidebarProfile {
-                    pair: DiscoveredPair {
-                        account_uuid: profile.account_uuid.clone(),
-                        organization_uuid: profile.organization_uuid.clone(),
-                    },
+                    pair: profile.key.clone(),
                     name: (self.settings.nicknames.get(&id).cloned())
                         .unwrap_or_else(|| profile.name.clone()),
                     signed_in: true,
@@ -1658,7 +1098,10 @@ impl Core {
             if !sidebars.iter().any(|sidebar| sidebar.pair == evidence.pair) {
                 sidebars.push(SidebarProfile {
                     pair: evidence.pair.clone(),
-                    name: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref())),
+                    name: evidence.hidden_title(
+                        choice.and_then(|c| c.nickname.as_deref()),
+                        &self.env.clock.time_zone(),
+                    ),
                     signed_in: false,
                 });
             }
@@ -1689,22 +1132,43 @@ impl Core {
             .collect()
     }
 
-    fn choice(&self, pair: &DiscoveredPair) -> Option<&DiscoveredChoice> {
-        self.settings.discovered_profiles.iter().find(|choice| {
-            choice.account_uuid == pair.account_uuid
-                && choice.organization_uuid == pair.organization_uuid
-        })
+    fn choice(&self, pair: &ProfileKey) -> Option<&DiscoveredChoice> {
+        self.settings
+            .discovered_profiles
+            .iter()
+            .find(|choice| choice.is(pair))
+    }
+
+    /// A Discovered Profile that became a Profile (the exact pair signed
+    /// in) hands its nickname over, unless the Profile already has one.
+    fn carry_over_nicknames(&mut self) {
+        let signed_in = self.profiles.signed_in();
+        let mut updated = self.settings.clone();
+        for choice in &mut updated.discovered_profiles {
+            let Some(profile) = signed_in.iter().find(|profile| choice.is(&profile.key)) else {
+                continue;
+            };
+            if let Some(nickname) = choice.nickname.take() {
+                updated
+                    .nicknames
+                    .entry(profile.id.clone())
+                    .or_insert(nickname);
+            }
+        }
+        updated
+            .discovered_profiles
+            .retain(|choice| choice.hidden || choice.nickname.is_some());
+        if updated != self.settings && self.save_settings(updated) {
+            self.log(Level::Info, "discovered nickname carried over", &[]);
+        }
     }
 
     /// Changes the saved choice for `pair` (creating it), dropping choices
     /// that no longer say anything.
-    fn update_choice(&mut self, pair: &DiscoveredPair, change: impl FnOnce(&mut DiscoveredChoice)) {
+    fn update_choice(&mut self, pair: &ProfileKey, change: impl FnOnce(&mut DiscoveredChoice)) {
         let mut updated = self.settings.clone();
         let choices = &mut updated.discovered_profiles;
-        let index = match choices.iter().position(|choice| {
-            choice.account_uuid == pair.account_uuid
-                && choice.organization_uuid == pair.organization_uuid
-        }) {
+        let index = match choices.iter().position(|choice| choice.is(pair)) {
             Some(index) => index,
             None => {
                 choices.push(DiscoveredChoice {
@@ -1722,9 +1186,7 @@ impl Core {
     }
 
     fn verbose_logging(&self) -> bool {
-        self.settings
-            .verbose_logging_until
-            .is_some_and(|until| until > self.env.clock.now())
+        verbose_logging(&self.settings, &self.env)
     }
 
     fn set_verbose_logging_until(&mut self, until: Option<jiff::Timestamp>) {
@@ -1761,152 +1223,20 @@ impl Core {
         }
     }
 
-    /// Remove… confirmed: signs the Profile out and deletes its folder, then
-    /// forgets its nickname and place in the order.
+    /// Remove… confirmed: starts signing the Profile out; once that worked,
+    /// its folder is deleted ([`Core::forget_removed`] follows).
     fn remove_profile(&mut self, id: &str) {
         let (profiles, ctx) = self.profiles();
-        if profiles.remove(&ctx, id) {
-            let ctx = profiles::Context {
-                env: &self.env,
-                paths: &self.paths,
-                logger: &self.logger,
-                verbose: self.verbose_logging(),
-                share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-            };
-            self.monitor.forget(&ctx, id);
-            self.notifier.forget(&ctx, id);
-            self.forget_profile_settings(id);
-        }
+        profiles.remove(&ctx, id);
     }
 
-    /// Runs the uninstall's steps in order (see [`uninstaller`]), each
-    /// skipped when already done. Stops, with a note and Retry in Settings,
-    /// where going on could break `claude` or orphan a login.
-    fn uninstall(&mut self) -> Vec<Effect> {
-        self.log(Level::Info, "uninstall started", &[]);
-        self.uninstall_note = None;
-        let mut left_to_user = Vec::new();
-        if self.profiles.signing_in() {
-            let (profiles, ctx) = self.profiles();
-            profiles.cancel(&ctx);
-        }
-        if self.desktop.waiting() {
-            let (desktop, ctx) = self.desktop();
-            desktop.cancel(&ctx);
-        }
-
-        // 1. Unhook the CLI while every Profile folder still exists.
-        self.set_cli_switching(false);
-        if cli_switcher::is_on(&self.paths) {
-            let why = self.cli_note.take().unwrap_or_default();
-            return self.stop_uninstall(format!(
-                "{why}\nUninstall stopped before signing anything out. Retry once that is fixed."
-            ));
-        }
-        left_to_user.extend(self.cli_note.take());
-
-        // 2. Remove each Profile: sign out, then delete.
-        let ids: Vec<String> = self
-            .profiles
-            .folders()
-            .into_iter()
-            .map(|(id, _)| id.to_owned())
-            .collect();
-        for id in &ids {
-            self.remove_profile(id);
-        }
-        let mut kept: Vec<String> = self
-            .profiles
-            .folders()
-            .into_iter()
-            .filter_map(|(id, _)| self.profiles.name(id))
-            .collect();
-        let unlisted = self.profiles.remove_unlisted(&self.context());
-        if unlisted > 0 {
-            kept.push(format!("{unlisted} unlisted sign-in folder(s)"));
-        }
-        if !kept.is_empty() {
-            return self.stop_uninstall(format!(
-                "Couldn't sign out {} · kept so the login can still be revoked. CLI switching is already off. Check your connection, then Retry.",
-                kept.join(", ")
-            ));
-        }
-
-        // 3. Unregister launch at login.
-        match self.env.login_item.status() {
-            LoginItemStatus::NotRegistered | LoginItemStatus::NotFound => {}
-            LoginItemStatus::Enabled | LoginItemStatus::RequiresApproval => {
-                if let Err(error) = self.env.login_item.unregister() {
-                    self.log(
-                        Level::Warn,
-                        "login item not unregistered",
-                        &[("error", Field::Text(&error))],
-                    );
-                    left_to_user.push(
-                        "Launch at login couldn't be turned off: remove AccRoster in System Settings → Login Items.".into(),
-                    );
-                }
-            }
-        }
-
-        // 4. Delete the app's folder, log included.
-        self.log(Level::Info, "uninstall deleting app folder", &[]);
-        if let Err(error) = uninstaller::delete_app_folder(&self.paths) {
-            return self.stop_uninstall(format!(
-                "Every Profile is signed out and removed, but AccRoster's folder couldn't be deleted ({error}). Retry, or delete it yourself: {}",
-                self.paths.root().display()
-            ));
-        }
-        self.uninstalled = true;
-
-        // 5. The UI moves the app to the Trash and quits.
-        let mut effects = vec![
-            Effect::StopWatchingSessionFiles,
-            Effect::StopWatchingSidebarFolders,
-        ];
-        if !left_to_user.is_empty() {
-            effects.push(Effect::Notify {
-                title: "AccRoster uninstalled · one thing left to do".into(),
-                body: left_to_user.join("\n"),
-            });
-        }
-        effects.push(Effect::TrashAppAndQuit);
-        effects
-    }
-
-    /// Ends an uninstall early: Settings shows `note` and Retry.
-    fn stop_uninstall(&mut self, note: String) -> Vec<Effect> {
-        self.log(Level::Warn, "uninstall stopped", &[]);
-        self.uninstall_note = Some(note);
-        vec![Effect::ShowSettings]
-    }
-
-    /// Points new CLI runs at Profile `next`, or at Default (`~/.claude`,
-    /// no pointer) for `None`, before the CLI's Active Profile is removed.
-    /// Returns whether that worked; the removal waits for it.
-    fn point_cli_elsewhere(&mut self, next: Option<&str>) -> bool {
-        let result = match next {
-            Some(next) => match self.profiles.config_dir(next) {
-                Some(config_dir) => cli_switcher::set_pointer(&self.paths, config_dir),
-                None => return false,
-            },
-            None => cli_switcher::clear_pointer(&self.paths),
-        };
-        match result {
-            Ok(()) => {
-                self.log(Level::Info, "cli profile moved before removal", &[]);
-                true
-            }
-            Err(error) => {
-                let error = error.to_string();
-                self.log(
-                    Level::Error,
-                    "cli profile not moved",
-                    &[("error", Field::Text(&error))],
-                );
-                false
-            }
-        }
+    /// A removed Profile: forgets its readings, fired notifications,
+    /// nickname, mute and place in the order.
+    fn forget_removed(&mut self, id: &str) {
+        let ctx = context!(self);
+        self.monitor.forget(&ctx, id);
+        self.notifier.forget(&ctx, id);
+        self.forget_profile_settings(id);
     }
 
     /// Drops a removed Profile's nickname and place in the order.
@@ -1995,146 +1325,19 @@ impl Core {
         Vec::new()
     }
 
-    /// The CLI switching switch: on appends the `.zshrc` block and installs
-    /// the shim; off removes them and the pointer, or lists the lines of an
-    /// edited block for the user to remove.
-    fn set_cli_switching(&mut self, on: bool) {
-        if on && self.safety.is_paused(SafetyFeature::CliSwitching) {
-            self.cli_note =
-                Some("CLI switching is paused · see Diagnostics for why and to resume it".into());
-            return;
-        }
-        let now = self.env.clock.now();
-        let result = if on {
-            cli_switcher::turn_on(&self.paths, &self.env.home, now).map(|()| TurnedOff::Clean)
-        } else {
-            cli_switcher::turn_off(&self.paths, &self.env.home, now)
-        };
-        let state = if on { "on" } else { "off" };
-        match result {
-            Ok(TurnedOff::Clean) => {
-                self.cli_note = None;
-                self.log(
-                    Level::Info,
-                    "cli switching changed",
-                    &[("state", Field::Word(state))],
-                );
-            }
-            Ok(TurnedOff::EditedBlock(lines)) => {
-                self.cli_note = Some(format!(
-                    "Your AccRoster block in ~/.zshrc was edited, so it was left in place. Remove these lines yourself:\n{}",
-                    lines.join("\n")
-                ));
-                self.log(
-                    Level::Info,
-                    "cli switching changed",
-                    &[
-                        ("state", Field::Word(state)),
-                        ("zshrc", Field::Word("edited")),
-                    ],
-                );
-            }
-            Err(error) => {
-                self.cli_note = Some(format!("Couldn't turn CLI switching {state}: {error}"));
-                let error = error.to_string();
-                self.log(
-                    Level::Error,
-                    "cli switching not changed",
-                    &[
-                        ("state", Field::Word(state)),
-                        ("error", Field::Text(&error)),
-                    ],
-                );
-            }
-        }
-    }
-
-    /// Makes Profile `id` the CLI's Active Profile by rewriting only the
-    /// pointer. Ignored while CLI switching is off.
-    fn use_for_new_cli_runs(&mut self, id: &str) {
-        if !cli_switcher::is_on(&self.paths) {
-            return;
-        }
-        // The shared settings may have changed since the menu opened.
-        if self.safety.check_settings_env(&self.env, true) {
-            self.settle();
-        }
-        if self.safety.is_paused(SafetyFeature::CliSwitching) {
-            self.log(Level::Info, "cli profile not chosen: paused", &[]);
-            return;
-        }
-        let Some(config_dir) = self.profiles.config_dir(id).map(Path::to_path_buf) else {
-            return;
-        };
-        match cli_switcher::set_pointer(&self.paths, &config_dir) {
-            Ok(()) => self.log(
-                Level::Info,
-                "cli profile chosen",
-                &[("profile", Field::Profile(id))],
-            ),
-            Err(error) => {
-                let error = error.to_string();
-                self.log(
-                    Level::Error,
-                    "cli profile not chosen",
-                    &[
-                        ("profile", Field::Profile(id)),
-                        ("error", Field::Text(&error)),
-                    ],
-                );
-            }
-        }
-    }
-
     /// The Desktop bridge, with what it needs from the rest of the core.
-    /// A Guided switch the guard let through: syncs the sidebars first when
-    /// Sidebar sync is on (so the target's sidebar has every Session when
-    /// Claude opens it), then brings Claude forward.
-    fn guide_desktop_switch(&mut self, cleared: Option<Target>) -> Vec<Effect> {
-        let Some(target) = cleared else {
-            return Vec::new();
-        };
-        if self.settings.sidebar_sync != SidebarSyncMode::Off {
-            self.sync_sidebar();
-        }
-        let (desktop, ctx) = self.desktop();
-        desktop.guide(&ctx, target)
-    }
-
     fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
-        let verbose = self.verbose_logging();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose,
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        (&mut self.desktop, ctx)
+        (&mut self.desktop, context!(self))
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
     fn profiles(&mut self) -> (&mut ProfileRegistry, profiles::Context<'_>) {
-        let verbose = self.verbose_logging();
-        let ctx = profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose,
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        };
-        (&mut self.profiles, ctx)
+        (&mut self.profiles, context!(self))
     }
 
     /// What the registry and the monitor need from the rest of the core.
     fn context(&self) -> profiles::Context<'_> {
-        profiles::Context {
-            env: &self.env,
-            paths: &self.paths,
-            logger: &self.logger,
-            verbose: self.verbose_logging(),
-            share_transcripts: !self.safety.is_paused(SafetyFeature::TranscriptSharing),
-        }
+        context!(self)
     }
 
     fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
@@ -2146,46 +1349,6 @@ impl Core {
             fields,
         );
     }
-}
-
-/// "Claude 3.6556.2", or "Claude" when the desktop app's version is unknown.
-fn desktop_name(versions: &ClaudeVersions) -> String {
-    match &versions.desktop {
-        Some(version) => format!("Claude {version}"),
-        None => "Claude".to_owned(),
-    }
-}
-
-/// Settings' line after a sync.
-fn sync_note(report: &sidebar_sync::Report) -> String {
-    let mut note = if report.written == 0 {
-        "Every sidebar was already in sync".to_owned()
-    } else {
-        let entries = if report.written == 1 {
-            "entry"
-        } else {
-            "entries"
-        };
-        let profiles = if report.folders == 1 {
-            "Profile"
-        } else {
-            "Profiles"
-        };
-        format!(
-            "Updated {} Sidebar {entries} in {} {profiles}",
-            report.written, report.folders
-        )
-    };
-    if report.left_desktop_account {
-        note.push_str(" · the Profile Claude is using syncs once Claude is quit");
-    }
-    if report.not_backed_up > 0 {
-        note.push_str(&format!(
-            " · {} couldn't be backed up and were left as they were",
-            report.not_backed_up
-        ));
-    }
-    note
 }
 
 /// A row's tightest limit: its highest bar, unknown limit kinds included.
@@ -2206,14 +1369,6 @@ fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom>
             tightest(&listed.row)?,
         ))
     }))
-}
-
-fn feature_word(feature: SafetyFeature) -> &'static str {
-    match feature {
-        SafetyFeature::CliSwitching => "cli_switching",
-        SafetyFeature::TranscriptSharing => "transcript_sharing",
-        SafetyFeature::SidebarSync => "sidebar_sync",
-    }
 }
 
 /// The Settings toggle shows what macOS has now, not what the app last asked.

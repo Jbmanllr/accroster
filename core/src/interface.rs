@@ -61,11 +61,11 @@ pub enum Command {
     OpenLimitResets,
     /// A Discovered Profile's row: Add Profile… aimed at that pair (passing
     /// its email to the sign-in when known).
-    SignInDiscovered(DiscoveredPair),
+    SignInDiscovered(ProfileKey),
     /// Hide in a Discovered Profile's submenu.
-    HideDiscovered(DiscoveredPair),
+    HideDiscovered(ProfileKey),
     /// Restore in Settings > Hidden (n)….
-    UnhideDiscovered(DiscoveredPair),
+    UnhideDiscovered(ProfileKey),
     /// Rename… in a submenu: asks the UI for a nickname
     /// ([`Effect::AskNickname`]).
     Rename(NicknameTarget),
@@ -167,16 +167,53 @@ pub enum SidebarSyncMode {
 pub enum SafetyFeature {
     /// The pointer and row clicks.
     CliSwitching,
-    /// The Profile links that share Transcripts and resume data
-    /// (`projects`, `file-history`, `session-env`).
-    TranscriptSharing,
+    /// Creating or repairing the links from Profile folders to
+    /// `~/.claude` (a replaced `projects`, `file-history` or `session-env`
+    /// link pauses them).
+    Links,
+    /// Writing a Profile's `.claude.json`: seeding it from `~/.claude.json`,
+    /// and putting its Login back after another Login's sign-in there was
+    /// undone.
+    Seeding,
     /// Copying Sidebar entries between Profiles.
     SidebarSync,
 }
 
-/// A Discovered Profile's identity: an account uuid and an Organization uuid.
+impl SafetyFeature {
+    pub const ALL: [SafetyFeature; 4] = [
+        SafetyFeature::CliSwitching,
+        SafetyFeature::Links,
+        SafetyFeature::Seeding,
+        SafetyFeature::SidebarSync,
+    ];
+
+    /// How the menu, notifications and Diagnostics name it ("Resume
+    /// <name>", "<name> paused").
+    pub fn name(self) -> &'static str {
+        match self {
+            SafetyFeature::CliSwitching => "CLI switching",
+            SafetyFeature::Links => "Profile links",
+            SafetyFeature::Seeding => "Seeding .claude.json",
+            SafetyFeature::SidebarSync => "Sidebar sync",
+        }
+    }
+
+    /// Its key in `state/safety.json` and the log.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            SafetyFeature::CliSwitching => "cliSwitching",
+            SafetyFeature::Links => "links",
+            SafetyFeature::Seeding => "seeding",
+            SafetyFeature::SidebarSync => "sidebarSync",
+        }
+    }
+}
+
+/// What tells Profiles apart: a Login's account uuid and an Organization
+/// uuid. A Discovered Profile is known by its key alone; a Sidebar folder is
+/// `claude-code-sessions/<account>/<org>/`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DiscoveredPair {
+pub struct ProfileKey {
     pub account_uuid: String,
     pub organization_uuid: String,
 }
@@ -186,7 +223,7 @@ pub struct DiscoveredPair {
 pub enum NicknameTarget {
     /// A Profile, by id.
     Profile(String),
-    Discovered(DiscoveredPair),
+    Discovered(ProfileKey),
 }
 
 impl Command {
@@ -498,7 +535,7 @@ pub struct DiscoveredRow {
     /// `email · Organization`, else "Unknown Login".
     pub title: String,
     /// A second line for an Unknown Login: Session count, last activity and
-    /// "Desktop's last account" when it applies.
+    /// "Desktop's last Login" when it applies.
     pub subtitle: Option<String>,
     /// Sent when the row is clicked: [`Command::SignInDiscovered`].
     pub command: Command,
@@ -557,6 +594,9 @@ pub struct SettingsView {
     pub verbose_logging_note: String,
     pub launch_at_login: LaunchAtLoginView,
     pub cli_switching: CliSwitchingView,
+    /// Profiles: every Profile, in the user's order, to reorder, rename and
+    /// mute.
+    pub profiles: Vec<ProfileSettings>,
     /// Profiles > Hidden (n)…: each hidden Discovered Profile still on the
     /// Mac.
     pub hidden_discovered: Vec<HiddenDiscovered>,
@@ -595,7 +635,31 @@ pub struct SidebarSyncView {
     pub note: Option<String>,
 }
 
-/// One entry of Settings > Hidden (n)….
+/// One Profile in Settings > Profiles, in the user's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSettings {
+    /// The nickname, else `email · Organization`.
+    pub title: String,
+    /// `email · Organization`, when a nickname titles the line.
+    pub detail: Option<String>,
+    /// `None` for the first Profile.
+    pub move_up: Option<Command>,
+    /// `None` for the last Profile.
+    pub move_down: Option<Command>,
+    /// Asks for the nickname.
+    pub rename: Command,
+    /// Mute notifications; `None` for a Profile with no Login.
+    pub mute: Option<Toggle>,
+}
+
+/// A checkbox: whether it is on, and what clicking it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toggle {
+    pub on: bool,
+    pub command: Command,
+}
+
+/// One hidden Discovered Profile in Settings > Hidden (n)….
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiddenDiscovered {
     /// The nickname, else `email · Organization`, else "Unknown Login" with
@@ -635,7 +699,7 @@ pub enum SessionFilter {
     /// Sessions whose working folder is this absolute path.
     Project(String),
     /// Sessions with an entry in this Profile's Sidebar (archived or not).
-    Sidebar(DiscoveredPair),
+    Sidebar(ProfileKey),
     /// Sessions with no Sidebar entry in any Profile.
     CliOnly,
 }

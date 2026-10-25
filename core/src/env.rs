@@ -11,8 +11,8 @@
 //! - [`Environment::inherited_vars`]: the environment variables the app was
 //!   started with. Spawns build their environment from these, so the core can
 //!   decide what to clear (`CLAUDE*`, `ANTHROPIC_*`) and what to pass through.
-//! - [`ProcessSpawner`]: runs an external program to completion, or starts
-//!   one that can be polled and killed (a browser sign-in). The only spawned
+//! - [`ProcessSpawner`]: starts an external program that the core polls on
+//!   later ticks and kills at its deadline; nothing waits on one. The only spawned
 //!   program is Claude Code (`claude`), resolved through the `PATH` of the
 //!   request's environment; tests put a stub `claude` first on that `PATH`.
 //! - [`Clock`]: the current time.
@@ -100,14 +100,12 @@ impl SpawnOutput {
 
 /// Runs external programs.
 pub trait ProcessSpawner: Send {
-    /// Runs the program and waits for it. `Err` means it could not be started
-    /// (for example, not found on `PATH`); a non-zero exit is an `Ok`.
-    fn run(&self, request: &SpawnRequest) -> io::Result<SpawnOutput>;
-
-    /// Starts the program and returns at once, for runs that may take minutes
-    /// and must be cancellable (a browser sign-in). The child's stdin receives
-    /// `request.stdin`, if any, and then stays open until the child exits or
-    /// is killed. `Err` means it could not be started.
+    /// Starts the program and returns at once. Nothing on the core thread
+    /// waits for a program: the core polls it on later ticks and kills it
+    /// at its deadline. The child's stdin receives `request.stdin`, if any,
+    /// and then stays open until it is closed, the child exits or is killed.
+    /// `Err` means it could not be started (for example, not found on
+    /// `PATH`).
     fn start(&self, request: &SpawnRequest) -> io::Result<Box<dyn RunningProcess>>;
 }
 
@@ -175,31 +173,6 @@ const MANAGED_SETTINGS: &str = "/Library/Application Support/ClaudeCode/managed-
 pub struct SystemSpawner;
 
 impl ProcessSpawner for SystemSpawner {
-    fn run(&self, request: &SpawnRequest) -> io::Result<SpawnOutput> {
-        let mut command = command_for(request)?;
-        command.stdin(if request.stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-        let mut child = command.spawn()?;
-        if let Some(input) = &request.stdin {
-            // Take stdin so it is closed (EOF) once written.
-            let mut stdin = child.stdin.take().expect("stdin was piped");
-            match stdin.write_all(input) {
-                // A child that exits without reading its input is not an error.
-                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
-                other => other?,
-            }
-        }
-        let output = child.wait_with_output()?;
-        Ok(SpawnOutput {
-            exit_code: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
-    }
-
     fn start(&self, request: &SpawnRequest) -> io::Result<Box<dyn RunningProcess>> {
         let mut command = command_for(request)?;
         command.stdin(Stdio::piped());

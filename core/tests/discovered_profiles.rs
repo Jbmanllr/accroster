@@ -85,7 +85,7 @@ fn a_sidebar_folder_with_entries_is_an_unknown_login_with_its_sessions() {
     assert_eq!(rows[0].title, "Sign in to Unknown Login…");
     assert_eq!(
         rows[0].subtitle.as_deref(),
-        Some("2 Sessions · last active Oct 24 · Desktop's last account")
+        Some("2 Sessions · last active Oct 24 · Desktop's last Login")
     );
     assert_eq!(
         details(&rows[0]),
@@ -263,8 +263,71 @@ fn signing_in_as_another_account_keeps_it_and_leaves_the_discovered_profile() {
     assert_eq!(
         warnings(&core),
         [
-            "Signed in as me@work.example · Work Inc, not Unknown Login (account 55555555) · to add it, pick that account and Organization in the browser"
+            "Signed in as me@work.example · Work Inc, not Unknown Login · to add it, pick that Login and Organization in the browser"
+        ],
+        "no uuid outside hover detail"
+    );
+}
+
+#[test]
+fn a_mismatch_names_the_discovered_profile_by_its_nickname() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "a", &entry(OCT_24));
+    let mut core = mac.launch();
+    let unknown = discovered(&core)
+        .into_iter()
+        .find(|row| row.title == "Sign in to Unknown Login…")
+        .unwrap();
+    rename(&mut core, &unknown, "Team");
+    let team = discovered(&core)
+        .into_iter()
+        .find(|row| row.title == "Sign in to Team…")
+        .unwrap();
+
+    core.command(team.command.clone());
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(
+        warnings(&core),
+        [
+            "Signed in as me@work.example · Work Inc, not Team · to add it, pick that Login and Organization in the browser"
         ]
+    );
+}
+
+/// Rename… on a Discovered Profile's row, answered with `nickname`.
+fn rename(core: &mut Core, row: &DiscoveredRow, nickname: &str) {
+    let effects = click_in(core, row, "Rename…");
+    let [Effect::AskNickname { target, .. }] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    core.command(Command::SetNickname {
+        target: target.clone(),
+        nickname: Some(nickname.into()),
+    });
+}
+
+#[test]
+fn a_discovered_profiles_nickname_carries_over_to_the_profile_it_becomes() {
+    let work = FixtureLogin::new(WORK_ACCOUNT, WORK_ORG, "me@work.example", "Work Inc");
+    let mac = mac_signing_in_as(&work, limits_body());
+    mac.write_json(".claude.json", &json!({"hasCompletedOnboarding": true}));
+    mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "a", &entry(OCT_24));
+    let mut core = mac.launch();
+    let unknown = discovered(&core).remove(0);
+    rename(&mut core, &unknown, "Work");
+    let row = discovered(&core).remove(0);
+
+    core.command(row.command.clone());
+    wait_for_sign_in(&mut core);
+
+    assert_eq!(profile_titles(&core), ["Work"]);
+    assert!(discovered(&core).is_empty());
+    drop(core);
+    assert_eq!(
+        profile_titles(&mac.launch()),
+        ["Work"],
+        "kept after a relaunch"
     );
 }
 
@@ -288,7 +351,10 @@ fn a_hidden_discovered_profile_is_remembered_and_restorable_from_settings() {
     assert_eq!(titles(&core).len(), 1, "Hide is remembered");
     let hidden = core.view().settings.hidden_discovered;
     assert_eq!(hidden.len(), 1, "Settings > Hidden (1)…");
-    assert_eq!(hidden[0].title, "Unknown Login (account 55555555)");
+    assert_eq!(
+        hidden[0].title, "Unknown Login · 1 Session · last active Oct 24",
+        "no uuid outside hover detail"
+    );
     assert_eq!(
         sidebar_files(&mac),
         sidebar_before,

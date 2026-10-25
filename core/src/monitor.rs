@@ -71,6 +71,20 @@ pub(crate) struct Completed {
     pub id: String,
     /// `None` when Claude Code gave no readable answer.
     pub reply: Option<UsageReply>,
+    /// Ask `claude auth status` whether the Login is gone: the first read
+    /// of a run of failures that Claude Code exited with an error while
+    /// online.
+    pub check_login: bool,
+}
+
+/// How a read ended.
+enum ReadEnd {
+    Reply(UsageReply),
+    /// Claude Code exited with an error and no readable answer.
+    Failed,
+    /// No readable answer otherwise: output in an unknown format, a read
+    /// killed at its timeout, or one that couldn't start.
+    Unreadable,
 }
 
 /// What a Profile's row shows about its limits.
@@ -113,6 +127,8 @@ struct Watch {
     refresh_requested: bool,
     /// Set after failed fetches; persisted in `state/backoff.json`.
     backoff: Option<Backoff>,
+    /// `auth status` was already asked during this run of failed reads.
+    login_checked: bool,
 }
 
 impl Watch {
@@ -489,7 +505,8 @@ impl LimitMonitor {
                         ("error", Field::Text(&error)),
                     ],
                 );
-                Some(self.complete(ctx, &watched, now, None, true))
+                let online = !self.offline;
+                Some(self.complete(ctx, &watched, now, ReadEnd::Unreadable, online))
             }
         }
     }
@@ -521,9 +538,10 @@ impl LimitMonitor {
             went_offline,
             ..
         } = self.running.take().expect("checked above");
+        let online = !went_offline && !self.offline;
+        let exited_with_error = output.as_ref().is_some_and(|output| !output.succeeded());
         if let Some(reply) = output.and_then(|output| step.parse(&output.stdout)) {
-            let online = !went_offline && !self.offline;
-            return Some(self.complete(ctx, &watched, spawned_at, Some(reply), online));
+            return Some(self.complete(ctx, &watched, spawned_at, ReadEnd::Reply(reply), online));
         }
         if step == UsageRead::GetUsage && !timed_out {
             return self.start(ctx, watched, UsageRead::SlashUsage);
@@ -533,7 +551,12 @@ impl LimitMonitor {
             "limits unreadable",
             &[("profile", Field::Profile(&watched.id))],
         );
-        Some(self.complete(ctx, &watched, spawned_at, None, true))
+        let end = if exited_with_error {
+            ReadEnd::Failed
+        } else {
+            ReadEnd::Unreadable
+        };
+        Some(self.complete(ctx, &watched, spawned_at, end, online))
     }
 
     /// Records a finished read. `online`: the network was up throughout, so
@@ -543,12 +566,27 @@ impl LimitMonitor {
         ctx: &Context,
         watched: &Watched,
         spawned_at: Timestamp,
-        reply: Option<UsageReply>,
+        end: ReadEnd,
         online: bool,
     ) -> Completed {
         let now = ctx.env.clock.now();
         let watch = self.watches.entry(watched.id.clone()).or_default();
         let backoff_before = watch.backoff;
+        // `auth status` can tell a lost login from a broken read, but a
+        // short-lived `claude` can start a token refresh and exit before
+        // saving it: asked once per run of failed reads, only after Claude
+        // Code itself failed while online.
+        let check_login = matches!(end, ReadEnd::Failed) && online && !watch.login_checked;
+        let reply = match end {
+            ReadEnd::Reply(reply) => {
+                watch.login_checked = false;
+                Some(reply)
+            }
+            ReadEnd::Failed | ReadEnd::Unreadable => {
+                watch.login_checked |= check_login;
+                None
+            }
+        };
         match &reply {
             Some(answer) if answer.limits.is_some() => {
                 watch.read_at = Some(
@@ -587,6 +625,7 @@ impl LimitMonitor {
         Completed {
             id: watched.id.clone(),
             reply,
+            check_login,
         }
     }
 

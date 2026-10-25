@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use accroster_core::{Command, Core, Effect, Event, LoginItem, LoginItemStatus};
+use accroster_core::{Command, Core, Effect, Event, LoginItem, LoginItemStatus, UninstallView};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 
@@ -41,13 +41,15 @@ fn installed() -> (FakeMac, Core) {
     (mac, core)
 }
 
-/// Uninstall… then its confirmation's button.
+/// Uninstall… then its confirmation's button, until its sign-outs ended.
 fn uninstall(core: &mut Core) -> Vec<Effect> {
     let Some(Effect::ConfirmUninstall { confirm, .. }) = core.command(Command::AskUninstall).pop()
     else {
         panic!("Uninstall… asks first");
     };
-    core.command(confirm)
+    let mut effects = core.command(confirm);
+    effects.extend(settle(core));
+    effects
 }
 
 /// `claude` runs the real binary, in a terminal opened before the uninstall
@@ -208,7 +210,16 @@ fn a_failed_sign_out_keeps_that_folder_stops_before_the_app_folder_and_offers_re
     assert_claude_works(&mac);
 
     mac.claude.reply(StubCall::AuthLogout, signed_out());
-    let effects = core.command(Command::Uninstall);
+    let mut effects = core.command(Command::Uninstall);
+    assert_eq!(
+        core.view().settings.uninstall,
+        UninstallView {
+            note: Some("Uninstalling · signing every Profile out…".into()),
+            retry: None,
+        },
+        "while it signs out"
+    );
+    effects.extend(settle(&mut core));
 
     assert_eq!(effects.last(), Some(&Effect::TrashAppAndQuit));
     assert_eq!(logouts(&mac), 3);

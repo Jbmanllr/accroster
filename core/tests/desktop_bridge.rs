@@ -95,11 +95,51 @@ fn the_desktop_badge_and_header_follow_the_account_and_the_folder_claude_writes(
     sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
     assert_eq!(
         header(&core).as_deref(),
-        Some(format!("Desktop: {WORK}").as_str())
+        Some("CLI: Default    Desktop: me")
     );
     let rows = rows(&core);
     assert_eq!(row(&rows, WORK).badges, ["Desktop"]);
     assert!(row(&rows, PERSO).badges.is_empty());
+}
+
+/// Names the Profile in the row titled `title` `nickname`.
+fn nickname(core: &mut Core, title: &str, nickname: &str) {
+    let effects = click_in_row(core, title, "Rename…");
+    let [Effect::AskNickname { target, .. }] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    core.command(Command::SetNickname {
+        target: target.clone(),
+        nickname: Some(nickname.into()),
+    });
+}
+
+#[test]
+fn the_header_names_each_clients_active_profile_by_its_short_name() {
+    let (mac, mut core) = mac_with_two_profiles();
+    nickname(&mut core, PERSO, "Perso");
+    nickname(&mut core, WORK, "Work");
+    desktop_signed_in_as(&mac, &work());
+    sidebar_entry(&mac, &work(), "a", "Fix the build", Duration::from_secs(60));
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: Default    Desktop: Work"),
+        "the CLI part shows with CLI switching off"
+    );
+
+    core.command(Command::SetCliSwitching(true));
+    let perso = rows(&core)[0].command.clone().expect("rows switch the CLI");
+    core.command(perso);
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: Perso    Desktop: Work")
+    );
+
+    let work_row = rows(&core)[1].command.clone().expect("rows switch the CLI");
+    core.command(work_row);
+    assert_eq!(header(&core).as_deref(), Some("CLI: Work    Desktop: Work"));
+    assert_eq!(row(&rows(&core), "Work").badges, ["CLI", "Desktop"]);
+    assert!(row(&rows(&core), "Perso").badges.is_empty());
 }
 
 #[test]
@@ -116,7 +156,7 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
     sidebar_entry(&mac, &other_org, "b", "New", Duration::from_secs(10));
     assert_eq!(
         header(&core).as_deref(),
-        Some("Desktop: another account"),
+        Some("CLI: Default    Desktop: another Profile"),
         "the newest folder belongs to no Profile"
     );
     assert!(rows(&core).iter().all(|row| row.badges.is_empty()));
@@ -124,7 +164,7 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
     sidebar_entry(&mac, &work(), "c", "Newer", Duration::from_secs(1));
     assert_eq!(
         header(&core).as_deref(),
-        Some(format!("Desktop: {WORK}").as_str())
+        Some("CLI: Default    Desktop: me")
     );
 }
 
@@ -141,7 +181,7 @@ fn the_desktop_config_is_read_for_its_account_only_and_never_logged() {
     assert!(!view.contains("sk-ant"), "{view}");
     assert_eq!(
         header(&core).as_deref(),
-        Some(format!("Desktop: {PERSO}").as_str())
+        Some("CLI: Default    Desktop: me")
     );
 }
 
@@ -560,7 +600,10 @@ fn the_switch_is_confirmed_from_the_folder_claude_writes() {
         }]
     );
     assert_eq!(warnings(&core), [format!("Claude now uses {WORK}")]);
-    assert_eq!(header(&core), Some(format!("Desktop: {WORK}")));
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: Default    Desktop: me")
+    );
     assert_eq!(row(&rows(&core), WORK).badges, ["Desktop"]);
 }
 
@@ -580,13 +623,13 @@ fn a_folder_of_another_account_is_flagged_as_a_mismatch() {
     assert_eq!(
         effects,
         [Effect::Notify {
-            title: "Claude signed in to another account".into(),
-            body: format!("Claude signed in as another account, not {WORK}"),
+            title: "Claude signed in to another Profile".into(),
+            body: format!("Claude signed in as another Profile, not {WORK}"),
         }]
     );
     assert_eq!(
         warnings(&core),
-        [format!("Claude signed in as another account, not {WORK}")]
+        [format!("Claude signed in as another Profile, not {WORK}")]
     );
 }
 

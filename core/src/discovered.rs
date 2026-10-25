@@ -21,7 +21,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::interface::{Command, DiscoveredPair, DiscoveredRow, MenuItem, NicknameTarget};
+use crate::claude_json;
+use crate::desktop::{self, DesktopPaths};
+use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 
 /// The desktop loader skips Sidebar entries over this size.
 const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
@@ -29,7 +31,7 @@ const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Evidence {
-    pub pair: DiscoveredPair,
+    pub pair: ProfileKey,
     /// Names from an `oauthAccount` for this exact pair, if any.
     login: Option<Login>,
     /// Readable Sidebar entries in the pair's folder.
@@ -58,29 +60,46 @@ impl Evidence {
             .filter(|email| !email.is_empty())
     }
 
-    /// `email · Organization`, else "Unknown Login (account 55555555)".
+    /// `email · Organization`, else "Unknown Login". A uuid appears only in
+    /// hover detail.
     pub fn known_name(&self) -> String {
         match &self.login {
             Some(login) => format!("{} · {}", login.email, login.organization_name),
-            None => format!("Unknown Login (account {})", short(&self.pair.account_uuid)),
+            None => "Unknown Login".to_owned(),
         }
     }
 
     /// The nickname, else `email · Organization`, else "Unknown Login".
-    fn name(&self, nickname: Option<&str>) -> String {
-        match (nickname, &self.login) {
-            (Some(nickname), _) => nickname.to_owned(),
-            (None, Some(login)) => format!("{} · {}", login.email, login.organization_name),
-            (None, None) => "Unknown Login".to_owned(),
+    pub fn name(&self, nickname: Option<&str>) -> String {
+        nickname.map_or_else(|| self.known_name(), str::to_owned)
+    }
+
+    /// The Settings > Hidden entry's title: the name, with what tells an
+    /// Unknown Login apart ("Unknown Login · 3 Sessions · last active Oct
+    /// 24"), dates in `tz`.
+    pub fn hidden_title(&self, nickname: Option<&str>, tz: &TimeZone) -> String {
+        match (nickname, self.evidence_line(tz)) {
+            (None, Some(line)) => format!("{} · {line}", self.known_name()),
+            _ => self.name(nickname),
         }
     }
 
-    /// The Settings > Hidden entry's title.
-    pub fn hidden_title(&self, nickname: Option<&str>) -> String {
-        match nickname {
-            Some(nickname) => nickname.to_owned(),
-            None => self.known_name(),
-        }
+    /// What tells an Unknown Login apart: its Sessions, last activity and
+    /// whether it is the desktop's last Login. `None` for a named Login.
+    fn evidence_line(&self, tz: &TimeZone) -> Option<String> {
+        self.login.is_none().then(|| {
+            let mut parts = vec![match self.sessions {
+                1 => "1 Session".to_owned(),
+                n => format!("{n} Sessions"),
+            }];
+            if let Some(last) = self.last_activity {
+                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
+            }
+            if self.desktop_last {
+                parts.push("Desktop's last Login".to_owned());
+            }
+            parts.join(" · ")
+        })
     }
 
     /// The menu row, with dates in `tz`.
@@ -93,19 +112,7 @@ impl Evidence {
             ),
             _ => format!("Sign in to {name}…"),
         };
-        let subtitle = self.login.is_none().then(|| {
-            let mut parts = vec![match self.sessions {
-                1 => "1 Session".to_owned(),
-                n => format!("{n} Sessions"),
-            }];
-            if let Some(last) = self.last_activity {
-                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
-            }
-            if self.desktop_last {
-                parts.push("Desktop's last account".to_owned());
-            }
-            parts.join(" · ")
-        });
+        let subtitle = self.evidence_line(tz);
         let mut submenu = Vec::new();
         if let Some(as_of) = self.login.as_ref().and_then(|login| login.as_of) {
             submenu.push(MenuItem::Detail(format!(
@@ -142,8 +149,8 @@ impl Evidence {
 /// then the most recently active.
 pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
     let desktop = home.join("Library/Application Support/Claude");
-    let desktop_last = last_known_account(&desktop.join("config.json"));
-    let mut found: BTreeMap<DiscoveredPair, Evidence> = BTreeMap::new();
+    let desktop_last = desktop::last_known_account(&DesktopPaths::new(home));
+    let mut found: BTreeMap<ProfileKey, Evidence> = BTreeMap::new();
     for (pair, sessions, last_activity) in sidebar_pairs(&desktop.join("claude-code-sessions")) {
         found.insert(
             pair.clone(),
@@ -183,7 +190,7 @@ pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
 
 /// `<account>/<org>/` folders holding at least one readable Sidebar entry,
 /// with their entry count and newest activity.
-fn sidebar_pairs(root: &Path) -> Vec<(DiscoveredPair, usize, Option<Timestamp>)> {
+fn sidebar_pairs(root: &Path) -> Vec<(ProfileKey, usize, Option<Timestamp>)> {
     let mut pairs = Vec::new();
     for account in subfolders(root) {
         for org in subfolders(&root.join(&account)) {
@@ -218,7 +225,7 @@ fn sidebar_pairs(root: &Path) -> Vec<(DiscoveredPair, usize, Option<Timestamp>)>
                 .filter_map(|ms| Timestamp::from_millisecond(ms).ok())
                 .max();
             pairs.push((
-                DiscoveredPair {
+                ProfileKey {
                     account_uuid: account.clone(),
                     organization_uuid: org,
                 },
@@ -241,39 +248,20 @@ fn subfolders(path: &Path) -> Vec<String> {
 }
 
 /// `oauthAccount` in `~/.claude.json`.
-fn cli_login(path: &Path) -> Option<(DiscoveredPair, Login)> {
-    let bytes = fs::read(path).ok()?;
-    let body: Value = serde_json::from_slice(&bytes).ok()?;
-    let account = body.get("oauthAccount")?;
-    let text = |key: &str| account.get(key).and_then(Value::as_str).map(str::to_owned);
-    let as_of = account
-        .get("profileFetchedAt")
-        .and_then(Value::as_i64)
-        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-        .or_else(|| {
-            let modified = fs::metadata(path).ok()?.modified().ok()?;
-            Timestamp::try_from(modified).ok()
-        });
+fn cli_login(path: &Path) -> Option<(ProfileKey, Login)> {
+    let account = claude_json::read_account(path)?;
+    let as_of = account.profile_fetched_at.or_else(|| {
+        let modified = fs::metadata(path).ok()?.modified().ok()?;
+        Timestamp::try_from(modified).ok()
+    });
     Some((
-        DiscoveredPair {
-            account_uuid: text("accountUuid")?,
-            organization_uuid: text("organizationUuid")?,
-        },
+        account.key,
         Login {
-            email: text("emailAddress").unwrap_or_default(),
-            organization_name: text("organizationName").unwrap_or_default(),
+            email: account.email,
+            organization_name: account.organization_name,
             as_of,
         },
     ))
-}
-
-/// `lastKnownAccountUuid` from the desktop's `config.json`. Only that key is
-/// read; the file also holds tokens.
-fn last_known_account(path: &Path) -> Option<String> {
-    let body: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    body.get("lastKnownAccountUuid")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 /// The first 8 characters of a uuid.

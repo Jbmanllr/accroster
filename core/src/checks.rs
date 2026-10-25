@@ -13,31 +13,27 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::interface::SafetyFeature;
-use crate::safety::{Finding, reportable};
+use crate::claude_json;
+use crate::interface::{ClaudeVersions, SafetyFeature};
+use crate::profiles::{Account, CrossCheckAnswer};
+use crate::safety::{Finding, claude_code_name, reportable};
 
 /// `oauthAccount` and `cachedUsageUtilization` in each Profile's
-/// `.claude.json`. A malformed `oauthAccount` pauses CLI switching: the app
-/// could no longer tell which account a folder is.
+/// `.claude.json`. A malformed `oauthAccount` pauses CLI switching (the app
+/// could no longer tell which account a folder is) and Seeding (the app
+/// would write a file whose format changed).
 pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Finding) {
     let mut accounts_seen = 0;
     let mut bad_accounts = BTreeSet::new();
     let mut caches_seen = 0;
     let mut bad_caches = BTreeSet::new();
     for folder in folders {
-        let Some(body) = fs::read(folder.join(".claude.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
+        let Some(body) = claude_json::read(&folder.join(".claude.json")) else {
             continue;
         };
-        if let Some(account) = body.get("oauthAccount").filter(|v| !v.is_null()) {
+        if let Some(account) = claude_json::oauth_account(&body) {
             accounts_seen += 1;
-            for key in ["accountUuid", "organizationUuid", "emailAddress"] {
-                if !account.get(key).is_some_and(Value::is_string) {
-                    bad_accounts.insert(key);
-                }
-            }
+            bad_accounts.extend(account.bad_keys);
         }
         if let Some(cache) = body.get("cachedUsageUtilization").filter(|v| !v.is_null()) {
             caches_seen += 1;
@@ -54,10 +50,10 @@ pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Findin
     } else if bad_accounts.is_empty() {
         Finding::pass()
     } else {
-        Finding::fail(format!("missing or not text: {}", join(&bad_accounts))).blocking(
-            SafetyFeature::CliSwitching,
-            format!("{claude_code} changed .claude.json accounts"),
-        )
+        let reason = format!("{claude_code} changed .claude.json accounts");
+        Finding::fail(format!("missing or not text: {}", join(&bad_accounts)))
+            .blocking(SafetyFeature::CliSwitching, reason.clone())
+            .blocking(SafetyFeature::Seeding, reason)
     };
     let caches = if caches_seen == 0 {
         Finding::never_seen()
@@ -67,6 +63,71 @@ pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Findin
         Finding::fail(format!("missing or wrong type: {}", join(&bad_caches)))
     };
     (accounts, caches)
+}
+
+/// Claude Code honouring Profile folders, from each signed-in Profile's
+/// `auth status`: every Profile reporting one account, or one naming
+/// another account than its `oauthAccount`, pauses CLI switching. Answers
+/// that never came are reported without pausing; unreadable ones say
+/// nothing. `None` when no answer said anything.
+pub(crate) fn config_dir_honoured(
+    versions: &ClaudeVersions,
+    answers: &[CrossCheckAnswer],
+) -> Option<Finding> {
+    let said: Vec<&Account> = answers
+        .iter()
+        .filter_map(|answer| answer.said.as_ref())
+        .collect();
+    let one_identity = answers.len() > 1
+        && said.len() == answers.len()
+        && said.iter().all(|account| *account == said[0]);
+    let disagreeing = answers
+        .iter()
+        .filter(|answer| {
+            answer
+                .said
+                .as_ref()
+                .is_some_and(|said| *said != answer.held)
+        })
+        .count();
+    let timed_out = answers.iter().filter(|answer| answer.timed_out).count();
+    Some(if one_identity {
+        let reason = format!("{} ignores Profile folders", claude_code_name(versions));
+        Finding::fail("every Profile reports one account")
+            .blocking(SafetyFeature::CliSwitching, reason)
+    } else if disagreeing > 0 {
+        config_dir_disagreement(versions, &format!("in {}", profiles(disagreeing)))
+    } else if timed_out > 0 {
+        Finding::fail(format!(
+            "auth status didn't answer in {}",
+            profiles(timed_out)
+        ))
+    } else if said.is_empty() {
+        return None;
+    } else {
+        Finding::pass()
+    })
+}
+
+/// `auth status` named another account than `oauthAccount` (`where_`:
+/// "in 2 Profiles").
+pub(crate) fn config_dir_disagreement(versions: &ClaudeVersions, where_: &str) -> Finding {
+    Finding::fail(format!("auth status names another account {where_}")).blocking(
+        SafetyFeature::CliSwitching,
+        format!(
+            "{} didn't use a Profile folder's login",
+            claude_code_name(versions)
+        ),
+    )
+}
+
+/// "1 Profile", "2 Profiles".
+fn profiles(count: usize) -> String {
+    if count == 1 {
+        "1 Profile".to_owned()
+    } else {
+        format!("{count} Profiles")
+    }
 }
 
 /// The desktop app's Sidebar folders, as the self-check sees them.
