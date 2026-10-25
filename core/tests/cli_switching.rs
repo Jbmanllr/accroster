@@ -364,7 +364,11 @@ fn with_cli_switching_off_rows_dont_switch_and_the_menu_bar_shows_the_icon_alone
 
     assert_eq!(rows(&core)[0].command, None);
     assert_eq!(core.view().menu_bar.label, None, "no Profile to show");
-    assert_eq!(header(&core), None);
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: me@example.com (default login)"),
+        "the CLI uses ~/.claude, signed in as perso"
+    );
     assert!(rows(&core)[0].submenu.iter().any(
         |item| matches!(item, MenuItem::Action { title, .. } if title == "Copy shell override")
     ));
@@ -588,7 +592,7 @@ fn a_nickname_is_the_clis_short_label() {
 }
 
 #[test]
-fn short_names_stay_unique_adding_the_organization_then_the_whole_email() {
+fn short_names_stay_unique_adding_the_organization_then_the_email() {
     let logins = [
         work(),
         FixtureLogin::new(
@@ -634,8 +638,8 @@ fn short_names_stay_unique_adding_the_organization_then_the_whole_email() {
         names,
         [
             "CLI: me · Work Inc",
-            "CLI: me@work.example · Research Lab",
-            "CLI: me@side.example · Research Lab",
+            "CLI: me@work.example",
+            "CLI: me@side.example",
             "CLI: jb",
         ]
     );
@@ -686,13 +690,7 @@ fn removing_the_clis_active_profile_asks_which_profile_is_next_and_moves_the_poi
     );
     let choices = removal_choices(&core, 0);
     let titles: Vec<&str> = choices.iter().map(|(title, _)| title.as_str()).collect();
-    assert_eq!(
-        titles,
-        [
-            "me@example.com · me@example.com's Organization",
-            "Default (~/.claude)"
-        ]
-    );
+    assert_eq!(titles, ["me@example.com", "Default (~/.claude)"]);
 
     confirm(&mut core, choices[0].1.clone());
 

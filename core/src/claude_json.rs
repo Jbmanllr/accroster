@@ -19,14 +19,92 @@ const CHECKED_KEYS: [&str; 3] = ["accountUuid", "organizationUuid", "emailAddres
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OauthAccount {
     pub key: ProfileKey,
-    /// Empty when missing.
-    pub email: String,
-    /// Empty when missing.
-    pub organization_name: String,
+    pub names: LoginNames,
     /// For example `claude_max`.
     pub organization_type: Option<String>,
     /// When Claude Code last refreshed these names.
     pub profile_fetched_at: Option<Timestamp>,
+}
+
+/// The names `oauthAccount` gives a Login and its Organization, and the
+/// names the app makes from them (GLOSSARY: Profile name, Short label).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct LoginNames {
+    /// Empty when missing.
+    pub email: String,
+    /// Empty when missing.
+    pub organization_name: String,
+    /// `fullName`; `None` when missing or empty.
+    pub full_name: Option<String>,
+    /// `displayName`; `None` when missing or empty.
+    pub display_name: Option<String>,
+}
+
+impl LoginNames {
+    /// The Organization when it says more than the email: not empty and not
+    /// Claude's personal default, `<email>'s Organization`.
+    fn telling_organization(&self) -> Option<&str> {
+        let name = self.organization_name.as_str();
+        (!name.is_empty() && name != format!("{}'s Organization", self.email)).then_some(name)
+    }
+
+    /// The Profile name: `<fullName> · <email>` (else the display name, else
+    /// the email alone), then ` · <Organization>` unless it is the personal
+    /// default.
+    pub fn name(&self) -> String {
+        self.joined(self.telling_organization())
+    }
+
+    /// The Profile name with the Organization even when it is the personal
+    /// default, for two Profiles that would otherwise share a name.
+    pub fn name_with_organization(&self) -> String {
+        self.joined(Some(self.organization_name.as_str()))
+    }
+
+    fn joined(&self, organization: Option<&str>) -> String {
+        let person = self.full_name.as_deref().or(self.display_name.as_deref());
+        [person, Some(self.email.as_str()), organization]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// `email · Organization`, for the hover line.
+    pub fn email_and_organization(&self) -> String {
+        format!("{} · {}", self.email, self.organization_name)
+    }
+
+    /// The short labels, shortest first: the display name (else the full
+    /// name's first word, else the email's local part); it with the
+    /// Organization when that tells; it with the email (the email alone in
+    /// place of the local part); and that with the Organization.
+    pub fn short_labels(&self) -> Vec<String> {
+        let first_name = self
+            .full_name
+            .as_deref()
+            .and_then(|name| name.split_whitespace().next());
+        let person = self.display_name.as_deref().or(first_name);
+        let short = person
+            .unwrap_or_else(|| self.email.split('@').next().unwrap_or_default())
+            .to_owned();
+        let with_email = match person {
+            Some(person) => format!("{person} · {}", self.email),
+            None => self.email.clone(),
+        };
+        let mut labels = vec![short.clone()];
+        if let Some(organization) = self.telling_organization() {
+            labels.push(format!("{short} · {organization}"));
+        }
+        if !self.organization_name.is_empty() {
+            labels.push(with_email.clone());
+            labels.push(format!("{with_email} · {}", self.organization_name));
+        } else {
+            labels.push(with_email);
+        }
+        labels
+    }
 }
 
 /// What a `.claude.json`'s `oauthAccount` holds.
@@ -59,8 +137,12 @@ pub(crate) fn oauth_account(body: &Value) -> Option<AccountRead> {
                 account_uuid: text("accountUuid")?,
                 organization_uuid: text("organizationUuid")?,
             },
-            email: text("emailAddress").unwrap_or_default(),
-            organization_name: text("organizationName").unwrap_or_default(),
+            names: LoginNames {
+                email: text("emailAddress").unwrap_or_default(),
+                organization_name: text("organizationName").unwrap_or_default(),
+                full_name: text("fullName").filter(|name| !name.trim().is_empty()),
+                display_name: text("displayName").filter(|name| !name.trim().is_empty()),
+            },
             organization_type: text("organizationType"),
             profile_fetched_at: account
                 .get("profileFetchedAt")

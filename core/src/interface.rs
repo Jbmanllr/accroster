@@ -566,8 +566,8 @@ pub enum MenuItem {
 /// that has no Profile yet. It never shows limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredRow {
-    /// `Sign in to <name>…`, where the name is the nickname, else
-    /// `email · Organization`, else "Unknown Login".
+    /// `Sign in to <name>…`, where the name is the nickname, else the
+    /// Login's Profile name, else "Unknown Login".
     pub title: String,
     /// A second line for an Unknown Login: Session count, last activity and
     /// "Desktop's last Login" when it applies.
@@ -581,7 +581,8 @@ pub struct DiscoveredRow {
 /// One Profile's row in the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileRow {
-    /// The nickname, else `email · Organization`.
+    /// The nickname, else the Profile name (`<full name> · <email>`, with
+    /// the Organization when it isn't the personal default).
     pub title: String,
     /// Badges after the name, CLI first, then Desktop: which clients use
     /// this Profile.
@@ -596,16 +597,24 @@ pub struct ProfileRow {
     /// Drawn dimmed: the reading is not current (stale, unreadable, or the
     /// Login expired).
     pub dimmed: bool,
-    /// The most-headroom marker text ("most headroom"), drawn after the
+    /// The most-headroom marker text ([`MOST_HEADROOM`]), drawn after the
     /// badges: of the non-stale signed-in Profiles (two or more), this one
     /// has the lowest tightest limit.
     pub marker: Option<String>,
+    /// Drawn as a muted "default login" after the badges: CLI switching is
+    /// off and the default `~/.claude` folder is signed in to this Profile's
+    /// Login and Organization, so the CLI's limits are this row's.
+    pub default_login: bool,
     /// Banked reset and Session refill lines, when Claude Code reports them
     /// (for example "Session refill available"). Never redeemable from here.
     pub offers: Vec<String>,
     /// The hover submenu.
     pub submenu: Vec<MenuItem>,
 }
+
+/// The most-headroom marker's text. It can move to another row while the
+/// menu is open, so the UI keeps room for it on every row.
+pub const MOST_HEADROOM: &str = "most headroom";
 
 /// One limit, drawn as an `NSLevelIndicator` (continuous capacity, warning at
 /// 70, critical at 90) with its percentage.
@@ -697,9 +706,9 @@ pub struct SidebarSyncView {
 /// One Profile in Settings > Profiles, in the user's order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSettings {
-    /// The nickname, else `email · Organization`.
+    /// The nickname, else the Profile name.
     pub title: String,
-    /// `email · Organization`, when a nickname titles the line.
+    /// The Profile name, when a nickname titles the line.
     pub detail: Option<String>,
     /// `None` for the first Profile.
     pub move_up: Option<Command>,
@@ -721,7 +730,7 @@ pub struct Toggle {
 /// One hidden Discovered Profile in Settings > Hidden (n)….
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiddenDiscovered {
-    /// The nickname, else `email · Organization`, else "Unknown Login" with
+    /// The nickname, else the Profile name, else "Unknown Login" with
     /// the account's first 8 characters.
     pub title: String,
     /// Sent by its Restore item: [`Command::UnhideDiscovered`].

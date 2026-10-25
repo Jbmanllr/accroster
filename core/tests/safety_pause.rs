@@ -1036,10 +1036,7 @@ fn a_malformed_oauth_account_pauses_cli_switching_and_hides_only_that_profile() 
     let titles: Vec<String> = rows(&core).into_iter().map(|row| row.title).collect();
     assert_eq!(
         titles,
-        [
-            "Signed-out Profile",
-            "me@example.com · me@example.com's Organization"
-        ],
+        ["Signed-out Profile", "me@example.com"],
         "the unreadable account degrades to its own row only"
     );
     assert_eq!(

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
-use crate::claude_json;
+use crate::claude_json::{self, LoginNames};
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
 use crate::interface::{
@@ -67,8 +67,7 @@ impl Context<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
     key: ProfileKey,
-    email: String,
-    organization_name: String,
+    names: LoginNames,
     /// For example `claude_max`; the plan when no usage read has said.
     organization_type: Option<String>,
 }
@@ -80,50 +79,61 @@ impl Identity {
         let account = claude_json::read_account(&config_dir.join(".claude.json"))?;
         Some(Identity {
             key: account.key,
-            email: account.email,
-            organization_name: account.organization_name,
+            names: account.names,
             organization_type: account.organization_type,
         })
     }
 
-    /// `email · Organization`.
+    /// The Profile name on its own (see [`LoginNames::name`]).
     fn name(&self) -> String {
-        format!("{} · {}", self.email, self.organization_name)
-    }
-
-    /// The menu bar's short names, shortest first: the email's local part,
-    /// then it with the Organization, then the whole `email · Organization`.
-    fn short_labels(&self) -> [String; 3] {
-        let local = self.email.split('@').next().unwrap_or_default();
-        [
-            local.to_owned(),
-            format!("{local} · {}", self.organization_name),
-            self.name(),
-        ]
+        self.names.name()
     }
 }
 
 /// Each Profile's short name, in `profiles`' order: its nickname, else the
-/// shortest of [`Identity::short_labels`] no other Profile shares (two
-/// Profiles named `me` become `me · Work Inc` and `me · Personal`).
+/// shortest of [`LoginNames::short_labels`] no other Profile shares (two
+/// Profiles named `Lucie` become `Lucie · Work Inc` and `Lucie · Research
+/// Lab`).
 fn short_labels(profiles: &[&Profile], settings: &Settings) -> Vec<String> {
-    let choices: Vec<Vec<String>> = profiles
-        .iter()
-        .map(|profile| match settings.nicknames.get(&profile.id) {
-            Some(nickname) => vec![nickname.clone()],
-            None => match &profile.identity {
-                Some(identity) => identity.short_labels().to_vec(),
-                None => vec!["Signed out".to_owned()],
-            },
-        })
-        .collect();
-    let mut level = vec![0; profiles.len()];
+    unique(
+        profiles
+            .iter()
+            .map(|profile| match settings.nicknames.get(&profile.id) {
+                Some(nickname) => vec![nickname.clone()],
+                None => match &profile.identity {
+                    Some(identity) => identity.names.short_labels(),
+                    None => vec!["Signed out".to_owned()],
+                },
+            })
+            .collect(),
+    )
+}
+
+/// Each Profile's name, in `profiles`' order: [`LoginNames::name`], with the
+/// Organization added when two Profiles would otherwise share it.
+fn names(profiles: &[&Profile]) -> Vec<String> {
+    unique(
+        profiles
+            .iter()
+            .map(|profile| match &profile.identity {
+                Some(identity) => vec![identity.name(), identity.names.name_with_organization()],
+                None => vec!["Signed-out Profile".to_owned()],
+            })
+            .collect(),
+    )
+}
+
+/// One pick per list of choices (shortest first): the first no other list's
+/// pick shares. Colliding lists move on together until none collides or a
+/// list runs out of choices.
+fn unique(choices: Vec<Vec<String>>) -> Vec<String> {
+    let mut level = vec![0; choices.len()];
     loop {
         let label = |index: usize| &choices[index][level[index]];
-        let collided: Vec<usize> = (0..profiles.len())
+        let collided: Vec<usize> = (0..choices.len())
             .filter(|&index| {
                 level[index] + 1 < choices[index].len()
-                    && (0..profiles.len())
+                    && (0..choices.len())
                         .any(|other| other != index && label(other) == label(index))
             })
             .collect();
@@ -148,12 +158,12 @@ pub(crate) struct Listed<'a> {
     pub config_dir: &'a Path,
     /// Whether its folder holds a Login (signed in or expired).
     pub signed_in: bool,
-    /// `email · Organization`, or "Signed-out Profile".
+    /// Its Profile name (see [`names`]), or "Signed-out Profile".
     pub name: String,
     /// A nickname titles its row.
     pub nicknamed: bool,
-    /// The menu bar's short name for it: the nickname, else the email's
-    /// local part (`perso`).
+    /// Its Short label (menu bar, header): the nickname, else the person's
+    /// first name (`Lucie`), lengthened when two Profiles share it.
     pub short_label: String,
     pub row: ProfileRow,
 }
@@ -163,7 +173,7 @@ pub(crate) struct Listed<'a> {
 pub(crate) struct SignedInProfile {
     pub id: String,
     pub key: ProfileKey,
-    /// `email · Organization`.
+    /// Its Profile name (see [`names`]).
     pub name: String,
 }
 
@@ -200,7 +210,7 @@ struct Profile {
 }
 
 impl Profile {
-    /// The menu row: `title` is the nickname, else `email · Organization`.
+    /// The menu row: `title` is the nickname, else the Profile name.
     fn row(&self, title: String, limits: LimitsView) -> ProfileRow {
         let mut submenu = Vec::new();
         let mut row_limits = LimitsView::default();
@@ -211,7 +221,7 @@ impl Profile {
                     .as_deref()
                     .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned())
             });
-            let mut detail = identity.name();
+            let mut detail = identity.names.email_and_organization();
             if let Some(plan) = plan.filter(|plan| !plan.is_empty()) {
                 detail.push_str(" · ");
                 detail.push_str(&capitalized(&plan));
@@ -266,16 +276,10 @@ impl Profile {
             note,
             dimmed,
             marker: None,
+            default_login: false,
             offers,
             submenu,
         }
-    }
-
-    /// `email · Organization`, or what the row says when no Login is known.
-    fn name(&self) -> String {
-        self.identity
-            .as_ref()
-            .map_or_else(|| "Signed-out Profile".to_owned(), Identity::name)
     }
 }
 
@@ -524,7 +528,7 @@ impl ProfileRegistry {
                 continue;
             };
             let held = Account {
-                email: Some(identity.email.clone()),
+                email: Some(identity.names.email.clone()),
                 organization_uuid: Some(identity.key.organization_uuid.clone()),
             };
             let tag = Tag {
@@ -692,6 +696,7 @@ impl ProfileRegistry {
         let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
             return;
         };
+        let name = self.name(id).unwrap_or_default();
         let profile = &self.profiles[index];
         if !signed_out {
             ctx.log(
@@ -699,16 +704,12 @@ impl ProfileRegistry {
                 "sign-out failed, profile kept",
                 &[("profile", Field::Profile(id))],
             );
-            self.notice = Some(format!(
-                "Couldn't sign out {} · nothing was removed",
-                profile.name()
-            ));
+            self.notice = Some(format!("Couldn't sign out {name} · nothing was removed"));
             return;
         }
         if !remove_folder(ctx, id, &profile.config_dir) {
             self.notice = Some(format!(
-                "Signed out {}, but its folder couldn't be deleted",
-                profile.name()
+                "Signed out {name}, but its folder couldn't be deleted"
             ));
         }
         self.profiles.remove(index);
@@ -735,7 +736,7 @@ impl ProfileRegistry {
         let status = AuthStatus::parse(finished);
         let confirmed = status.as_ref().is_some_and(|status| {
             status.logged_in
-                && status.email.as_deref() == Some(identity.email.as_str())
+                && status.email.as_deref() == Some(identity.names.email.as_str())
                 && status.org_id.as_deref() == Some(identity.key.organization_uuid.as_str())
         });
         if confirmed {
@@ -947,12 +948,13 @@ impl ProfileRegistry {
     ) -> Vec<Listed<'_>> {
         let ordered = self.ordered(&settings.profile_order);
         let short_labels = short_labels(&ordered, settings);
+        let names = names(&ordered);
         ordered
             .into_iter()
-            .zip(short_labels)
-            .map(|(profile, short_label)| {
+            .zip(short_labels.into_iter().zip(names))
+            .map(|(profile, (short_label, name))| {
                 let nickname = settings.nicknames.get(&profile.id);
-                let title = nickname.cloned().unwrap_or_else(|| profile.name());
+                let title = nickname.cloned().unwrap_or_else(|| name.clone());
                 let mut row = profile.row(title, limits(&profile.id));
                 if self.removing(&profile.id) {
                     row.note = Some("Signing out…".to_owned());
@@ -971,7 +973,7 @@ impl ProfileRegistry {
                     id: &profile.id,
                     config_dir: &profile.config_dir,
                     signed_in: profile.identity.is_some(),
-                    name: profile.name(),
+                    name,
                     nicknamed: nickname.is_some(),
                     short_label,
                     row,
@@ -1011,9 +1013,8 @@ impl ProfileRegistry {
 
     /// The prompt for Rename…, or `None` for an unknown Profile.
     pub(crate) fn nickname_prompt(&self, id: &str, settings: &Settings) -> Option<Effect> {
-        let profile = self.profile(id)?;
         Some(Effect::AskNickname {
-            name: profile.name(),
+            name: self.name(id)?,
             current: settings.nicknames.get(id).cloned(),
             target: NicknameTarget::Profile(id.to_owned()),
         })
@@ -1028,7 +1029,7 @@ impl ProfileRegistry {
         id: &str,
         confirm: Command,
     ) -> Option<Effect> {
-        let profile = self.profile(id)?;
+        let name = self.name(id)?;
         let mut message = "AccRoster signs it out with Claude Code, then deletes its folder. \
                            Shared Transcripts and settings in ~/.claude stay."
             .to_owned();
@@ -1039,7 +1040,7 @@ impl ProfileRegistry {
             );
         }
         Some(Effect::ConfirmRemoval {
-            title: format!("Remove {}?", profile.name()),
+            title: format!("Remove {name}?"),
             message,
             confirm,
         })
@@ -1069,10 +1070,12 @@ impl ProfileRegistry {
         self.run_jobs(ctx);
     }
 
-    /// A Profile's name for notices: `email · Organization`, or
-    /// "Signed-out Profile".
+    /// A Profile's name, as its row has it without a nickname (see
+    /// [`names`]), or "Signed-out Profile".
     pub(crate) fn name(&self, id: &str) -> Option<String> {
-        self.profile(id).map(Profile::name)
+        let all: Vec<&Profile> = self.profiles.iter().collect();
+        let index = all.iter().position(|profile| profile.id == id)?;
+        names(&all).into_iter().nth(index)
     }
 
     /// Starts signing out, then deleting, every folder under `profiles/`
@@ -1127,14 +1130,15 @@ impl ProfileRegistry {
 
     /// Who each signed-in Profile is, in add order.
     pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
-        self.profiles
-            .iter()
-            .filter_map(|profile| {
+        let all: Vec<&Profile> = self.profiles.iter().collect();
+        all.iter()
+            .zip(names(&all))
+            .filter_map(|(profile, name)| {
                 let identity = profile.identity.as_ref()?;
                 Some(SignedInProfile {
                     id: profile.id.clone(),
                     key: identity.key.clone(),
-                    name: identity.name(),
+                    name,
                 })
             })
             .collect()
@@ -1168,11 +1172,7 @@ impl ProfileRegistry {
                     ("existing", Field::Profile(&existing.id)),
                 ],
             );
-            let name = existing
-                .identity
-                .as_ref()
-                .map(Identity::name)
-                .unwrap_or_default();
+            let name = self.name(&existing.id).unwrap_or_default();
             self.notice = Some(format!("Already added: {name}"));
             let failed = format!("Already added: {name} · the new sign-in couldn't be undone");
             self.discard(ctx, &id, &config_dir, Some(failed));
@@ -1250,7 +1250,11 @@ impl ProfileRegistry {
         if !accepted {
             let used = identity.name();
             let wanted = expected.as_ref().map_or_else(
-                || self.find(&identity).map(Profile::name).unwrap_or_default(),
+                || {
+                    self.find(&identity)
+                        .and_then(|existing| self.name(&existing.id))
+                        .unwrap_or_default()
+                },
                 Identity::name,
             );
             ctx.log(
@@ -1311,7 +1315,9 @@ impl ProfileRegistry {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|body| body.get("oauthAccount").cloned());
-        let email = expected.as_ref().map(|identity| identity.email.clone());
+        let email = expected
+            .as_ref()
+            .map(|identity| identity.names.email.clone());
         ctx.log(
             Level::Info,
             "sign-in again started",
@@ -1389,10 +1395,11 @@ impl ProfileRegistry {
     }
 
     fn expire(&mut self, ctx: &Context, index: usize) {
-        let profile = &mut self.profiles[index];
-        if profile.expired {
+        if self.profiles[index].expired {
             return;
         }
+        let name = self.name(&self.profiles[index].id).unwrap_or_default();
+        let profile = &mut self.profiles[index];
         profile.expired = true;
         ctx.log(
             Level::Warn,
@@ -1401,10 +1408,7 @@ impl ProfileRegistry {
         );
         self.effects.push(Effect::Notify {
             title: "Login expired".into(),
-            body: format!(
-                "{} needs signing in again. Choose Sign in again… in its menu.",
-                profile.name()
-            ),
+            body: format!("{name} needs signing in again. Choose Sign in again… in its menu."),
         });
         self.save(ctx);
     }

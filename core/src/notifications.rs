@@ -21,8 +21,8 @@ use crate::usage::{Limit, Limits};
 /// A signed-in, watched Profile, as the notifier sees it.
 pub(crate) struct Subject<'a> {
     pub id: &'a str,
-    /// The short name notifications use: the nickname, else the email's
-    /// local part.
+    /// The Short label notifications use: the nickname, else the person's
+    /// first name.
     pub name: &'a str,
     /// The latest reading's limits, if any.
     pub limits: Option<&'a Limits>,

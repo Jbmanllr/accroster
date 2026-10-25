@@ -15,9 +15,9 @@ use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings, SafetyFeature,
-    SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
+    HiddenDiscovered, LaunchAtLoginView, MOST_HEADROOM, MenuBarView, MenuItem, MenuView,
+    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings,
+    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
@@ -807,7 +807,7 @@ impl Core {
         });
         if let Some(headroom) = most_headroom(&listed, &watched) {
             for listed in listed.iter_mut() {
-                listed.row.marker = (listed.id == headroom.id).then(|| "most headroom".to_owned());
+                listed.row.marker = (listed.id == headroom.id).then(|| MOST_HEADROOM.to_owned());
             }
         }
         for profile in &mut listed {
@@ -829,16 +829,38 @@ impl Core {
         let desktop_profile = desktop_account
             .as_ref()
             .and_then(|account| account.profile(&signed_in));
-        // Each client's Active Profile by its short name, the CLI's first:
-        // without CLI switching that is Default, said when the desktop's is.
+        // Each client's Active Profile by its Short label, the CLI's first:
+        // without CLI switching that is the Default login, else Default,
+        // said when the desktop's is.
         let desktop_part = desktop_account.as_ref().map(|_| {
             let name = desktop_profile
                 .and_then(|desktop| listed.iter().find(|listed| listed.id == desktop.id))
                 .map_or("another Profile", |listed| listed.short_label.as_str());
             format!("Desktop: {name}")
         });
+        // Without CLI switching the CLI uses `~/.claude`: named by its Login.
+        let default_login = self
+            .discovered
+            .iter()
+            .find_map(|evidence| Some((&evidence.pair, evidence.default_login()?)))
+            .filter(|_| cli.header.is_none());
+        let default_login_part = default_login.map(|(pair, names)| {
+            let listed = signed_in
+                .iter()
+                .find(|profile| profile.key == *pair)
+                .and_then(|profile| listed.iter_mut().find(|listed| listed.id == profile.id));
+            let name = match listed {
+                Some(listed) => {
+                    listed.row.default_login = true;
+                    listed.short_label.clone()
+                }
+                None => names.name(),
+            };
+            format!("CLI: {name} (default login)")
+        });
         let cli_part = cli
             .header
+            .or(default_login_part)
             .or_else(|| desktop_part.as_ref().map(|_| "CLI: Default".to_owned()));
         let header: Vec<String> = cli_part.into_iter().chain(desktop_part).collect();
         if !header.is_empty() {

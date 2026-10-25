@@ -854,10 +854,7 @@ fn the_sidebar_lists_projects_and_every_profiles_sidebar() {
             (
                 Some("Sidebars"),
                 vec![
-                    (
-                        "me@example.com · me@example.com's Organization",
-                        &SessionFilter::Sidebar(perso_pair)
-                    ),
+                    ("me@example.com", &SessionFilter::Sidebar(perso_pair)),
                     (
                         "Unknown Login · 1 Session · last active Jan 1 (not signed in)",
                         &SessionFilter::Sidebar(pair(ACCOUNT_B, ORG_B))
@@ -925,7 +922,7 @@ fn the_detail_pane_shows_where_a_session_lives() {
             dot: None,
             sidebars: vec![
                 SidebarPresence {
-                    profile: "me@example.com · me@example.com's Organization".into(),
+                    profile: "me@example.com".into(),
                     has_entry: true,
                     archived: true,
                     desktop_now: true,
