@@ -105,6 +105,16 @@ pub(crate) struct Listed<'a> {
     pub row: ProfileRow,
 }
 
+/// A signed-in Profile as other modules see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignedInProfile {
+    pub id: String,
+    pub account_uuid: String,
+    pub organization_uuid: String,
+    /// `email · Organization`.
+    pub name: String,
+}
+
 /// `state/profiles.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryFile {
@@ -498,6 +508,22 @@ impl ProfileRegistry {
                     config_dir: &profile.config_dir,
                     short_label: identity.short_label(),
                     row: profile.row(identity, now, &tz),
+                })
+            })
+            .collect()
+    }
+
+    /// Who each signed-in Profile is, in the same order as [`Self::listed`].
+    pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(SignedInProfile {
+                    id: profile.id.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    organization_uuid: identity.organization_uuid.clone(),
+                    name: identity.name(),
                 })
             })
             .collect()

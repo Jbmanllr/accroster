@@ -9,6 +9,7 @@ use jiff::SignedDuration;
 
 use crate::backups;
 use crate::cli_switcher::{self, TurnedOff};
+use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
@@ -74,6 +75,7 @@ pub struct Core {
     profiles: ProfileRegistry,
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
+    desktop: DesktopBridge,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
 }
@@ -98,6 +100,7 @@ impl Core {
             warnings: Vec::new(),
             profiles: ProfileRegistry::default(),
             cli_note: None,
+            desktop: DesktopBridge::default(),
             discovered: Vec::new(),
         };
         core.log(
@@ -164,7 +167,7 @@ impl Core {
     /// while a sign-in is waiting (so its end shows at once), otherwise
     /// [`crate::driver::TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
-        if self.profiles.signing_in() {
+        if self.profiles.signing_in() || self.desktop.waiting() {
             Duration::from_secs(1)
         } else {
             crate::driver::TICK_INTERVAL
@@ -260,6 +263,32 @@ impl Core {
                     ))]
                 })
                 .unwrap_or_default(),
+            Command::SwitchDesktopApp(id) => {
+                let target = self
+                    .profiles
+                    .signed_in()
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map(Target::of);
+                let Some(target) = target else {
+                    return Vec::new();
+                };
+                let (desktop, ctx) = self.desktop();
+                desktop.start(&ctx, target)
+            }
+            Command::ConfirmDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.confirm(&ctx)
+            }
+            Command::NotifyWhenDesktopIdle => {
+                self.desktop.notify_when_idle();
+                Vec::new()
+            }
+            Command::CancelDesktopSwitch => {
+                let (desktop, ctx) = self.desktop();
+                desktop.cancel(&ctx);
+                Vec::new()
+            }
             Command::OpenLimitResets => vec![Effect::OpenUrl(LIMIT_RESETS_URL.into())],
         }
     }
@@ -273,7 +302,9 @@ impl Core {
                 }
                 let (profiles, ctx) = self.profiles();
                 profiles.poll(&ctx);
-                Vec::new()
+                let signed_in = self.profiles.signed_in();
+                let (desktop, ctx) = self.desktop();
+                desktop.poll(&ctx, &signed_in)
             }
             Event::MenuOpened => {
                 self.rescan_discovered();
@@ -294,12 +325,35 @@ impl Core {
             .collect();
         let mut listed = self.profiles.listed(self.env.clock.as_ref());
         let cli = cli_switcher::present(&self.paths, &mut listed);
-        let header: Vec<String> = cli.header.into_iter().collect();
+        items.extend(self.desktop.menu_items());
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        let signed_in = self.profiles.signed_in();
+        let desktop_account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+        let desktop_profile = desktop_account
+            .as_ref()
+            .and_then(|account| account.profile(&signed_in));
+        // The CLI part comes first.
+        let mut header: Vec<String> = cli.header.into_iter().collect();
+        if desktop_account.is_some() {
+            let name = desktop_profile.map_or("another account", |profile| &profile.name);
+            header.push(format!("Desktop: {name}"));
+        }
         if !header.is_empty() {
             items.push(MenuItem::Detail(header.join("    ")));
         }
-        if !items.is_empty() {
-            items.push(MenuItem::Separator);
+        let desktop_installed = self.env.os.desktop_app_version().is_some();
+        for (listed, profile) in listed.iter_mut().zip(&signed_in) {
+            let row = &mut listed.row;
+            if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
+                row.badges.push("Desktop".into());
+            } else if desktop_installed {
+                row.submenu.push(MenuItem::Action {
+                    title: "Switch desktop app to this Profile…".into(),
+                    command: Command::SwitchDesktopApp(profile.id.clone()),
+                });
+            }
         }
         let shown = self.shown_discovered();
         let tz = self.env.clock.time_zone();
@@ -382,6 +436,7 @@ impl Core {
                 .then_some(FirstRunView {
                     launch_at_login: true,
                 }),
+            versions: desktop::versions(&self.env),
         }
     }
 
@@ -589,6 +644,18 @@ impl Core {
                 );
             }
         }
+    }
+
+    /// The Desktop bridge, with what it needs from the rest of the core.
+    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+        let verbose = self.verbose_logging();
+        let ctx = profiles::Context {
+            env: &self.env,
+            paths: &self.paths,
+            logger: &self.logger,
+            verbose,
+        };
+        (&mut self.desktop, ctx)
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
