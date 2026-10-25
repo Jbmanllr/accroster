@@ -700,9 +700,8 @@ impl SessionIndex {
             .filter_map(|(_, entry)| entry.as_ref())
         {
             if !listed.iter().any(|(pair, _)| *pair == entry.pair) {
-                let account = &entry.pair.account_uuid;
-                let short = account.get(..8).unwrap_or(account);
-                let name = format!("Unknown Login (account {short}) {NOT_SIGNED_IN}");
+                // A uuid appears only in hover detail.
+                let name = format!("Unknown Login {NOT_SIGNED_IN}");
                 listed.push((entry.pair.clone(), name));
             }
         }
