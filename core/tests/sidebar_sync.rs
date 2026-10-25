@@ -8,7 +8,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use accroster_core::{CheckStatus, Command, Core, SafetyFeature, SidebarSyncMode};
+use accroster_core::{CheckStatus, Command, Core, Effect, Event, SafetyFeature, SidebarSyncMode};
 use accroster_fake_mac::FakeMac;
 use common::*;
 use serde_json::{Value, json};
@@ -658,4 +658,228 @@ fn old_folder_backups_are_pruned_at_launch_keeping_the_last_five() {
     mac.launch();
 
     assert_eq!(copies(&mac), 5);
+}
+
+// ----- Automatic mode ------------------------------------------------------------------
+
+fn automatic(mac: &FakeMac) -> (Core, Vec<Effect>) {
+    let mut core = mac.launch();
+    let effects = core.command(Command::SetSidebarSync(SidebarSyncMode::Automatic));
+    (core, effects)
+}
+
+fn seconds(n: i64) -> jiff::SignedDuration {
+    jiff::SignedDuration::from_secs(n)
+}
+
+/// What the UI's FSEvents watch reports.
+fn changed(core: &mut Core, paths: &[PathBuf]) -> Vec<Effect> {
+    core.event(Event::SidebarFilesChanged(paths.to_vec()))
+}
+
+#[test]
+fn automatic_mode_watches_the_sidebars_and_syncs_a_few_seconds_after_the_last_change() {
+    let mac = FakeMac::new();
+    desktop_uses(&mac, PERSO);
+    empty_folder(&mac, WORK);
+    mac.os.set_desktop_app_running(true);
+
+    let (mut core, effects) = automatic(&mac);
+    assert!(
+        effects.contains(&Effect::WatchSidebarFolders(vec![mac.path(SIDEBAR)])),
+        "{effects:?}"
+    );
+    assert_eq!(
+        core.view().settings.sidebar_sync.mode,
+        SidebarSyncMode::Automatic
+    );
+
+    // Claude writes a Session, then writes it again two seconds later.
+    let first = put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
+    changed(&mut core, &[first]);
+    mac.clock.advance(seconds(2));
+    let mut later = entry("s1", "Fix login bug");
+    later["lastActivityAt"] = json!(1_761_400_500_000_i64);
+    let second = put(&mac, PERSO, "s1", &later);
+    changed(&mut core, &[second]);
+
+    mac.clock.advance(seconds(2));
+    core.event(Event::Tick);
+    assert_eq!(read(&mac, WORK, "s1"), None, "still settling");
+    assert!(core.tick_interval() <= Duration::from_secs(1));
+
+    mac.clock.advance(seconds(1));
+    core.event(Event::Tick);
+    assert_eq!(read(&mac, WORK, "s1"), Some(without_cleared(later)));
+    assert_eq!(core.tick_interval(), accroster_core::driver::TICK_INTERVAL);
+}
+
+#[test]
+fn the_watch_starts_once_the_sidebars_exist_resumes_after_relaunch_and_stops_when_sync_is_off() {
+    let mac = FakeMac::new();
+    let (mut core, effects) = automatic(&mac);
+    let watch = Effect::WatchSidebarFolders(vec![mac.path(SIDEBAR)]);
+    assert!(!effects.contains(&watch), "no sidebars yet: {effects:?}");
+
+    empty_folder(&mac, WORK);
+    assert!(core.event(Event::Tick).contains(&watch));
+    assert!(!core.event(Event::Tick).contains(&watch), "asked once");
+
+    drop(core);
+    let mut relaunched = mac.launch();
+    assert!(relaunched.take_effects().contains(&watch));
+
+    let effects = relaunched.command(Command::SetSidebarSync(SidebarSyncMode::Off));
+    assert!(
+        effects.contains(&Effect::StopWatchingSidebarFolders),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn copies_sync_wrote_itself_do_not_start_another_run() {
+    // Claude is quit, so sync also writes into the desktop's own folder.
+    let mac = FakeMac::new();
+    put(&mac, WORK, "w1", &entry("w1", "From Work"));
+    desktop_uses(&mac, PERSO);
+    let (mut core, _) = automatic(&mac);
+    let s1 = put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
+    changed(&mut core, &[s1]);
+    mac.clock.advance(seconds(3));
+    core.event(Event::Tick);
+    let copy = mac.path(entry_path(PERSO, "w1"));
+    assert!(copy.exists());
+
+    changed(&mut core, &[copy]);
+
+    assert_eq!(core.tick_interval(), accroster_core::driver::TICK_INTERVAL);
+}
+
+#[test]
+fn manual_mode_ignores_changes_until_sync_now() {
+    let mac = FakeMac::new();
+    desktop_uses(&mac, PERSO);
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    let s1 = put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
+
+    changed(&mut core, &[s1]);
+    mac.clock.advance(seconds(10));
+    core.event(Event::Tick);
+
+    assert_eq!(read(&mac, WORK, "s1"), None);
+}
+
+// ----- Dormant multi-account mode: writes outside the desktop's folder ------------------
+
+/// Claude runs on Perso; sync is on (Manual) and ran once, so Work's folder
+/// holds a copy sync wrote.
+fn claude_running_on_perso() -> (FakeMac, Core) {
+    let mac = FakeMac::new();
+    desktop_uses(&mac, PERSO);
+    put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
+    empty_folder(&mac, WORK);
+    mac.os.set_desktop_app_running(true);
+    let mut core = manual(&mac);
+    sync(&mut core);
+    assert!(read(&mac, WORK, "s1").is_some());
+    (mac, core)
+}
+
+/// Claude itself writes `id` into `profile`'s folder.
+fn claude_writes(mac: &FakeMac, profile: (&str, &str), id: &str) -> PathBuf {
+    let mut body = entry(id, "Parked");
+    body["lastActivityAt"] = json!(1_761_600_000_000_i64);
+    put(mac, profile, id, &body)
+}
+
+#[test]
+fn an_entry_claude_writes_outside_its_folder_while_running_pauses_sync() {
+    let (mac, mut core) = claude_running_on_perso();
+    mac.clock.advance(seconds(60));
+    let parked = claude_writes(&mac, WORK, "p1");
+
+    changed(&mut core, &[parked]);
+
+    assert!(is_paused(&core));
+    assert!(
+        warnings(&core)
+            .contains(&"Claude wrote to a Profile it isn't using · Sidebar sync paused".to_owned()),
+        "{:?}",
+        warnings(&core)
+    );
+    let check = core
+        .view()
+        .diagnostics
+        .checks
+        .into_iter()
+        .find(|check| check.name == "Dormant multi-account mode")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Fail);
+    let before = sidebars(&mac);
+    sync(&mut core);
+    assert_eq!(sidebars(&mac), before, "nothing is written while paused");
+
+    core.command(resume_button(&core).expect("Resume is offered"));
+    assert!(!is_paused(&core));
+}
+
+#[test]
+fn copies_sync_wrote_and_entries_in_claudes_own_folder_are_not_a_pause() {
+    let (mac, mut core) = claude_running_on_perso();
+    mac.clock.advance(seconds(60));
+    let own = claude_writes(&mac, PERSO, "s2");
+
+    changed(&mut core, &[mac.path(entry_path(WORK, "s1")), own]);
+
+    assert!(!is_paused(&core));
+}
+
+#[test]
+fn writes_outside_claudes_folder_within_30_seconds_of_an_account_switch_are_not_a_pause() {
+    let (mac, mut core) = claude_running_on_perso();
+    mac.clock.advance(seconds(60));
+    // Claude switches to Work: it starts writing Work's folder and flushes
+    // Perso's Sessions into Perso's.
+    mac.write_desktop_config(&json!({ "lastKnownAccountUuid": WORK.0 }));
+    let work_entry = claude_writes(&mac, WORK, "w1");
+    changed(&mut core, &[work_entry]);
+    mac.clock.advance(seconds(20));
+    let flushed = claude_writes(&mac, PERSO, "s1");
+    changed(&mut core, &[flushed]);
+    assert!(!is_paused(&core), "the switch's own flush");
+
+    mac.clock.advance(seconds(11));
+    let parked = claude_writes(&mac, PERSO, "s3");
+    changed(&mut core, &[parked]);
+    assert!(is_paused(&core), "31 s after the switch");
+}
+
+#[test]
+fn a_sign_in_in_main_log_counts_as_a_switch() {
+    let (mac, mut core) = claude_running_on_perso();
+    mac.clock.advance(seconds(60));
+    mac.write_file(
+        "Library/Logs/Claude/main.log",
+        "[account] Login-state transition (loggedOut: true → false, now)\n",
+    );
+    core.event(Event::Tick);
+    mac.clock.advance(seconds(10));
+    let flushed = claude_writes(&mac, WORK, "p1");
+
+    changed(&mut core, &[flushed]);
+
+    assert!(!is_paused(&core));
+}
+
+#[test]
+fn entries_written_outside_claudes_folder_while_it_is_quit_are_not_a_pause() {
+    let (mac, mut core) = claude_running_on_perso();
+    mac.os.set_desktop_app_running(false);
+    mac.clock.advance(seconds(60));
+    let edited = claude_writes(&mac, WORK, "p1");
+
+    changed(&mut core, &[edited]);
+
+    assert!(!is_paused(&core));
 }

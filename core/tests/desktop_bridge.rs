@@ -6,7 +6,9 @@ mod common;
 
 use std::time::{Duration, SystemTime};
 
-use accroster_core::{ClaudeVersions, Core, Effect, Event, MenuItem, ProfileRow};
+use accroster_core::{
+    ClaudeVersions, Command, Core, Effect, Event, MenuItem, ProfileRow, SidebarSyncMode,
+};
 use accroster_fake_mac::{FakeMac, FixtureLogin, StubCall};
 use common::*;
 use serde_json::json;
@@ -470,6 +472,63 @@ fn append_main_log(mac: &FakeMac, line: &str) {
     let mut log = mac.read_file(MAIN_LOG).unwrap_or_default();
     log.push_str(line);
     mac.write_file(MAIN_LOG, log);
+}
+
+#[test]
+fn with_sidebar_sync_on_the_switch_first_syncs_into_the_target_profile() {
+    let (mac, mut core) = desktop_on_perso();
+    mac.os.set_desktop_app_running(true);
+    let work_folder = format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}",
+        work().account_uuid,
+        work().organization_uuid
+    );
+    // Claude was signed in as Work once, so Work has a sidebar.
+    std::fs::create_dir_all(mac.path(&work_folder)).unwrap();
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+
+    let effects = click_in_row(&mut core, WORK, SWITCH);
+
+    assert!(brought_forward(&effects), "{effects:?}");
+    let copy: Option<serde_json::Value> = mac.read_json(format!("{work_folder}/local_a.json"));
+    assert_eq!(copy.unwrap()["title"], "Fix the build");
+    // The copies sync just wrote are not Claude signing in to Work.
+    core.event(Event::Tick);
+    assert_eq!(
+        warnings(&core),
+        [format!("In Claude: Sign out, then sign in as {WORK}")]
+    );
+}
+
+#[test]
+fn automatic_sync_waits_while_a_switch_waits_so_its_copies_confirm_nothing() {
+    let (mac, mut core) = desktop_on_perso();
+    mac.os.set_desktop_app_running(true);
+    let work_folder = format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}",
+        work().account_uuid,
+        work().organization_uuid
+    );
+    std::fs::create_dir_all(mac.path(&work_folder)).unwrap();
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Automatic));
+    click_in_row(&mut core, WORK, SWITCH);
+
+    // Signed out, Claude keeps saving Perso's Sessions.
+    let perso = FixtureLogin::perso();
+    sidebar_entry(&mac, &perso, "c", "New while signing out", Duration::ZERO);
+    let written = mac.path(format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}/local_c.json",
+        perso.account_uuid, perso.organization_uuid
+    ));
+    core.event(Event::SidebarFilesChanged(vec![written]));
+    mac.clock.advance(jiff::SignedDuration::from_secs(5));
+    core.event(Event::Tick);
+
+    assert!(!mac.path(format!("{work_folder}/local_c.json")).exists());
+    assert_eq!(
+        warnings(&core),
+        [format!("In Claude: Sign out, then sign in as {WORK}")]
+    );
 }
 
 #[test]

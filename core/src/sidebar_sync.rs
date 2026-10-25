@@ -26,13 +26,19 @@
 //!   mode's trace. Either stops the whole run before any write, for a Safety
 //!   pause. Then each target folder is backed up, each exact file is read
 //!   again, and each copy is written as temp file then rename.
+//! - **Watching** ([`Watch`]): while sync is on, the UI watches
+//!   `claude-code-sessions/`. Automatic mode runs a few seconds after the
+//!   last change to the desktop's Active Profile folder. An entry Claude
+//!   writes in any other folder while it runs, more than 30 s after the last
+//!   account switch, is the other trace of the dormant multi-account mode.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -40,6 +46,7 @@ use crate::backups;
 use crate::checks::SIDEBAR_ENTRY_FIELDS;
 use crate::desktop::{self, DesktopPaths};
 use crate::env::Environment;
+use crate::interface::Effect;
 use crate::safety::reportable;
 use crate::storage::{self, AppPaths, VersionedFile};
 
@@ -169,6 +176,180 @@ struct Read {
     unknown_fields: BTreeSet<String>,
 }
 
+/// How long the desktop's folder stays quiet before Automatic mode syncs.
+const SETTLE: SignedDuration = SignedDuration::from_secs(3);
+
+/// Switching flushes the old account's Sessions into its folder: entries
+/// written outside the desktop's folder this soon after a switch are that.
+const SWITCH_GRACE: SignedDuration = SignedDuration::from_secs(30);
+
+/// The watch on the sidebars while sync is on: when Automatic mode runs
+/// next, and the account switches that excuse writes outside the desktop's
+/// Active Profile folder.
+#[derive(Debug, Default)]
+pub(crate) struct Watch {
+    /// The UI was asked to watch `claude-code-sessions/`.
+    watching: bool,
+    /// When Automatic mode runs, once the desktop's folder stays quiet.
+    due: Option<Timestamp>,
+    /// The desktop's Active Profile folder (`<account>/<org>`) last seen.
+    desktop: Option<String>,
+    main_log_length: Option<u64>,
+    /// When a switch was last noticed (none since the watch started).
+    switched_at: Option<Timestamp>,
+}
+
+impl Watch {
+    /// Starts the watch while sync is `on` and the sidebars' folder exists
+    /// (checked again on every input until it does); stops it when off.
+    pub(crate) fn reconcile(&mut self, env: &Environment, on: bool) -> Option<Effect> {
+        let root = sidebar_root(&env.home);
+        if on && !self.watching && root.is_dir() {
+            let desktop_paths = DesktopPaths::new(&env.home);
+            *self = Watch {
+                watching: true,
+                desktop: active_key(&desktop_paths),
+                main_log_length: desktop::main_log_length(&desktop_paths),
+                ..Watch::default()
+            };
+            return Some(Effect::WatchSidebarFolders(vec![root]));
+        }
+        if !on && self.watching {
+            *self = Watch::default();
+            return Some(Effect::StopWatchingSidebarFolders);
+        }
+        None
+    }
+
+    /// Notes an account switch since the last look: another desktop folder,
+    /// or a sign-in line in `main.log`.
+    pub(crate) fn notice_switch(&mut self, env: &Environment) {
+        if !self.watching {
+            return;
+        }
+        let desktop_paths = DesktopPaths::new(&env.home);
+        let desktop = active_key(&desktop_paths);
+        let signed_in = desktop::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
+        if desktop != self.desktop || signed_in {
+            self.switched_at = Some(env.clock.now());
+        }
+        self.desktop = desktop;
+        self.main_log_length = desktop::main_log_length(&desktop_paths);
+    }
+
+    /// FSEvents reported `changed`. Entries that differ from sync's record
+    /// were written by someone else: in the desktop's folder they schedule
+    /// Automatic mode (when `automatic`); elsewhere, while Claude runs and
+    /// not just after a switch, they are counted and returned (the dormant
+    /// multi-account mode's trace).
+    pub(crate) fn files_changed(
+        &mut self,
+        env: &Environment,
+        paths: &AppPaths,
+        changed: &[PathBuf],
+        automatic: bool,
+    ) -> usize {
+        if !self.watching {
+            return 0;
+        }
+        self.notice_switch(env);
+        let now = env.clock.now();
+        let root = sidebar_root(&env.home);
+        let record = load(paths);
+        let mut elsewhere = 0;
+        for path in changed {
+            let Some((key, name)) = entry_location(&root, path) else {
+                continue;
+            };
+            let Some(body) = read_body(path) else {
+                continue;
+            };
+            let recorded = record
+                .folders
+                .get(&key)
+                .and_then(|copies| copies.get(&name))
+                .map(|copy| &copy.content);
+            if recorded == Some(&hash(&Value::Object(body))) {
+                // Sync wrote it, or nothing changed.
+                continue;
+            }
+            if Some(&key) == self.desktop.as_ref() {
+                if automatic {
+                    self.due = Some(now + SETTLE);
+                }
+            } else {
+                elsewhere += 1;
+            }
+        }
+        let settled = self
+            .switched_at
+            .is_none_or(|at| now.duration_since(at) > SWITCH_GRACE);
+        if self.desktop.is_some() && settled && env.os.desktop_app_running() {
+            elsewhere
+        } else {
+            0
+        }
+    }
+
+    /// Whether Automatic mode's run is due now (then it's no longer pending).
+    pub(crate) fn take_due(&mut self, now: Timestamp) -> bool {
+        let due = self.due.is_some_and(|due| due <= now);
+        if due {
+            self.due = None;
+        }
+        due
+    }
+
+    /// A run happened, whatever started it: nothing is pending any more.
+    pub(crate) fn ran(&mut self) {
+        self.due = None;
+    }
+
+    /// How long until Automatic mode's run, if one is pending.
+    pub(crate) fn until_due(&self, now: Timestamp) -> Option<Duration> {
+        let due = self.due?;
+        Some(Duration::try_from(due.duration_since(now)).unwrap_or(Duration::ZERO))
+    }
+}
+
+/// `<account>/<org>` and the file name of a `local_*.json` under `root`.
+fn entry_location(root: &Path, path: &Path) -> Option<(String, String)> {
+    let parts: Vec<&str> = path
+        .strip_prefix(root)
+        .ok()?
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<_>>()?;
+    let [account, org, name] = parts.as_slice() else {
+        return None;
+    };
+    let entry = name.starts_with("local_") && name.ends_with(".json");
+    (desktop::is_uuid(account) && desktop::is_uuid(org) && entry)
+        .then(|| (format!("{account}/{org}"), (*name).to_owned()))
+}
+
+fn read_body(path: &Path) -> Option<Map<String, Value>> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    match serde_json::from_slice(&fs::read(path).ok()?).ok()? {
+        Value::Object(body) => Some(body),
+        _ => None,
+    }
+}
+
+fn sidebar_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/Claude/claude-code-sessions")
+}
+
+/// The desktop's Active Profile folder as `<account>/<org>`.
+fn active_key(desktop_paths: &DesktopPaths) -> Option<String> {
+    let account = desktop::desktop_account(desktop_paths)?;
+    let org = account.organization_uuid?;
+    Some(format!("{}/{org}", account.account_uuid))
+}
+
 /// "Sync now".
 pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
     let desktop_paths = DesktopPaths::new(&env.home);
@@ -182,10 +363,7 @@ pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
         return Run::UnknownFields(read.unknown_fields);
     }
     let record = load(paths);
-    let active_key = desktop.as_ref().and_then(|account| {
-        let org = account.organization_uuid.as_ref()?;
-        Some(format!("{}/{org}", account.account_uuid))
-    });
+    let active_key = active_key(&desktop_paths);
     let active = read
         .folders
         .iter()
@@ -306,10 +484,7 @@ pub(crate) fn accept_current(env: &Environment, paths: &AppPaths) {
         .iter()
         .map(|folder| (folder.key.clone(), copy_records(folder)))
         .collect();
-    record.desktop_folder = desktop::desktop_account(&desktop_paths).and_then(|account| {
-        let org = account.organization_uuid?;
-        Some(format!("{}/{org}", account.account_uuid))
-    });
+    record.desktop_folder = active_key(&desktop_paths);
     record.main_log_length = desktop::main_log_length(&desktop_paths);
     save(paths, &record);
 }
@@ -522,7 +697,7 @@ fn hash(value: &Value) -> String {
 
 /// Reads every `<account>/<org>/` folder (real folders with uuid names).
 fn read_all(home: &Path) -> Read {
-    let root = home.join("Library/Application Support/Claude/claude-code-sessions");
+    let root = sidebar_root(home);
     let mut read = Read {
         folders: Vec::new(),
         skipped: BTreeSet::new(),

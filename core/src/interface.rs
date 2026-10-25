@@ -135,6 +135,9 @@ pub enum SidebarSyncMode {
     Off,
     /// Sync runs on "Sync now".
     Manual,
+    /// Sync also runs a few seconds after each change to the desktop's
+    /// Active Profile folder, and before a Guided switch.
+    Automatic,
 }
 
 /// A feature that writes Claude's files and can get a Safety pause
@@ -234,6 +237,9 @@ pub enum Event {
     /// Files changed under the folders of [`Effect::WatchSessionFiles`]
     /// (already debounced, about a second): the paths FSEvents reported.
     SessionFilesChanged(Vec<PathBuf>),
+    /// Files changed under the folders of [`Effect::WatchSidebarFolders`]
+    /// (already debounced, about a second): the paths FSEvents reported.
+    SidebarFilesChanged(Vec<PathBuf>),
 }
 
 /// An action only the UI layer can perform. The UI does exactly this and
@@ -288,6 +294,13 @@ pub enum Effect {
     WatchSessionFiles(Vec<PathBuf>),
     /// Stop the watch [`Effect::WatchSessionFiles`] started.
     StopWatchingSessionFiles,
+    /// Watch these folders (recursively, debounced about a second) and send
+    /// [`Event::SidebarFilesChanged`] for what changes, until
+    /// [`Effect::StopWatchingSidebarFolders`]. Independent of the All
+    /// Sessions watch; replaces any earlier Sidebar watch.
+    WatchSidebarFolders(Vec<PathBuf>),
+    /// Stop the watch [`Effect::WatchSidebarFolders`] started.
+    StopWatchingSidebarFolders,
     /// Ask before an irreversible action: an alert with `title` and
     /// `message`, a destructive confirm button and Cancel. Confirming sends
     /// `confirm`; Cancel sends nothing.
@@ -522,7 +535,7 @@ pub struct NotificationsView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarSyncView {
     pub mode: SidebarSyncMode,
-    /// "Sync now", present in Manual mode: [`Command::SyncSidebarNow`].
+    /// "Sync now", present while sync is on: [`Command::SyncSidebarNow`].
     pub sync_now: Option<Command>,
     /// What the last sync did, or why it didn't run.
     pub note: Option<String>,
