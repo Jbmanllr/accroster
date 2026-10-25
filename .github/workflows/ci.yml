@@ -1,0 +1,49 @@
+# The hosted gate: format, lint, then every test, on macOS (the app and its
+# tests are macOS-only). One job, so one required check and one setup; the
+# steps run cheapest first and stop at the first failure.
+#
+# The tests need nothing a runner lacks: Claude Code is a stub script, the Mac
+# is a temp folder (fake-mac), FSEvents works in any folder, and the shells
+# and tools they start (/bin/sh, /bin/zsh, /bin/kill, plutil) ship with macOS.
+# Bundling and signing (scripts/bundle.sh: rsvg-convert, a keychain identity)
+# and the running app (a GUI session) are not part of this gate.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A newer push to a pull request supersedes its run; main's runs finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # Same toolchain as rust-toolchain.toml, so a new stable clippy lint
+      # never fails a pull request that passes locally.
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main's runs write the cache pull requests read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
