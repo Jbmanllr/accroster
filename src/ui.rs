@@ -5,25 +5,30 @@
 //! thread; each [`Update`] hops to the main queue and is applied there.
 
 use std::cell::{OnceCell, RefCell};
+use std::ffi::{c_int, c_void};
 
 use accroster_core::driver::{self, CoreHandle, Update};
-use accroster_core::{Command, Core, Effect, LimitBar, MenuItem, ProfileRow, SettingsView, View};
+use accroster_core::{
+    Command, Core, Effect, Event, LimitBar, MenuItem, ProfileRow, SettingsView, View,
+};
+use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSApplication, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
     NSControlSize, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontWeightRegular,
     NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle,
-    NSMenu, NSMenuItem, NSResponder, NSStackView, NSStatusBar, NSStatusItem, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowStyleMask, NSWorkspace,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSResponder, NSStackView, NSStatusBar, NSStatusItem,
+    NSTextField, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL, ns_string,
+    NSArray, NSAttributedString, NSDictionary, NSDistributedNotificationCenter, NSEdgeInsets,
+    NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 
 /// Width of a Profile row in the menu.
@@ -50,11 +55,17 @@ pub fn start(core: Core, mtm: MainThreadMarker) {
         });
     });
     ui.ivars().core.set(handle).expect("the core starts once");
+    ui.observe_the_mac();
 }
 
 pub struct Ivars {
     core: OnceCell<CoreHandle>,
     status_item: Retained<NSStatusItem>,
+    /// The status item's menu. It is kept and refilled on every update, so
+    /// an open menu updates in place.
+    menu: Retained<NSMenu>,
+    /// Keeps the network path monitor alive.
+    network: OnceCell<NetworkMonitor>,
     /// The commands of the menu's clickable items (submenus included), by tag.
     actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
@@ -85,7 +96,36 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Ui {}
 
+    unsafe impl NSMenuDelegate for Ui {
+        /// The status item's menu is opening: the core refreshes old
+        /// readings in the background.
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            self.event(Event::MenuOpened);
+        }
+    }
+
     impl Ui {
+        #[unsafe(method(willSleep:))]
+        fn will_sleep(&self, _notification: &NSNotification) {
+            self.event(Event::WillSleep);
+        }
+
+        #[unsafe(method(didWake:))]
+        fn did_wake(&self, _notification: &NSNotification) {
+            self.event(Event::DidWake);
+        }
+
+        #[unsafe(method(screenLocked:))]
+        fn screen_locked(&self, _notification: &NSNotification) {
+            self.event(Event::ScreenLocked);
+        }
+
+        #[unsafe(method(screenUnlocked:))]
+        fn screen_unlocked(&self, _notification: &NSNotification) {
+            self.event(Event::ScreenUnlocked);
+        }
+
         /// A menu item was clicked; its tag indexes the menu's commands.
         #[unsafe(method(menuItemClicked:))]
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
@@ -132,14 +172,65 @@ impl Ui {
     fn new(mtm: MainThreadMarker) -> Retained<Ui> {
         let status_item =
             NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        status_item.setMenu(Some(&menu));
         let this = Ui::alloc(mtm).set_ivars(Ivars {
             core: OnceCell::new(),
             status_item,
+            menu,
+            network: OnceCell::new(),
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
             first_run: RefCell::new(None),
         });
-        unsafe { msg_send![super(this), init] }
+        let this: Retained<Ui> = unsafe { msg_send![super(this), init] };
+        this.ivars()
+            .menu
+            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
+        this
+    }
+
+    /// Forwards sleep and wake, screen lock and unlock, and network path
+    /// changes to the core.
+    fn observe_the_mac(&self) {
+        let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
+        let distributed = NSDistributedNotificationCenter::defaultCenter();
+        // SAFETY: each selector names a method of `Ui` taking one
+        // NSNotification; the observer lives as long as the app.
+        unsafe {
+            workspace.addObserver_selector_name_object(
+                self,
+                sel!(willSleep:),
+                Some(NSWorkspaceWillSleepNotification),
+                None,
+            );
+            workspace.addObserver_selector_name_object(
+                self,
+                sel!(didWake:),
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+            );
+            distributed.addObserver_selector_name_object(
+                self,
+                sel!(screenLocked:),
+                Some(ns_string!("com.apple.screenIsLocked")),
+                None,
+            );
+            distributed.addObserver_selector_name_object(
+                self,
+                sel!(screenUnlocked:),
+                Some(ns_string!("com.apple.screenIsUnlocked")),
+                None,
+            );
+        }
+        let _ = self.ivars().network.set(NetworkMonitor::start());
+    }
+
+    fn event(&self, event: Event) {
+        if let Some(core) = self.ivars().core.get() {
+            core.event(event);
+        }
     }
 
     fn mtm(&self) -> MainThreadMarker {
@@ -167,7 +258,9 @@ impl Ui {
             button.setTitle(&NSString::from_str(&view.menu_bar.label));
         }
         let mut actions = Vec::new();
-        item.setMenu(Some(&self.build_menu(&view.menu.items, &mut actions)));
+        let menu = &self.ivars().menu;
+        menu.removeAllItems();
+        self.fill_menu(menu, &view.menu.items, &mut actions);
         *self.ivars().actions.borrow_mut() = actions;
         if let Some(settings) = self.ivars().settings.get() {
             render_settings(settings, &view.settings);
@@ -196,12 +289,18 @@ impl Ui {
         }
     }
 
-    /// Builds a menu from `items`, recording each clickable item's command in
-    /// `actions` under the tag it gets.
+    /// Builds a submenu from `items`.
     fn build_menu(&self, items: &[MenuItem], actions: &mut Vec<Command>) -> Retained<NSMenu> {
-        let mtm = self.mtm();
-        let menu = NSMenu::new(mtm);
+        let menu = NSMenu::new(self.mtm());
         menu.setAutoenablesItems(false);
+        self.fill_menu(&menu, items, actions);
+        menu
+    }
+
+    /// Adds `items` to `menu`, recording each clickable item's command in
+    /// `actions` under the tag it gets.
+    fn fill_menu(&self, menu: &NSMenu, items: &[MenuItem], actions: &mut Vec<Command>) {
+        let mtm = self.mtm();
         for item in items {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
@@ -231,7 +330,6 @@ impl Ui {
             };
             menu.addItem(&row);
         }
-        menu
     }
 
     fn perform(&self, effect: Effect, view: &View) {
@@ -496,6 +594,9 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
     }
     let refs: Vec<&NSView> = lines.iter().map(|view| &**view).collect();
     let body = stack(mtm, true, 3.0, &refs);
+    if row.dimmed {
+        body.setAlphaValue(0.5);
+    }
     body.setEdgeInsets(NSEdgeInsets {
         top: 5.0,
         left: 16.0,
@@ -531,7 +632,12 @@ fn limit_line(mtm: MainThreadMarker, bar: &LimitBar) -> Retained<NSView> {
         .heightAnchor()
         .constraintEqualToConstant(10.0)
         .setActive(true);
-    let percent = label(mtm, &format!("{}%", bar.percent), regular(), false);
+    let text = if bar.reset {
+        "Reset".to_owned()
+    } else {
+        format!("{}%", bar.percent)
+    };
+    let percent = label(mtm, &text, regular(), false);
     stack(mtm, false, 6.0, &[&name, &level, &percent]).into_super()
 }
 
@@ -627,4 +733,66 @@ pub fn show_fatal_error(mtm: MainThreadMarker, message: &str) {
     alert.setInformativeText(&NSString::from_str(message));
     NSApplication::sharedApplication(mtm).activate();
     alert.runModal();
+}
+
+/// Watches the Mac's network path (`NWPathMonitor`) and tells the core when
+/// it is gained or lost, starting with the current state.
+struct NetworkMonitor {
+    monitor: *mut c_void,
+}
+
+#[link(name = "Network", kind = "framework")]
+unsafe extern "C" {
+    fn nw_path_monitor_create() -> *mut c_void;
+    fn nw_path_monitor_set_update_handler(
+        monitor: *mut c_void,
+        handler: &block2::Block<dyn Fn(*mut c_void)>,
+    );
+    fn nw_path_monitor_set_queue(monitor: *mut c_void, queue: &DispatchQueue);
+    fn nw_path_monitor_start(monitor: *mut c_void);
+    fn nw_path_monitor_cancel(monitor: *mut c_void);
+    fn nw_path_get_status(path: *mut c_void) -> c_int;
+    fn nw_release(object: *mut c_void);
+}
+
+/// `nw_path_status_satisfied`.
+const NW_PATH_STATUS_SATISFIED: c_int = 1;
+
+impl NetworkMonitor {
+    fn start() -> NetworkMonitor {
+        let last = std::cell::Cell::new(None::<bool>);
+        let handler = RcBlock::new(move |path: *mut c_void| {
+            // SAFETY: `path` is the nw_path_t the monitor passes in.
+            let online = unsafe { nw_path_get_status(path) } == NW_PATH_STATUS_SATISFIED;
+            if last.replace(Some(online)) == Some(online) {
+                return;
+            }
+            UI.with(|cell| {
+                if let Some(ui) = cell.get() {
+                    ui.event(Event::NetworkChanged { online });
+                }
+            });
+        });
+        // SAFETY: the monitor is created, given its handler and the main
+        // queue (the handler touches the UI's thread-local), then started;
+        // it is cancelled and released on drop.
+        unsafe {
+            let monitor = nw_path_monitor_create();
+            nw_path_monitor_set_update_handler(monitor, &handler);
+            nw_path_monitor_set_queue(monitor, DispatchQueue::main());
+            nw_path_monitor_start(monitor);
+            NetworkMonitor { monitor }
+        }
+    }
+}
+
+impl Drop for NetworkMonitor {
+    fn drop(&mut self) {
+        // SAFETY: `monitor` came from nw_path_monitor_create and is used
+        // nowhere else.
+        unsafe {
+            nw_path_monitor_cancel(self.monitor);
+            nw_release(self.monitor);
+        }
+    }
 }

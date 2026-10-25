@@ -36,6 +36,7 @@ publish.workspace = true
 
 [dependencies]
 accroster-core.workspace = true
+block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"

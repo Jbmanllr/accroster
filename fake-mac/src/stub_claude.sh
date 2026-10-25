@@ -67,8 +67,13 @@ fi
 reply="$replies/$first"
 
 # A hanging reply waits, like a sign-in nobody finishes, until killed. exec
-# keeps the pid, so killing the recorded pid kills the wait.
+# keeps the pid, so killing the recorded pid kills the wait. It is consumed
+# first, like any other reply, unless it is the last one.
 if [ -f "$reply/hang" ]; then
+  if [ "$count" -gt 1 ]; then
+    mkdir -p "$state/used/$key"
+    mv "$reply" "$state/used/$key/$first"
+  fi
   exec /bin/sleep 600
 fi
 

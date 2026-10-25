@@ -12,6 +12,7 @@ pub mod driver;
 pub mod env;
 pub mod interface;
 mod logging;
+mod monitor;
 mod profiles;
 mod runner;
 mod settings;

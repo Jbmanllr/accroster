@@ -31,7 +31,10 @@ fn a_signed_in_profile_appears_with_its_session_weekly_and_model_bars() {
     );
     assert_eq!(
         rows[0].submenu,
-        [MenuItem::Detail("me@work.example · Work Inc · Max".into())]
+        [
+            MenuItem::Detail("me@work.example · Work Inc · Max".into()),
+            MenuItem::Detail("Limits as of 14:02".into()),
+        ]
     );
     assert_eq!(rows[0].note, None);
     assert!(action_titles(&core).contains(&"Add Profile…".to_string()));

@@ -123,3 +123,12 @@ pub(crate) fn seed_claude_json(profile_dir: &Path, home: &Path) -> io::Result<()
     bytes.push(b'\n');
     storage::write_atomically(&target, &bytes)
 }
+
+/// The CLI's Active Profile folder: the path the pointer
+/// `bin/cli-active-profile` holds, verbatim. `None` without a pointer.
+pub(crate) fn cli_active_config_dir(paths: &storage::AppPaths) -> Option<PathBuf> {
+    let bytes = fs::read(paths.bin().join("cli-active-profile")).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let path = text.strip_suffix('\n').unwrap_or(&text);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}

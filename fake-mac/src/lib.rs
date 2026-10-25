@@ -607,6 +607,11 @@ impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
         *self.0.lock().unwrap()
     }
+
+    /// UTC, so times shown in tests read like [`START_TIME`] ("14:02").
+    fn time_zone(&self) -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::UTC
+    }
 }
 
 #[derive(Debug, Default)]

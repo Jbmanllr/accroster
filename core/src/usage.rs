@@ -5,6 +5,7 @@
 //! label, falling back to `five_hour` / `seven_day` when `limits` is absent.
 //! The API's `severity` is ignored.
 
+use jiff::Timestamp;
 use serde_json::Value;
 
 /// A usage answer, as far as it could be read.
@@ -17,15 +18,38 @@ pub(crate) struct UsageReply {
     pub rate_limits_available: Option<bool>,
     /// `None` when `rate_limits` was null or isn't a usage body.
     pub limits: Option<Limits>,
+    /// Whether `rate_limits` was null (or absent): with
+    /// `rate_limits_available: true` that is a failed fetch, not an
+    /// unreadable answer.
+    pub rate_limits_null: bool,
 }
 
-/// A Profile's limits, utilization in percent (0–100, fractional).
+/// A Profile's limits.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Limits {
-    pub session: Option<f64>,
-    pub weekly: Option<f64>,
-    /// Model-specific weekly limits: display name and utilization.
-    pub models: Vec<(String, f64)>,
+    pub session: Option<Limit>,
+    pub weekly: Option<Limit>,
+    /// Model-specific weekly limits, by display name.
+    pub models: Vec<(String, Limit)>,
+}
+
+impl Limits {
+    /// Every limit, Session first.
+    pub fn all(&self) -> impl Iterator<Item = &Limit> {
+        self.session
+            .iter()
+            .chain(&self.weekly)
+            .chain(self.models.iter().map(|(_, limit)| limit))
+    }
+}
+
+/// One limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Limit {
+    /// Utilization in percent (0–100, fractional).
+    pub percent: f64,
+    /// When the window resets, when known.
+    pub resets_at: Option<Timestamp>,
 }
 
 /// Reads the `control_response` answering `request_id` from stream-json
@@ -72,6 +96,7 @@ fn reply_from_body(body: &Value) -> UsageReply {
             .map(str::to_owned),
         rate_limits_available: body.get("rate_limits_available").and_then(Value::as_bool),
         limits: body.get("rate_limits").and_then(parse_rate_limits),
+        rate_limits_null: body.get("rate_limits").is_none_or(Value::is_null),
     }
 }
 
@@ -93,7 +118,13 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
     if !USAGE_BODY_KEYS.iter().any(|key| object.contains_key(*key)) {
         return None;
     }
-    let utilization = |key: &str| body.get(key)?.get("utilization")?.as_f64();
+    let utilization = |key: &str| {
+        let window = body.get(key)?;
+        Some(Limit {
+            percent: window.get("utilization")?.as_f64()?,
+            resets_at: resets_at(window),
+        })
+    };
     let mut limits = Limits {
         session: utilization("five_hour"),
         weekly: utilization("seven_day"),
@@ -105,15 +136,19 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
                 let Some(percent) = entry.get("percent").and_then(Value::as_f64) else {
                     continue;
                 };
+                let limit = Limit {
+                    percent,
+                    resets_at: resets_at(entry),
+                };
                 match entry.get("kind").and_then(Value::as_str) {
-                    Some("session") => limits.session = Some(percent),
-                    Some("weekly_all") => limits.weekly = Some(percent),
+                    Some("session") => limits.session = Some(limit),
+                    Some("weekly_all") => limits.weekly = Some(limit),
                     Some("weekly_scoped") => {
                         if let Some(name) = entry
                             .pointer("/scope/model/display_name")
                             .and_then(Value::as_str)
                         {
-                            limits.models.push((name.to_owned(), percent));
+                            limits.models.push((name.to_owned(), limit));
                         }
                     }
                     _ => {}
@@ -122,11 +157,16 @@ fn parse_rate_limits(body: &Value) -> Option<Limits> {
         }
         None => {
             for (key, name) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
-                if let Some(percent) = utilization(key) {
-                    limits.models.push((name.to_owned(), percent));
+                if let Some(limit) = utilization(key) {
+                    limits.models.push((name.to_owned(), limit));
                 }
             }
         }
     }
     Some(limits)
+}
+
+/// An ISO 8601 `resets_at`; `None` when absent or unreadable.
+fn resets_at(window: &Value) -> Option<Timestamp> {
+    window.get("resets_at")?.as_str()?.parse().ok()
 }

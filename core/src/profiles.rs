@@ -17,11 +17,11 @@ use serde_json::Value;
 
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
-use crate::interface::{LimitBar, MenuItem, ProfileRow};
+use crate::interface::{MenuItem, ProfileRow};
 use crate::logging::{Field, Level, Logger};
+use crate::monitor::{LimitsView, Watched};
 use crate::runner::Runner;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
-use crate::usage::UsageReply;
 
 /// A sign-in still running after this long is killed.
 pub(crate) const SIGN_IN_TIMEOUT: SignedDuration = SignedDuration::from_mins(10);
@@ -35,12 +35,17 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn log(&self, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {
+    pub(crate) fn log(
+        &self,
+        level: Level,
+        message: &'static str,
+        fields: &[(&'static str, Field<'_>)],
+    ) {
         self.logger
             .write(self.env.clock.now(), self.verbose, level, message, fields);
     }
 
-    fn runner(&self) -> Runner<'_> {
+    pub(crate) fn runner(&self) -> Runner<'_> {
         Runner::new(self.env, self.paths)
     }
 }
@@ -103,67 +108,33 @@ impl VersionedFile for RegistryFile {
     const VERSION: u64 = 1;
 }
 
-/// The outcome of the latest usage read.
-#[derive(Debug, Clone, PartialEq)]
-enum Reading {
-    Read(UsageReply),
-    Failed,
-}
-
 struct Profile {
     id: String,
     config_dir: PathBuf,
     identity: Option<Identity>,
-    reading: Option<Reading>,
 }
 
 impl Profile {
-    fn row(&self, identity: &Identity) -> ProfileRow {
-        let mut limits = Vec::new();
-        let mut note = None;
-        let mut plan = identity
-            .organization_type
-            .as_deref()
-            .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned());
-        match &self.reading {
-            None => {}
-            Some(Reading::Read(reply)) => {
-                if let Some(kind) = &reply.subscription_type {
-                    plan = Some(kind.clone());
-                }
-                match &reply.limits {
-                    Some(read) => {
-                        let mut bar = |label: &str, percent: f64| {
-                            limits.push(LimitBar {
-                                label: label.to_owned(),
-                                percent: percent.max(0.0).floor() as u32,
-                            });
-                        };
-                        if let Some(percent) = read.session {
-                            bar("Session", percent);
-                        }
-                        if let Some(percent) = read.weekly {
-                            bar("Weekly", percent);
-                        }
-                        for (name, percent) in &read.models {
-                            bar(name, *percent);
-                        }
-                    }
-                    None => note = Some("Couldn't read limits".to_owned()),
-                }
-            }
-            Some(Reading::Failed) => note = Some("Couldn't read limits".to_owned()),
-        }
+    fn row(identity: &Identity, limits: LimitsView) -> ProfileRow {
+        let plan = limits.plan.or_else(|| {
+            identity
+                .organization_type
+                .as_deref()
+                .map(|kind| kind.strip_prefix("claude_").unwrap_or(kind).to_owned())
+        });
         let mut detail = identity.name();
         if let Some(plan) = plan.filter(|plan| !plan.is_empty()) {
             detail.push_str(" · ");
             detail.push_str(&capitalized(&plan));
         }
+        let mut submenu = vec![MenuItem::Detail(detail)];
+        submenu.extend(limits.details.into_iter().map(MenuItem::Detail));
         ProfileRow {
             title: identity.name(),
-            limits,
-            note,
-            submenu: vec![MenuItem::Detail(detail)],
+            limits: limits.bars,
+            note: limits.note,
+            dimmed: limits.dimmed,
+            submenu,
         }
     }
 }
@@ -227,7 +198,6 @@ impl ProfileRegistry {
                     identity: Identity::read(&entry.config_dir),
                     id: entry.id,
                     config_dir: entry.config_dir,
-                    reading: None,
                 });
             }
         }
@@ -267,7 +237,6 @@ impl ProfileRegistry {
                         id,
                         config_dir,
                         identity: Some(identity),
-                        reading: None,
                     });
                     changed = true;
                 }
@@ -428,16 +397,37 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
-    /// One row per signed-in Profile, in order.
-    pub(crate) fn rows(&self) -> Vec<ProfileRow> {
+    /// One row per signed-in Profile, in order, with what `limits` says
+    /// about each one's limits.
+    pub(crate) fn rows(&self, limits: impl Fn(&str) -> LimitsView) -> Vec<ProfileRow> {
         self.profiles
             .iter()
-            .filter_map(|profile| Some(profile.row(profile.identity.as_ref()?)))
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(Profile::row(identity, limits(&profile.id)))
+            })
+            .collect()
+    }
+
+    /// The signed-in Profiles the Limit monitor reads, in order; `active`
+    /// says which folders are a client's Active Profile.
+    pub(crate) fn watched(&self, active: impl Fn(&Path) -> bool) -> Vec<Watched> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let identity = profile.identity.as_ref()?;
+                Some(Watched {
+                    id: profile.id.clone(),
+                    config_dir: profile.config_dir.clone(),
+                    account_uuid: identity.account_uuid.clone(),
+                    active: active(&profile.config_dir),
+                })
+            })
             .collect()
     }
 
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
-    /// otherwise records the Profile and reads its limits.
+    /// otherwise records the Profile (the Limit monitor reads it next).
     fn finish(&mut self, ctx: &Context, sign_in: SignIn) {
         let SignIn { id, config_dir, .. } = sign_in;
         let Some(identity) = Identity::read(&config_dir) else {
@@ -488,17 +478,6 @@ impl ProfileRegistry {
                 ));
             }
         }
-        let reading = match ctx.runner().read_usage(&config_dir) {
-            Some(reply) => Reading::Read(reply),
-            None => {
-                ctx.log(
-                    Level::Warn,
-                    "limits unreadable",
-                    &[("profile", Field::Profile(&id))],
-                );
-                Reading::Failed
-            }
-        };
         ctx.log(
             Level::Info,
             "profile added",
@@ -508,7 +487,6 @@ impl ProfileRegistry {
             id,
             config_dir,
             identity: Some(identity),
-            reading: Some(reading),
         });
         self.save(ctx);
     }

@@ -7,6 +7,7 @@ name = "accroster"
 version = "0.1.0"
 dependencies = [
  "accroster-core",
+ "block2",
  "dispatch2",
  "objc2",
  "objc2-app-kit",

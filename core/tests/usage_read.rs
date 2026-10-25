@@ -110,11 +110,11 @@ fn every_field_is_optional() {
 }
 
 #[test]
-fn null_rate_limits_show_couldnt_read_limits() {
+fn null_rate_limits_are_a_failed_fetch_that_backs_off() {
     let (bars, note) = read_with(usage_reply(Value::Null));
 
     assert!(bars.is_empty());
-    assert_eq!(note.as_deref(), Some("Couldn't read limits"));
+    assert_eq!(note.as_deref(), Some("Couldn't refresh · next try 14:07"));
 }
 
 #[test]
