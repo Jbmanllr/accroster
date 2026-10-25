@@ -406,7 +406,7 @@ pub(crate) fn transcript_records(home: &Path) -> Finding {
     if files.is_empty() {
         return Finding::never_seen();
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut bad = BTreeSet::new();
     for (_, path) in files.iter().take(TRANSCRIPT_SAMPLE) {
         let mut text = String::new();

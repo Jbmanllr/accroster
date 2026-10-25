@@ -119,7 +119,7 @@ pub(crate) fn prune(backups: &Path, now: Timestamp) -> io::Result<usize> {
                 Some((taken, path))
             })
             .collect();
-        copies.sort_by(|a, b| b.0.cmp(&a.0));
+        copies.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (taken, path) in copies.into_iter().skip(KEEP_LAST) {
             if now.duration_since(taken) >= KEEP_YOUNGER_THAN {
                 if path.is_dir() {
