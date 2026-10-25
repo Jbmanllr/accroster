@@ -42,6 +42,10 @@ _Avoid_: monthly limit
 A saved, not-yet-used reset of one of a Profile's limits, redeemable until its expiry date.
 _Avoid_: reset grant, reset credit
 
+**Session refill**:
+A recurring weekly allowance that refills a Profile's Session limit at the cost of its Weekly limit; it never expires and is not a Banked reset.
+_Avoid_: weekly reset, session reset, refill (alone)
+
 **Limit reading**:
 All of a Profile's limits as fetched at one moment, with the time it was taken.
 _Avoid_: usage data, snapshot, figures
