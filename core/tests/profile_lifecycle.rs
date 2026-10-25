@@ -79,11 +79,16 @@ fn profiles_can_be_reordered_and_the_order_survives_a_relaunch() {
     assert_eq!(titles(&core), [WORK, PERSO], "add order at first");
     assert_eq!(
         row_actions(&rows(&core)[0]),
-        ["Move Down", "Rename…", "Remove…"]
+        [
+            "Limit resets → claude.ai",
+            "Move Down",
+            "Rename…",
+            "Remove…"
+        ]
     );
     assert_eq!(
         row_actions(&rows(&core)[1]),
-        ["Move Up", "Rename…", "Remove…"]
+        ["Limit resets → claude.ai", "Move Up", "Rename…", "Remove…"]
     );
 
     click_in_row(&mut core, 1, "Move Up");

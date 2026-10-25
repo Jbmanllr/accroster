@@ -11,14 +11,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
 use crate::cli_switcher;
-use crate::env::{Environment, RunningProcess};
-use crate::interface::{Command, Effect, LimitBar, MenuItem, NicknameTarget, ProfileRow};
+use crate::env::{Clock, Environment, RunningProcess};
+use crate::interface::{
+    Command, DiscoveredPair, Effect, LimitBar, MenuItem, NicknameTarget, ProfileRow,
+};
+use crate::limit_offers;
 use crate::logging::{Field, Level, Logger};
 use crate::runner::Runner;
 use crate::settings::Settings;
@@ -80,6 +84,10 @@ impl Identity {
         self.account_uuid == other.account_uuid && self.organization_uuid == other.organization_uuid
     }
 
+    fn is(&self, pair: &DiscoveredPair) -> bool {
+        self.account_uuid == pair.account_uuid && self.organization_uuid == pair.organization_uuid
+    }
+
     /// `email · Organization`.
     fn name(&self) -> String {
         format!("{} · {}", self.email, self.organization_name)
@@ -129,9 +137,17 @@ struct Profile {
 impl Profile {
     /// The menu row: `title` is the nickname, else `email · Organization`;
     /// `position` and `count` decide which Move items the submenu offers.
-    fn row(&self, title: String, position: usize, count: usize) -> ProfileRow {
+    fn row(
+        &self,
+        title: String,
+        position: usize,
+        count: usize,
+        now: Timestamp,
+        tz: &TimeZone,
+    ) -> ProfileRow {
         let mut limits = Vec::new();
         let mut note = None;
+        let mut offers = Vec::new();
         let mut submenu = Vec::new();
         if let Some(identity) = &self.identity {
             let mut plan = identity
@@ -141,26 +157,21 @@ impl Profile {
             match &self.reading {
                 None => {}
                 Some(Reading::Read(reply)) => {
+                    offers = limit_offers::lines(
+                        reply.banked_reset.as_ref(),
+                        reply.session_refill.as_ref(),
+                        now,
+                        tz,
+                    );
                     if let Some(kind) = &reply.subscription_type {
                         plan = Some(kind.clone());
                     }
                     match &reply.limits {
                         Some(read) => {
-                            let mut bar = |label: &str, percent: f64| {
-                                limits.push(LimitBar {
-                                    label: label.to_owned(),
-                                    percent: percent.max(0.0).floor() as u32,
-                                });
-                            };
-                            if let Some(percent) = read.session {
-                                bar("Session", percent);
-                            }
-                            if let Some(percent) = read.weekly {
-                                bar("Weekly", percent);
-                            }
-                            for (name, percent) in &read.models {
-                                bar(name, *percent);
-                            }
+                            limits.extend(read.all().map(|(label, percent)| LimitBar {
+                                label: label.to_owned(),
+                                percent: percent.max(0.0).floor() as u32,
+                            }));
                         }
                         None => note = Some("Couldn't read limits".to_owned()),
                     }
@@ -173,6 +184,12 @@ impl Profile {
                 detail.push_str(&capitalized(&plan));
             }
             submenu.push(MenuItem::Detail(detail));
+            if !self.expired {
+                submenu.push(MenuItem::Action {
+                    title: "Limit resets → claude.ai".to_owned(),
+                    command: Command::OpenLimitResets,
+                });
+            }
         }
         let action = |title: &str, command: Command| MenuItem::Action {
             title: title.to_owned(),
@@ -209,7 +226,7 @@ impl Profile {
         }
         submenu.push(action(
             "Rename…",
-            Command::AskNickname(NicknameTarget::Profile(self.id.clone())),
+            Command::Rename(NicknameTarget::Profile(self.id.clone())),
         ));
         submenu.push(action(
             "Remove…",
@@ -220,6 +237,7 @@ impl Profile {
             limits,
             note,
             dimmed: self.expired,
+            offers,
             submenu,
         }
     }
@@ -240,12 +258,23 @@ fn capitalized(word: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The account a sign-in started from a Discovered Profile is meant to add.
+pub(crate) struct SignInTarget {
+    pub pair: DiscoveredPair,
+    /// Passed as `--email` when known.
+    pub email: Option<String>,
+    /// How the menu names it ("X" in "Signed in as Y, not X").
+    pub name: String,
+}
+
 /// A sign-in waiting for the user in the browser.
 struct SignIn {
     id: String,
     config_dir: PathBuf,
     process: Box<dyn RunningProcess>,
     started_at: Timestamp,
+    /// The Discovered Profile Add Profile… was aimed at, if any.
+    target: Option<SignInTarget>,
     /// Set for "Sign in again…" in an existing Profile's folder.
     again: Option<Again>,
 }
@@ -370,8 +399,10 @@ impl ProfileRegistry {
     }
 
     /// Add Profile…: creates the folder, links it, seeds `.claude.json`, and
-    /// starts the browser sign-in. Ignored while a sign-in is running.
-    pub(crate) fn add(&mut self, ctx: &Context) {
+    /// starts the browser sign-in. Ignored while a sign-in is running. With a
+    /// `target` (a Discovered Profile), its email is passed to the sign-in and
+    /// the account that signs in is checked against its pair.
+    pub(crate) fn add(&mut self, ctx: &Context, target: Option<SignInTarget>) {
         if self.sign_in.is_some() {
             return;
         }
@@ -406,13 +437,15 @@ impl ProfileRegistry {
                 ],
             );
         }
-        match ctx.runner().start_sign_in(&config_dir, None) {
+        let email = target.as_ref().and_then(|target| target.email.as_deref());
+        match ctx.runner().start_sign_in(&config_dir, email) {
             Ok(process) => {
                 self.sign_in = Some(SignIn {
                     id,
                     config_dir,
                     process,
                     started_at: ctx.env.clock.now(),
+                    target,
                     again: None,
                 })
             }
@@ -519,9 +552,20 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
+    /// Whether a signed-in Profile has this (account, Organization) pair.
+    pub(crate) fn has_signed_in(&self, pair: &DiscoveredPair) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.is(pair))
+        })
+    }
+
     /// One row per Profile (signed in, expired or signed out), in the
     /// user's order, titled by nickname when there is one.
-    pub(crate) fn rows(&self, settings: &Settings) -> Vec<ProfileRow> {
+    pub(crate) fn rows(&self, clock: &dyn Clock, settings: &Settings) -> Vec<ProfileRow> {
+        let (now, tz) = (clock.now(), clock.time_zone());
         let listed = self.ordered(&settings.profile_order);
         listed
             .iter()
@@ -532,7 +576,7 @@ impl ProfileRegistry {
                     .get(&profile.id)
                     .cloned()
                     .unwrap_or_else(|| profile.name());
-                profile.row(title, position, listed.len())
+                profile.row(title, position, listed.len(), now, &tz)
             })
             .collect()
     }
@@ -648,7 +692,12 @@ impl ProfileRegistry {
     /// A sign-in exited successfully: reads who signed in, undoes a duplicate,
     /// otherwise records the Profile and reads its limits.
     fn finish(&mut self, ctx: &Context, sign_in: SignIn) {
-        let SignIn { id, config_dir, .. } = sign_in;
+        let SignIn {
+            id,
+            config_dir,
+            target,
+            ..
+        } = sign_in;
         let Some(identity) = Identity::read(&config_dir) else {
             ctx.log(
                 Level::Warn,
@@ -696,6 +745,19 @@ impl ProfileRegistry {
                     identity.name()
                 ));
             }
+        }
+        if let Some(target) = target.filter(|target| !identity.is(&target.pair)) {
+            // Kept: it is a real Profile, just not the one asked for.
+            ctx.log(
+                Level::Info,
+                "sign-in matched another account",
+                &[("profile", Field::Profile(&id))],
+            );
+            self.notice = Some(format!(
+                "Signed in as {}, not {} · to add it, pick that account and Organization in the browser",
+                identity.name(),
+                target.name
+            ));
         }
         ctx.log(
             Level::Info,
@@ -817,6 +879,7 @@ impl ProfileRegistry {
                     config_dir,
                     process,
                     started_at: ctx.env.clock.now(),
+                    target: None,
                     again: Some(Again {
                         expected,
                         previous_account,

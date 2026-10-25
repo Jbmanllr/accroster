@@ -8,9 +8,11 @@
 mod backups;
 mod cli_switcher;
 mod core;
+mod discovered;
 pub mod driver;
 pub mod env;
 pub mod interface;
+mod limit_offers;
 mod logging;
 mod profiles;
 mod runner;
@@ -25,9 +27,12 @@ pub use env::{
 };
 pub use env::{LoginItem, LoginItemStatus, SystemLoginItem};
 pub use interface::{
-    AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, NicknameTarget,
-    ProfileRow, SettingsView, View,
+    AboutView, Command, Effect, Event, LimitBar, MenuBarView, MenuItem, MenuView, ProfileRow,
+    SettingsView, View,
 };
-pub use interface::{FirstRunView, LaunchAtLoginView};
+pub use interface::{
+    DiscoveredPair, DiscoveredRow, FirstRunView, HiddenDiscovered, LaunchAtLoginView,
+    NicknameTarget,
+};
 pub use logging::install_panic_hook;
 pub use storage::{AppPaths, BUNDLE_ID};
