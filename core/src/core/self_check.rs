@@ -286,7 +286,13 @@ impl Core {
     /// The Sidebar entries check. A failure pauses Sidebar sync only while
     /// sync is on: with it off, nothing would be written anyway.
     pub(super) fn check_sidebar_entries(&mut self) {
-        let mut finding = checks::sidebar_entries(&self.env.home);
+        let (mut finding, parsed) =
+            checks::sidebar_entries(&self.env.home, &mut self.sidebar_shapes);
+        self.log(
+            Level::Debug,
+            "sidebar entries checked",
+            &[("parsed", Field::Number(parsed as i64))],
+        );
         if finding.status == CheckStatus::Fail && self.settings.sidebar_sync != SidebarSyncMode::Off
         {
             let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));

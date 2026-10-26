@@ -299,7 +299,7 @@ impl EntryCache {
 /// a new file over it, which changes the inode; the change time also
 /// catches an edit in place whose modification time was put back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     inode: u64,
     len: u64,
     modified: SystemTime,
@@ -307,7 +307,7 @@ struct Stamp {
 }
 
 impl Stamp {
-    fn of(meta: &fs::Metadata) -> Option<Stamp> {
+    pub(crate) fn of(meta: &fs::Metadata) -> Option<Stamp> {
         Some(Stamp {
             inode: meta.ino(),
             len: meta.len(),
