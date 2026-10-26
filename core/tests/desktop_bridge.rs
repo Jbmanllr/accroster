@@ -659,9 +659,8 @@ fn a_paused_sync_stops_the_switch_and_says_why_with_switch_anyway() {
     let (mac, mut core) = desktop_on_perso();
     mac.os.set_desktop_app_running(true);
     core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
-    // Claude added a field sync doesn't know: Sidebar sync pauses.
-    let mut changed = json!({ "sessionId": "local_z", "cliSessionId": "z", "title": "Z" });
-    changed["brandNewField"] = json!(true);
+    // An entry named unlike its sessionId fails the check: Sidebar sync pauses.
+    let changed = json!({ "sessionId": "local_other", "cliSessionId": "z", "title": "Z" });
     mac.write_sidebar_entry(
         &FixtureLogin::perso().account_uuid,
         &FixtureLogin::perso().organization_uuid,

@@ -3,11 +3,14 @@
 //!
 //! - **Where it writes.** Every existing Profile folder (signed in to
 //!   AccRoster or not: a folder is a Profile's sidebar). While Claude runs,
-//!   never into a folder of the desktop's account: Claude reads and
-//!   overwrites its own folder from memory, and its Active Organization
-//!   can't be read from disk, so every Organization of that account is left
-//!   alone. If Claude runs and its account can't be read, nothing is written.
-//!   Folders are never created and files are never deleted.
+//!   a folder of the desktop's account only gains the entries it lacks:
+//!   Claude overwrites the entries it holds from memory, and its Active
+//!   Organization can't be read from disk, so no entry already in any
+//!   Organization of that account is replaced, and a new one is written
+//!   only if no file took its name meanwhile. Claude reads new entries at
+//!   launch or an account switch. If Claude runs and its account can't be
+//!   read, nothing is written. Folders are never created and files are
+//!   never deleted.
 //! - **What it copies.** `local_*.json` entries only (never one for a
 //!   CLI-only Session), skipping scratch, WSL, scheduled-task and (when
 //!   "Include SSH Sessions" is off, ADR 0003's amendment) SSH
@@ -22,11 +25,11 @@
 //!   differs from its record; if several do, the desktop's Active Profile's
 //!   copy, else the newest file. Every other field comes from the copy with
 //!   the newest `lastActivityAt`, which holds the current `cliSessionId`.
-//! - **Before writing** (ADR 0004): every entry read is checked for unknown
-//!   top-level fields; a target folder Claude wasn't using that changed since
-//!   sync's record (and no account switch since) is the dormant multi-account
-//!   mode's trace. Either stops the whole run before any write, for a Safety
-//!   pause. Then each target folder is backed up, each exact file is read
+//! - **Before writing** (ADR 0004): a target folder Claude wasn't using that
+//!   changed since sync's record (and no account switch since) is the dormant
+//!   multi-account mode's trace; it stops the whole run before any write, for
+//!   a Safety pause. Unknown top-level fields don't: they are copied as they
+//!   are. Then each target folder is backed up, each exact file is read
 //!   again, and each copy is written as temp file then rename.
 //! - **Watching** ([`Watch`]): while sync is on, the UI watches
 //!   `claude-code-sessions/`. Automatic mode runs a few seconds after the
@@ -45,11 +48,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::backups;
-use crate::checks::SIDEBAR_ENTRY_FIELDS;
 use crate::desktop::{self, DesktopPaths};
 use crate::env::Environment;
 use crate::interface::Effect;
-use crate::safety::reportable;
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// The desktop app's loader skips larger entries; so does sync.
@@ -125,9 +126,6 @@ pub(crate) enum Run {
     /// Claude runs but its account can't be read, so any folder could be
     /// the one it uses: nothing was written.
     DesktopAccountUnknown,
-    /// Stopped before any write: entries carry fields the app doesn't know
-    /// (reportable names).
-    UnknownFields(BTreeSet<String>),
     /// Stopped: this many target folders changed since sync's record while
     /// Claude wasn't using them.
     FoldersChanged(usize),
@@ -141,8 +139,12 @@ pub(crate) struct Report {
     pub folders: usize,
     /// Folders left unchanged because their backup failed.
     pub not_backed_up: usize,
-    /// Claude was running, so its account's folders were left alone.
-    pub left_desktop_account: bool,
+    /// Of `written`, entries added to the folders of the account Claude
+    /// runs on (which only gain entries while it runs).
+    pub added_to_desktop: usize,
+    /// Entries in those folders that differ but were left as they are
+    /// until Claude is quit.
+    pub held_for_desktop: usize,
     /// Sessions never copied, by why (each counted once, whatever the
     /// number of sidebars holding it).
     pub left_out: BTreeMap<LeftOut, usize>,
@@ -213,7 +215,6 @@ struct Read {
     folders: Vec<Folder>,
     /// File names of entries sync never copies, with why.
     skipped: BTreeMap<String, LeftOut>,
-    unknown_fields: BTreeSet<String>,
 }
 
 /// How long the desktop's folder stays quiet before Automatic mode syncs.
@@ -429,23 +430,22 @@ pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_ssh: bool) -> B
         return Begun::Ended(Run::DesktopAccountUnknown);
     }
     let read = read_all(&env.home, include_ssh);
-    if !read.unknown_fields.is_empty() {
-        return Begun::Ended(Run::UnknownFields(read.unknown_fields));
-    }
     let record = load(paths);
     let active_key = active_key(&desktop_paths);
     let active = read
         .folders
         .iter()
         .position(|folder| Some(&folder.key) == active_key.as_ref());
-    let writable = |folder: &Folder| {
-        !running
-            || desktop
+    // Claude's account's folders, while it runs: entries Claude may be
+    // saving are never replaced there.
+    let add_only = |folder: &Folder| {
+        running
+            && desktop
                 .as_ref()
-                .is_some_and(|account| account.account_uuid != folder.account)
+                .is_some_and(|account| account.account_uuid == folder.account)
     };
 
-    let (writes, decided) = plan(&read, &record, active, &writable);
+    let (writes, decided, held) = plan(&read, &record, active, &add_only);
 
     // The dormant multi-account mode: since the last run, with no account
     // switch, a folder sync may write changed although it belongs to an
@@ -460,7 +460,7 @@ pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_ssh: bool) -> B
         let changed = read
             .folders
             .iter()
-            .filter(|folder| writable(folder) && folder.account != desktop_account)
+            .filter(|folder| folder.account != desktop_account)
             .filter(|folder| {
                 record
                     .folders
@@ -478,7 +478,7 @@ pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_ssh: bool) -> B
         by_folder.entry(write.folder).or_default().push(write);
     }
     let report = Report {
-        left_desktop_account: running,
+        held_for_desktop: held,
         left_out: read.left_out(),
         ..Report::default()
     };
@@ -525,6 +525,10 @@ impl SyncRun {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(_) => continue,
             };
+            if write.add_only && now_there.is_some() {
+                // Claude saved its own entry meanwhile: it stays.
+                continue;
+            }
             let expected = folder.copies.get(&write.name).map(|entry| &entry.bytes);
             if now_there.as_ref() != expected {
                 if wrote_any {
@@ -537,7 +541,12 @@ impl SyncRun {
             let Ok(bytes) = serde_json::to_vec(&Value::Object(write.body.clone())) else {
                 continue;
             };
-            if storage::write_atomically(&file, &bytes).is_ok() {
+            let written = if write.add_only {
+                storage::write_new(&file, &bytes)
+            } else {
+                storage::write_atomically(&file, &bytes)
+            };
+            if written.is_ok() {
                 // A copy is never newer than what it was made from, so the
                 // folder Claude wrote last still tells its Active Profile.
                 let _ = fs::File::options()
@@ -546,6 +555,9 @@ impl SyncRun {
                     .and_then(|copy| copy.set_modified(write.modified));
                 copies.insert(write.name.clone(), copy_record(&write.body));
                 self.report.written += 1;
+                if write.add_only {
+                    self.report.added_to_desktop += 1;
+                }
                 wrote_any = true;
             }
         }
@@ -607,15 +619,18 @@ struct Write {
     body: Map<String, Value>,
     /// The newest modification time among the copies it was made from.
     modified: SystemTime,
+    /// Into a folder Claude may be using: only if no file has the name.
+    add_only: bool,
 }
 
-/// Decides every Session's entry and which folders need it written.
+/// Decides every Session's entry and which folders need it written, and
+/// counts the entries left as they are in `add_only` folders.
 fn plan(
     read: &Read,
     record: &Record,
     active: Option<usize>,
-    writable: &impl Fn(&Folder) -> bool,
-) -> (Vec<Write>, BTreeMap<String, Groups>) {
+    add_only: &impl Fn(&Folder) -> bool,
+) -> (Vec<Write>, BTreeMap<String, Groups>, usize) {
     let names: BTreeSet<&String> = read
         .folders
         .iter()
@@ -624,6 +639,7 @@ fn plan(
         .collect();
     let mut writes = Vec::new();
     let mut decided = BTreeMap::new();
+    let mut held = 0;
     for name in names {
         let copies: Vec<Copy<'_>> = read
             .folders
@@ -666,9 +682,6 @@ fn plan(
         decided.insert(name.clone(), groups(&body));
         let transcript = body.get("cliSessionId").and_then(Value::as_str);
         for (index, folder) in read.folders.iter().enumerate() {
-            if !writable(folder) {
-                continue;
-            }
             let existing = folder.copies.get(name);
             if existing.is_none() && transcript.is_some_and(|id| folder.tombstones.contains(id)) {
                 continue;
@@ -680,15 +693,21 @@ fn plan(
             if existing.is_some_and(|entry| same_but_cleared(&entry.body, &wanted)) {
                 continue;
             }
+            let add_only = add_only(folder);
+            if add_only && existing.is_some() {
+                held += 1;
+                continue;
+            }
             writes.push(Write {
                 folder: index,
                 name: name.clone(),
                 body: wanted,
                 modified,
+                add_only,
             });
         }
     }
-    (writes, decided)
+    (writes, decided, held)
 }
 
 struct Copy<'a> {
@@ -815,7 +834,6 @@ fn read_all(home: &Path, include_ssh: bool) -> Read {
     let mut read = Read {
         folders: Vec::new(),
         skipped: BTreeMap::new(),
-        unknown_fields: BTreeSet::new(),
     };
     for (account, account_path) in uuid_folders(&root) {
         for (org, path) in uuid_folders(&account_path) {
@@ -864,11 +882,6 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_ssh: bool) {
         // A copy under another name would be a second entry in Claude.
         if body.get("sessionId").and_then(Value::as_str) != Some(stem) {
             continue;
-        }
-        for key in body.keys() {
-            if !SIDEBAR_ENTRY_FIELDS.contains(&key.as_str()) {
-                read.unknown_fields.insert(reportable(key));
-            }
         }
         if let Some(why) = left_out(&body, include_ssh) {
             read.skipped.insert(name.clone(), why);

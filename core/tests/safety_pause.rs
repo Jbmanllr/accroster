@@ -815,7 +815,7 @@ fn copy_report_holds_check_names_field_names_and_versions_only() {
         &account.organization_uuid,
         "0f1e",
         &json!({ "sessionId": "local_0f1e", "cliSessionId": "3c", "title": "Fix login bug",
-                 "newAccountBoundField": "secret-ish value", "isArchived": false }),
+                 "newField": "secret-ish value", "isArchived": false }),
     );
     shared_env(&mac, json!({ "ANTHROPIC_API_KEY": "sk-ant-123" }));
     let mut core = mac.launch();
@@ -831,7 +831,7 @@ fn copy_report_holds_check_names_field_names_and_versions_only() {
         "Claude Code: 2.1.310",
         "Desktop's Claude Code: 2.1.308",
         "Claude desktop app: 3.6556.2",
-        "FAIL: Sidebar entries (unknown fields: newAccountBoundField)",
+        "pass: Sidebar entries (1 entries read · new fields seen: newField)",
         "settings.json sets ANTHROPIC_API_KEY",
     ] {
         assert!(report.contains(expected), "{expected} in:\n{report}");

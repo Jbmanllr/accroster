@@ -157,6 +157,25 @@ pub(crate) fn write_versioned<T: VersionedFile>(path: &Path, contents: &T) -> io
 /// renames it over `path`. Readers see the old file or the new one, never a
 /// mix.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_whole(path, bytes, |temp| fs::rename(temp, path))
+}
+
+/// Like [`write_atomically`], but only if no file has `path` yet: the temp
+/// file is linked in place, which fails when one appeared meanwhile.
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_whole(path, bytes, |temp| {
+        let linked = fs::hard_link(temp, path);
+        let _ = fs::remove_file(temp);
+        linked
+    })
+}
+
+/// Writes `bytes` to a flushed temp file next to `path`, then `place`s it.
+fn write_whole(
+    path: &Path,
+    bytes: &[u8],
+    place: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = path
         .parent()
@@ -174,7 +193,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        place(&temp)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
