@@ -191,18 +191,6 @@ impl Core {
                     Some("Couldn't tell which Profile Claude is using · nothing was synced".into());
                 self.show_result(StatusTone::Failed);
             }
-            Run::UnknownFields(fields) => {
-                let detail = format!(
-                    "unknown fields: {}",
-                    fields.iter().cloned().collect::<Vec<_>>().join(", ")
-                );
-                let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
-                self.safety.record(
-                    CheckId::SidebarEntries,
-                    Finding::fail(detail).blocking(SafetyFeature::SidebarSync, reason),
-                );
-                self.paused_sync_note();
-            }
             Run::FoldersChanged(count) => {
                 let whose = if *count > 1 { "sidebars" } else { "sidebar" };
                 let detail =
@@ -317,9 +305,6 @@ impl Core {
                 .paused_reason(SafetyFeature::SidebarSync)
                 .unwrap_or_else(|| "it is paused".into()),
             Run::DesktopAccountUnknown => "couldn't tell which Profile Claude is using".into(),
-            Run::UnknownFields(_) => {
-                format!("{} changed Sidebar entries", desktop_name(&self.versions))
-            }
             Run::FoldersChanged(_) => "Claude wrote to a Profile it isn't using".into(),
         };
         let (desktop, ctx) = self.desktop();
@@ -368,8 +353,22 @@ fn sync_line(report: &sidebar_sync::Report, explained: bool) -> String {
             plural(report.folders, "sidebar", "sidebars")
         )
     };
-    if report.left_desktop_account && explained {
-        note.push_str(" · the Profile Claude is using syncs once Claude is quit");
+    if report.added_to_desktop > 0 {
+        let added = thousands(report.added_to_desktop);
+        note.push_str(&if explained {
+            format!(
+                " · {added} added to the sidebar Claude is using: \
+                 Claude shows them once it's reopened"
+            )
+        } else {
+            format!(" · {added} added to Claude's sidebar, shown once it's reopened")
+        });
+    }
+    if report.held_for_desktop > 0 && explained {
+        note.push_str(&format!(
+            " · {} there syncs once Claude is quit",
+            plural(report.held_for_desktop, "changed entry", "changed entries")
+        ));
     }
     if report.not_backed_up > 0 {
         note.push_str(&format!(
