@@ -21,7 +21,8 @@
 //!
 //! AccRoster never quits or relaunches Claude: nothing here can.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -143,23 +144,62 @@ pub(crate) fn last_known_account(paths: &DesktopPaths) -> Option<String> {
 /// The desktop's account, or `None` when its `config.json` is missing,
 /// unreadable or names no account.
 pub(crate) fn desktop_account(paths: &DesktopPaths) -> Option<DesktopAccount> {
-    let account_uuid = last_known_account(paths)?;
-    let organization_uuid = newest_org_folder(&paths.sidebar_root().join(&account_uuid));
-    Some(DesktopAccount {
-        account_uuid,
-        organization_uuid,
-    })
+    NewestEntries::default().desktop_account(paths)
+}
+
+/// Each Sidebar folder's newest entry, remembered with the folder's mtime.
+/// Entries are written temp-file-then-rename (by Claude and by Sidebar
+/// sync), so a folder whose mtime is unchanged has the same newest entry:
+/// it isn't listed again. Finding the desktop's Organization otherwise
+/// stats every entry in its account's folders, thousands on a busy Mac.
+#[derive(Debug, Default)]
+pub(crate) struct NewestEntries(RefCell<HashMap<PathBuf, (SystemTime, Option<SystemTime>)>>);
+
+impl NewestEntries {
+    /// [`desktop_account`], listing only the folders that changed since the
+    /// last call.
+    pub(crate) fn desktop_account(&self, paths: &DesktopPaths) -> Option<DesktopAccount> {
+        let account_uuid = last_known_account(paths)?;
+        let organization_uuid =
+            newest_org_folder(&paths.sidebar_root().join(&account_uuid), |folder| {
+                self.newest_entry(folder)
+            });
+        Some(DesktopAccount {
+            account_uuid,
+            organization_uuid,
+        })
+    }
+
+    fn newest_entry(&self, folder: &Path) -> Option<SystemTime> {
+        // Taken before listing: a write during the listing changes it.
+        let Ok(modified) = fs::metadata(folder).and_then(|meta| meta.modified()) else {
+            return newest_entry(folder);
+        };
+        if let Some((at, newest)) = self.0.borrow().get(folder)
+            && *at == modified
+        {
+            return *newest;
+        }
+        let newest = newest_entry(folder);
+        self.0
+            .borrow_mut()
+            .insert(folder.to_path_buf(), (modified, newest));
+        newest
+    }
 }
 
 /// The Organization folder under an account folder holding the most recently
-/// written Sidebar entry.
-fn newest_org_folder(account_dir: &Path) -> Option<String> {
+/// written Sidebar entry, by `newest`.
+fn newest_org_folder(
+    account_dir: &Path,
+    newest: impl Fn(&Path) -> Option<SystemTime>,
+) -> Option<String> {
     fs::read_dir(account_dir)
         .ok()?
         .flatten()
         .filter_map(|org| {
             let name = org.file_name().into_string().ok().filter(|n| is_uuid(n))?;
-            let newest = newest_entry(&org.path())?;
+            let newest = newest(&org.path())?;
             Some((newest, name))
         })
         .max()

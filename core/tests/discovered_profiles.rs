@@ -423,6 +423,70 @@ fn opening_the_menu_rescans_new_and_emptied_pairs() {
     assert!(warnings(&core).is_empty(), "new pairs appear silently");
 }
 
+/// Sidebar sync copies entries into every Organization folder of a Login,
+/// so another Organization of a signed-in account is the same Login, not a
+/// Discovered Profile; an account with no Profile still is.
+#[test]
+fn another_organization_of_a_signed_in_account_is_not_discovered() {
+    let work = FixtureLogin::new(WORK_ACCOUNT, WORK_ORG, "me@work.example", "Work Inc");
+    let mac = mac_signing_in_as(&work, limits_body());
+    mac.write_json(".claude.json", &json!({"hasCompletedOnboarding": true}));
+    let other_org = "88888888-8888-4888-8888-888888888888";
+    let other_account = "99999999-9999-4999-8999-999999999999";
+    mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "a", &entry(OCT_24));
+    mac.write_sidebar_entry(WORK_ACCOUNT, other_org, "a", &entry(OCT_24));
+    mac.write_sidebar_entry(other_account, other_org, "a", &entry(OCT_23));
+    mac.write_desktop_config(&json!({ "lastKnownAccountUuid": WORK_ACCOUNT }));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    wait_for_sign_in(&mut core);
+    core.event(Event::MenuOpened);
+
+    let rows = discovered(&core);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        details(&rows[0]),
+        ["Account 99999999 · Organization 88888888"]
+    );
+    assert_eq!(
+        rows[0].subtitle.as_deref(),
+        Some("1 Session · last active Oct 23"),
+        "the desktop's last Login is the Profile, not this row"
+    );
+}
+
+/// Opening the menu must stay cheap with thousands of entries: a Sidebar
+/// folder whose listing didn't change isn't read again, and a changed folder
+/// reads only its new or rewritten entries. (Claude writes entries
+/// temp-file-then-rename, so every write changes its folder.)
+#[test]
+fn a_menu_open_reads_only_the_sidebar_entries_that_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let mac = mac_without_cli_login();
+    let old = mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "a", &entry(OCT_23));
+    let mut core = mac.launch();
+    // Reading this entry again would now fail and drop it from the count.
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    core.event(Event::MenuOpened);
+    let unchanged = discovered(&core);
+    mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "b", &entry(OCT_24));
+    core.event(Event::MenuOpened);
+    let changed = discovered(&core);
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        unchanged[0].subtitle.as_deref(),
+        Some("1 Session · last active Oct 23"),
+        "{unchanged:?}"
+    );
+    assert_eq!(
+        changed[0].subtitle.as_deref(),
+        Some("2 Sessions · last active Oct 24"),
+        "{changed:?}"
+    );
+}
+
 #[test]
 fn discovery_never_shows_limits_or_runs_claude() {
     let mac = mac_without_cli_login();

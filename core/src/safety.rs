@@ -130,7 +130,7 @@ fn feature_from_key(key: &str) -> Option<SafetyFeature> {
 }
 
 /// `state/safety.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SafetyFile {
     #[serde(default)]
@@ -147,7 +147,7 @@ struct SafetyFile {
     config_dir_check: Option<StoredFinding>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PauseRecord {
     feature: String,
@@ -172,7 +172,7 @@ impl From<&ClaudeVersions> for VersionsRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredFinding {
     passed: bool,
@@ -187,6 +187,9 @@ impl VersionedFile for SafetyFile {
 pub(crate) struct Safety {
     path: std::path::PathBuf,
     file: SafetyFile,
+    /// What `path` holds, when known: [`Safety::settle`] runs on every menu
+    /// open and tick, and writes only what changed.
+    saved: Option<SafetyFile>,
     findings: BTreeMap<CheckId, Finding>,
     /// One-time warning lines for this run (settings `env` variables).
     warnings: Vec<String>,
@@ -203,10 +206,8 @@ impl Safety {
     /// can't read; the next self-check finds the cause again.
     pub(crate) fn load(paths: &AppPaths) -> Safety {
         let path = paths.state().join("safety.json");
-        let file = storage::read_versioned::<SafetyFile>(&path)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let saved = storage::read_versioned::<SafetyFile>(&path).ok().flatten();
+        let file = saved.clone().unwrap_or_default();
         let mut findings = BTreeMap::new();
         if let Some(stored) = &file.config_dir_check {
             findings.insert(
@@ -225,6 +226,7 @@ impl Safety {
         Safety {
             path,
             file,
+            saved,
             findings,
             warnings: Vec::new(),
             settings_stamp: None,
@@ -264,7 +266,9 @@ impl Safety {
             });
             paused.push(feature);
         }
-        self.save();
+        if self.saved.as_ref() != Some(&self.file) {
+            self.save();
+        }
         paused
     }
 
@@ -475,10 +479,12 @@ impl Safety {
         }
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
         // A lost write only means a pause may need finding again at the next
         // self-check; nothing is written to Claude's files meanwhile.
-        let _ = storage::write_versioned(&self.path, &self.file);
+        self.saved = storage::write_versioned(&self.path, &self.file)
+            .ok()
+            .map(|()| self.file.clone());
     }
 }
 

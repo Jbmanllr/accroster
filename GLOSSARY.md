@@ -33,7 +33,7 @@ The Profile a given client (the desktop app or the CLI) is currently signed in a
 _Avoid_: current account
 
 **Discovered Profile**:
-A Profile the app has evidence of on the Mac but holds no sign-in for; listed greyed until signed in.
+A Profile the app has evidence of on the Mac but holds no sign-in for; listed greyed until signed in. Another Organization of a signed-in account is the same Login, not a Discovered Profile.
 _Avoid_: found profile, ghost profile, unsigned profile
 
 **Guided switch**:

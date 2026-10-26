@@ -29,7 +29,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::desktop::{self, DesktopAccount, DesktopPaths};
+use crate::desktop::{self, DesktopAccount, DesktopPaths, NewestEntries};
 use crate::env::Environment;
 use crate::interface::{
     AllSessionsView, ProfileKey, RunningDot, SessionDetail, SessionFilter, SessionRow,
@@ -305,11 +305,15 @@ pub(crate) struct SessionIndex {
     /// Transcripts read since the index was last saved.
     read: usize,
     entries: Cached<SidebarEntry>,
+    /// Each Sidebar folder's mtime when its entries were last stat'ed.
+    entry_folders: BTreeMap<PathBuf, u64>,
     live: Cached<LiveFile>,
     running: HashMap<String, Running>,
     /// The desktop's account and Organization, for title precedence and
     /// "desktop now".
     desktop: Option<DesktopAccount>,
+    /// What finding the desktop's Organization last read.
+    newest_entries: NewestEntries,
     /// The All Sessions window is open (its folders are watched).
     window_open: bool,
     search: String,
@@ -518,28 +522,49 @@ impl SessionIndex {
 
     /// Re-reads the Sidebar entries whose files changed, and the desktop's
     /// account (it follows the Sidebar folder written last).
+    ///
+    /// Claude writes entries temp-file-then-rename, so every write changes
+    /// its folder's mtime: a folder whose mtime is unchanged since its last
+    /// listing is skipped without a stat per entry.
     fn restat_entries(&mut self) {
-        let files = entry_files(&self.home);
-        refresh_cached(&mut self.entries, files, |path, inside| {
-            let [account, org, name] = inside else {
-                return None;
-            };
-            let entry = read_entry(path)?;
-            Some(SidebarEntry {
-                pair: ProfileKey {
-                    account_uuid: account.clone(),
-                    organization_uuid: org.clone(),
-                },
-                entry_id: name.strip_suffix(".json")?.to_owned(),
-                cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
-                title: entry.title.filter(|title| !title.trim().is_empty()),
-                user_title: entry.title_source.is_some_and(|source| source != "auto"),
-                archived: entry.is_archived == Some(true),
-                last_activity_at: entry.last_activity_at.unwrap_or(0),
-                cwd: entry.cwd,
-            })
-        });
-        self.desktop = desktop::desktop_account(&DesktopPaths::new(&self.home));
+        let folders = entry_folders(&self.home);
+        let listed: BTreeMap<PathBuf, u64> = folders
+            .iter()
+            .map(|(dir, _, _, modified)| (dir.clone(), *modified))
+            .collect();
+        if !listed.keys().eq(self.entry_folders.keys()) {
+            self.entries
+                .retain(|path, _| path.parent().is_some_and(|dir| listed.contains_key(dir)));
+        }
+        for (dir, account, org, modified) in folders {
+            if self.entry_folders.get(&dir) == Some(&modified) {
+                continue;
+            }
+            let files = entry_files(&dir, &account, &org);
+            refresh_folder(&mut self.entries, &dir, files, |path, inside| {
+                let [account, org, name] = inside else {
+                    return None;
+                };
+                let entry = read_entry(path)?;
+                Some(SidebarEntry {
+                    pair: ProfileKey {
+                        account_uuid: account.clone(),
+                        organization_uuid: org.clone(),
+                    },
+                    entry_id: name.strip_suffix(".json")?.to_owned(),
+                    cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
+                    title: entry.title.filter(|title| !title.trim().is_empty()),
+                    user_title: entry.title_source.is_some_and(|source| source != "auto"),
+                    archived: entry.is_archived == Some(true),
+                    last_activity_at: entry.last_activity_at.unwrap_or(0),
+                    cwd: entry.cwd,
+                })
+            });
+        }
+        self.entry_folders = listed;
+        self.desktop = self
+            .newest_entries
+            .desktop_account(&DesktopPaths::new(&self.home));
     }
 
     /// Re-reads the live-process files that changed, then which of their
@@ -1048,31 +1073,75 @@ fn sidebar_root(home: &Path) -> PathBuf {
     home.join("Library/Application Support/Claude/claude-code-sessions")
 }
 
-/// Every `claude-code-sessions/<account>/<org>/local_*.json`, with its stamp
-/// and `[account, org, file name]`.
-fn entry_files(home: &Path) -> Vec<(PathBuf, Stamp, Vec<String>)> {
+/// Every `claude-code-sessions/<account>/<org>/` folder, with its account,
+/// Organization and mtime. The mtime is taken before the folder is listed:
+/// a write during the listing changes it, so the next rescan lists again.
+fn entry_folders(home: &Path) -> Vec<(PathBuf, String, String, u64)> {
     let mut found = Vec::new();
     for (account_dir, kind) in real_children(&sidebar_root(home)) {
         if !kind.is_dir() {
             continue;
         }
+        let account = file_name(&account_dir);
         for (org_dir, kind) in real_children(&account_dir) {
             if !kind.is_dir() {
                 continue;
             }
-            for (path, _) in real_children(&org_dir) {
-                let name = file_name(&path);
-                if !name.starts_with("local_") || !name.ends_with(".json") {
-                    continue;
-                }
-                if let Some(stamp) = regular_file_stamp(&path) {
-                    let inside = vec![file_name(&account_dir), file_name(&org_dir), name];
-                    found.push((path, stamp, inside));
-                }
+            if let Some(modified) = modified_ns(&org_dir) {
+                let org = file_name(&org_dir);
+                found.push((org_dir, account.clone(), org, modified));
             }
         }
     }
     found
+}
+
+/// Every `local_*.json` in one Sidebar folder, with its stamp and `[account,
+/// org, file name]`.
+fn entry_files(dir: &Path, account: &str, org: &str) -> Vec<(PathBuf, Stamp, Vec<String>)> {
+    real_children(dir)
+        .into_iter()
+        .filter_map(|(path, _)| {
+            let name = file_name(&path);
+            if !name.starts_with("local_") || !name.ends_with(".json") {
+                return None;
+            }
+            let stamp = regular_file_stamp(&path)?;
+            Some((path, stamp, vec![account.to_owned(), org.to_owned(), name]))
+        })
+        .collect()
+}
+
+/// [`refresh_cached`] for the files directly in `dir`, leaving the rest of
+/// `cache` alone.
+fn refresh_folder<T>(
+    cache: &mut Cached<T>,
+    dir: &Path,
+    files: Vec<(PathBuf, Stamp, Vec<String>)>,
+    read: impl Fn(&Path, &[String]) -> Option<T>,
+) {
+    let listed: std::collections::HashSet<&PathBuf> = files.iter().map(|(path, ..)| path).collect();
+    let vanished: Vec<PathBuf> = cache
+        .range(dir.to_path_buf()..)
+        .take_while(|(path, _)| path.starts_with(dir))
+        .filter(|(path, _)| !listed.contains(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in vanished {
+        cache.remove(&path);
+    }
+    for (path, stamp, inside) in files {
+        if cache.get(&path).is_none_or(|(known, _)| *known != stamp) {
+            let value = read(&path, &inside);
+            cache.insert(path, (stamp, value));
+        }
+    }
+}
+
+/// A file's or folder's mtime in nanoseconds, without following a link.
+fn modified_ns(path: &Path) -> Option<u64> {
+    let modified = fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64)
 }
 
 /// A Sidebar entry the index uses: non-empty, at most 10 MB, parsable, and

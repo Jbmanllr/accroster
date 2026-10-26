@@ -12,10 +12,15 @@
 //! "Unknown Login" shown with their Session count and last activity. The
 //! desktop's `config.json` adds one fact, `lastKnownAccountUuid`, read on its
 //! own (the same file holds tokens, which are never touched).
+//!
+//! The menu lists a Sidebar pair only while its account has no signed-in
+//! Profile: another Organization of a signed-in account is the same Login.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -153,13 +158,129 @@ impl Evidence {
     }
 }
 
-/// Reads every discovered pair under `home`: the `~/.claude.json` login first,
-/// then the most recently active.
-pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
-    let desktop = home.join("Library/Application Support/Claude");
+/// What the Sidebar folders held at the last scan, so a scan reads only what
+/// changed since. Claude writes entries temp-file-then-rename, so any write
+/// changes its folder's mtime: a folder whose mtime is unchanged is not
+/// listed again, and in a changed one only new or rewritten entries (by size
+/// and mtime) are read.
+#[derive(Debug, Default)]
+pub(crate) struct Scanner {
+    folders: BTreeMap<PathBuf, Folder>,
+}
+
+#[derive(Debug)]
+struct Folder {
+    /// The folder's mtime when it was listed.
+    modified: SystemTime,
+    /// Every `local_*.json` by name: its stamp, and whether it was readable
+    /// with its newest activity.
+    entries: BTreeMap<OsString, (Stamp, Option<Activity>)>,
+}
+
+/// A file's size and mtime.
+type Stamp = (u64, Option<SystemTime>);
+
+/// A readable entry's `lastActivityAt` (else `createdAt`).
+type Activity = Option<Timestamp>;
+
+impl Scanner {
+    /// Reads every discovered pair under `home`: the `~/.claude.json` login
+    /// first, then the most recently active.
+    pub(crate) fn scan(&mut self, home: &Path) -> Vec<Evidence> {
+        let root = home.join("Library/Application Support/Claude/claude-code-sessions");
+        let pairs = self.sidebar_pairs(&root);
+        evidence(home, pairs)
+    }
+
+    /// `<account>/<org>/` folders holding at least one readable Sidebar
+    /// entry, with their entry count and newest activity.
+    fn sidebar_pairs(&mut self, root: &Path) -> Vec<(ProfileKey, usize, Option<Timestamp>)> {
+        let mut known = std::mem::take(&mut self.folders);
+        let mut pairs = Vec::new();
+        for account in subfolders(root) {
+            for org in subfolders(&root.join(&account)) {
+                let path = root.join(&account).join(&org);
+                // Taken before listing: a write during the listing changes
+                // it, so the next scan lists again.
+                let Some(modified) = fs::metadata(&path).and_then(|m| m.modified()).ok() else {
+                    continue;
+                };
+                let folder = match known.remove(&path) {
+                    Some(folder) if folder.modified == modified => folder,
+                    previous => Folder {
+                        modified,
+                        entries: list(&path, previous.map(|f| f.entries).unwrap_or_default()),
+                    },
+                };
+                let readable: Vec<Activity> = folder
+                    .entries
+                    .values()
+                    .filter_map(|(_, activity)| *activity)
+                    .collect();
+                if !readable.is_empty() {
+                    pairs.push((
+                        ProfileKey {
+                            account_uuid: account.clone(),
+                            organization_uuid: org,
+                        },
+                        readable.len(),
+                        readable.into_iter().flatten().max(),
+                    ));
+                }
+                self.folders.insert(path, folder);
+            }
+        }
+        pairs
+    }
+}
+
+/// A folder's `local_*.json` entries, reusing `known` for those whose size
+/// and mtime are unchanged and reading the rest.
+fn list(
+    folder: &Path,
+    mut known: BTreeMap<OsString, (Stamp, Option<Activity>)>,
+) -> BTreeMap<OsString, (Stamp, Option<Activity>)> {
+    fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|item| {
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("local_") && name.ends_with(".json")
+        })
+        .filter_map(|item| {
+            let meta = item.metadata().ok()?;
+            let stamp = (meta.len(), meta.modified().ok());
+            let name = item.file_name();
+            let activity = match known.remove(&name) {
+                Some((was, activity)) if was == stamp => activity,
+                _ => read_activity(&item.path(), &meta),
+            };
+            Some((name, (stamp, activity)))
+        })
+        .collect()
+}
+
+/// A readable entry's newest activity; `None` when it isn't readable.
+fn read_activity(path: &Path, meta: &fs::Metadata) -> Option<Activity> {
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    Some(
+        ["lastActivityAt", "createdAt"]
+            .iter()
+            .find_map(|key| body.get(key).and_then(Value::as_i64))
+            .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+    )
+}
+
+/// The Sidebar `pairs` plus the `~/.claude.json` login, ordered.
+fn evidence(home: &Path, pairs: Vec<(ProfileKey, usize, Option<Timestamp>)>) -> Vec<Evidence> {
     let desktop_last = desktop::last_known_account(&DesktopPaths::new(home));
     let mut found: BTreeMap<ProfileKey, Evidence> = BTreeMap::new();
-    for (pair, sessions, last_activity) in sidebar_pairs(&desktop.join("claude-code-sessions")) {
+    for (pair, sessions, last_activity) in pairs {
         found.insert(
             pair.clone(),
             Evidence {
@@ -194,55 +315,6 @@ pub(crate) fn scan(home: &Path) -> Vec<Evidence> {
             .then(a.pair.cmp(&b.pair))
     });
     all
-}
-
-/// `<account>/<org>/` folders holding at least one readable Sidebar entry,
-/// with their entry count and newest activity.
-fn sidebar_pairs(root: &Path) -> Vec<(ProfileKey, usize, Option<Timestamp>)> {
-    let mut pairs = Vec::new();
-    for account in subfolders(root) {
-        for org in subfolders(&root.join(&account)) {
-            let folder = root.join(&account).join(&org);
-            let entries: Vec<Value> = fs::read_dir(&folder)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|item| {
-                    let name = item.file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with("local_") && name.ends_with(".json")
-                })
-                .filter_map(|item| {
-                    let meta = item.metadata().ok()?;
-                    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
-                        return None;
-                    }
-                    serde_json::from_slice(&fs::read(item.path()).ok()?).ok()
-                })
-                .collect();
-            if entries.is_empty() {
-                continue;
-            }
-            let last_activity = entries
-                .iter()
-                .filter_map(|body| {
-                    ["lastActivityAt", "createdAt"]
-                        .iter()
-                        .find_map(|key| body.get(key).and_then(Value::as_i64))
-                })
-                .filter_map(|ms| Timestamp::from_millisecond(ms).ok())
-                .max();
-            pairs.push((
-                ProfileKey {
-                    account_uuid: account.clone(),
-                    organization_uuid: org,
-                },
-                entries.len(),
-                last_activity,
-            ));
-        }
-    }
-    pairs
 }
 
 fn subfolders(path: &Path) -> Vec<String> {
