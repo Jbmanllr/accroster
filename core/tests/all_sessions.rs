@@ -713,6 +713,35 @@ fn filter(core: &mut Core, filter: SessionFilter) -> Vec<String> {
 }
 
 #[test]
+fn a_session_in_a_worktree_counts_as_its_repositorys_project() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "in the repo", 5, &[]);
+    let mut in_worktree = prompt(S2, "in a worktree", &mac_time(6));
+    in_worktree["cwd"] = json!("/Users/tester/Dev/app/.claude/worktrees/angry-rhodes-80f475");
+    mac.write_transcript(
+        "-Users-tester-Dev-app--claude-worktrees-angry-rhodes-80f475",
+        S2,
+        &[in_worktree],
+    );
+    let mut core = mac.launch();
+    let rows = open(&mut core);
+
+    assert_eq!(row(&rows, S2).subtitle, "app · 6 min ago");
+    let projects: Vec<(String, SessionFilter)> = core
+        .view()
+        .all_sessions
+        .sidebar
+        .into_iter()
+        .filter(|group| group.title.as_deref() == Some("Projects"))
+        .flat_map(|group| group.items)
+        .map(|item| (item.title, item.filter))
+        .collect();
+    let app = SessionFilter::Project("/Users/tester/Dev/app".into());
+    assert_eq!(projects, [("app".to_owned(), app.clone())]);
+    assert_eq!(filter(&mut core, app), [S1, S2]);
+}
+
+#[test]
 fn a_session_leaves_all_sessions_only_when_every_entry_is_archived() {
     let mac = FakeMac::new();
     transcript(&mac, S1, "archived in A only", 5, &[]);

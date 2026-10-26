@@ -701,7 +701,9 @@ impl SessionIndex {
         match &self.filter {
             SessionFilter::All => !session.archived,
             SessionFilter::Running => session.running.is_some(),
-            SessionFilter::Project(folder) => session.cwd == Some(folder.as_str()),
+            SessionFilter::Project(folder) => {
+                session.cwd.map(project_folder) == Some(folder.as_str())
+            }
             SessionFilter::Sidebar(pair) => session.entries.iter().any(|e| e.pair == *pair),
             SessionFilter::CliOnly => session.entries.is_empty(),
         }
@@ -917,7 +919,10 @@ fn sidebar(sessions: &[Session], profiles: &[(ProfileKey, String)]) -> Vec<Sideb
         title: title.to_owned(),
         filter,
     };
-    let mut folders: Vec<&str> = sessions.iter().filter_map(|session| session.cwd).collect();
+    let mut folders: Vec<&str> = sessions
+        .iter()
+        .filter_map(|session| session.cwd.map(project_folder))
+        .collect();
     folders.sort_by_key(|cwd| (project(Some(cwd)).to_lowercase(), *cwd));
     folders.dedup();
     let mut groups = vec![SidebarGroup {
@@ -995,11 +1000,19 @@ fn quoted(prompt: &str) -> String {
     format!("“{shown}”")
 }
 
-/// The project: the last folder of the Session's working directory.
+/// The project: the last folder of the Session's project folder.
 fn project(cwd: Option<&str>) -> &str {
-    cwd.and_then(|cwd| Path::new(cwd).file_name())
+    cwd.map(project_folder)
+        .and_then(|folder| Path::new(folder).file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("unknown folder")
+}
+
+/// The folder a working directory belongs to: the repository for a Claude
+/// worktree (`<repo>/.claude/worktrees/<name>/…`), else the directory itself.
+fn project_folder(cwd: &str) -> &str {
+    cwd.split_once("/.claude/worktrees/")
+        .map_or(cwd, |(repository, _)| repository)
 }
 
 /// `5 min ago`, `3 h ago`, `yesterday`, `4 days ago`.
