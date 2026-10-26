@@ -6,7 +6,7 @@
 //! data (limits, identities, the Session index, Sidebar sync) still check
 //! every field they read and degrade per item.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use crate::claude_json;
 use crate::interface::{ClaudeVersions, SafetyFeature};
 use crate::profiles::{Account, CrossCheckAnswer};
 use crate::safety::{Finding, claude_code_name, reportable};
+use crate::sidebar_sync::Stamp;
 
 /// `oauthAccount` and `cachedUsageUtilization` in each Profile's
 /// `.claude.json`. A malformed `oauthAccount` pauses CLI switching (the app
@@ -271,15 +272,58 @@ const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 /// At most this many Sidebar entries are read per self-check.
 const MAX_ENTRIES: usize = 5000;
 
+/// What the Sidebar entries check last saw of each entry, by path, with the
+/// file's [`Stamp`] then; `None` for a file that isn't a JSON object. A
+/// check parses only the entries whose stamp changed, so the steady state
+/// costs a `stat` per entry.
+#[derive(Default)]
+pub(crate) struct EntryShapes(HashMap<PathBuf, (Stamp, Option<Shape>)>);
+
+impl std::fmt::Debug for EntryShapes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "EntryShapes({} files)", self.0.len())
+    }
+}
+
+/// The part of an entry the check looks at.
+struct Shape {
+    session_id_matches: bool,
+    /// Top-level field names outside [`SIDEBAR_ENTRY_FIELDS`], reportable.
+    unknown_fields: Vec<String>,
+}
+
+impl Shape {
+    /// Only the field names and `sessionId` are looked at: the values are
+    /// checked as JSON but not built.
+    fn of(bytes: &[u8], stem: &str) -> Option<Shape> {
+        let body = serde_json::from_slice::<BTreeMap<String, &RawValue>>(bytes).ok()?;
+        let session_id = body
+            .get("sessionId")
+            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+        Some(Shape {
+            session_id_matches: session_id.as_deref() == Some(stem),
+            unknown_fields: body
+                .keys()
+                .filter(|key| !SIDEBAR_ENTRY_FIELDS.contains(&key.as_str()))
+                .map(|key| reportable(key))
+                .collect(),
+        })
+    }
+}
+
 /// Sidebar entries: the folder layout `<account>/<org>/` with known file
 /// names and `sessionId` equal to the file name. Unknown top-level fields
-/// are a note on a pass, never a failure.
-pub(crate) fn sidebar_entries(home: &Path) -> Finding {
+/// are a note on a pass, never a failure. Reads only the entries changed
+/// since `shapes`, which then holds every entry looked at now; also returns
+/// how many it parsed.
+pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding, usize) {
     let root = home.join(SIDEBAR_ROOT);
     let mut read = 0usize;
+    let mut parsed = 0usize;
     let mut unknown_fields = BTreeSet::new();
     let mut mismatched = 0usize;
     let mut unknown_files = 0usize;
+    let mut before = std::mem::take(&mut shapes.0);
     for org in subfolders(&root)
         .iter()
         .flat_map(|account| subfolders(account))
@@ -303,31 +347,32 @@ pub(crate) fn sidebar_entries(home: &Path) -> Finding {
             if meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
                 continue;
             }
-            let Ok(bytes) = fs::read(entry.path()) else {
+            let Some(stamp) = Stamp::of(&meta) else {
                 continue;
             };
-            // Only the field names and `sessionId` are looked at: the values
-            // are checked as JSON but not built.
-            let Ok(body) = serde_json::from_slice::<BTreeMap<String, &RawValue>>(&bytes) else {
-                continue;
-            };
-            read += 1;
-            let stem = name.trim_end_matches(".json");
-            let session_id = body
-                .get("sessionId")
-                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
-            if session_id.as_deref() != Some(stem) {
-                mismatched += 1;
-            }
-            for key in body.keys() {
-                if !SIDEBAR_ENTRY_FIELDS.contains(&key.as_str()) {
-                    unknown_fields.insert(reportable(key));
+            let path = entry.path();
+            let shape = match before.remove(&path) {
+                Some((seen, shape)) if seen == stamp => shape,
+                _ => {
+                    let Ok(bytes) = fs::read(&path) else {
+                        continue;
+                    };
+                    parsed += 1;
+                    Shape::of(&bytes, name.trim_end_matches(".json"))
                 }
+            };
+            if let Some(shape) = &shape {
+                read += 1;
+                if !shape.session_id_matches {
+                    mismatched += 1;
+                }
+                unknown_fields.extend(shape.unknown_fields.iter().cloned());
             }
+            shapes.0.insert(path, (stamp, shape));
         }
     }
     if read == 0 && unknown_files == 0 {
-        return Finding::never_seen();
+        return (Finding::never_seen(), parsed);
     }
     let mut problems = Vec::new();
     if mismatched > 0 {
@@ -347,11 +392,12 @@ pub(crate) fn sidebar_entries(home: &Path) -> Finding {
         detail.push_str(" · new fields seen: ");
         detail.push_str(&unknown_fields.into_iter().collect::<Vec<_>>().join(", "));
     }
-    if problems.is_empty() {
+    let finding = if problems.is_empty() {
         Finding::pass().with_detail(detail)
     } else {
         Finding::fail(detail)
-    }
+    };
+    (finding, parsed)
 }
 
 /// Live-process files `sessions/<pid>.json` in these folders: the fields the

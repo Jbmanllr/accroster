@@ -338,6 +338,53 @@ fn a_sync_reads_again_only_the_entries_changed_since_the_last_run() {
 }
 
 #[test]
+fn the_check_before_a_sync_reads_again_only_the_entries_changed_since_the_last_check() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    put(&mac, WORK, "s2", &entry("s2", "Two"));
+    empty_folder(&mac, PERSO_TEAM);
+    let mut core = mac.launch();
+    core.command(Command::SetVerboseLogging(true));
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+
+    sync(&mut core);
+    sync(&mut core);
+    sync(&mut core);
+    let mut changed = entry("s2", "Two");
+    changed["brandNewField"] = json!(true);
+    put(&mac, WORK, "s2", &changed);
+    sync(&mut core);
+
+    let log = mac
+        .read_file(format!("{APP_FOLDER}/logs/app.log"))
+        .unwrap_or_default();
+    let parsed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("sidebar entries checked "))
+        .filter_map(|line| line.split_whitespace().find(|f| f.starts_with("parsed=")))
+        .collect();
+    assert_eq!(
+        parsed,
+        // Turning sync on, then each sync: the first run's 4 copies are
+        // new files to the check after it.
+        ["parsed=0", "parsed=0", "parsed=4", "parsed=0", "parsed=1"],
+        "{log}"
+    );
+    let check = core
+        .view()
+        .diagnostics
+        .checks
+        .into_iter()
+        .find(|check| check.name == "Sidebar entries")
+        .expect("Diagnostics lists Sidebar entries");
+    assert_eq!(check.status, CheckStatus::Pass);
+    assert_eq!(
+        check.detail.as_deref(),
+        Some("6 entries read · new fields seen: brandNewField")
+    );
+}
+
+#[test]
 fn ssh_and_no_folder_sessions_are_included_by_default_and_can_be_left_out() {
     let mac = FakeMac::new();
     let mut ssh = entry("ssh", "On the VPS");
