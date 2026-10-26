@@ -1153,7 +1153,6 @@ fn running<'a>(
     env: &Environment,
     lives: impl Iterator<Item = &'a LiveFile>,
 ) -> HashMap<String, Running> {
-    let time_zone = env.clock.time_zone();
     let mut dots = HashMap::new();
     for live in lives {
         let Some(session_id) = live.session_id.clone() else {
@@ -1162,7 +1161,7 @@ fn running<'a>(
         let alive = env.os.process(live.pid).is_some_and(|facts| {
             live.proc_start
                 .as_deref()
-                .and_then(|text| desktop::parse_proc_start(text, &time_zone))
+                .and_then(desktop::parse_proc_start)
                 .is_some_and(|started| started.as_second() == facts.started_at.as_second())
         });
         if !alive {

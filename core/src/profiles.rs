@@ -40,6 +40,8 @@ pub(crate) struct Context<'a> {
     /// The write features under a Safety pause: nothing they write is
     /// written.
     pub paused: Vec<SafetyFeature>,
+    /// The `claude` spawns run; `None` while none is found.
+    pub claude: Option<&'a std::path::Path>,
 }
 
 impl Context<'_> {
@@ -58,7 +60,7 @@ impl Context<'_> {
     }
 
     pub(crate) fn runner(&self) -> Runner<'_> {
-        Runner::new(self.env, self.paths)
+        Runner::new(self.env, self.paths, self.claude)
     }
 }
 

@@ -6,7 +6,8 @@
 //! `CLAUDE.md` load. Its environment is the app's inherited one minus every
 //! `CLAUDE*` and `ANTHROPIC_*` variable, plus the `CLAUDE_CONFIG_DIR` it sets
 //! to the Profile folder's stored path, verbatim (the Keychain slot is a hash
-//! of that literal string).
+//! of that literal string). It runs the `claude` [`crate::claude_code`]
+//! found, with that file's folder first on its `PATH`.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -31,6 +32,8 @@ pub(crate) const AUTH_STATUS_TIMEOUT: SignedDuration = SignedDuration::from_secs
 pub(crate) const SIGN_OUT_TIMEOUT: SignedDuration = SignedDuration::from_mins(1);
 /// `--desktop --resume` only hands the Session over to the desktop app.
 pub(crate) const OPEN_IN_DESKTOP_TIMEOUT: SignedDuration = SignedDuration::from_mins(1);
+/// A login shell whose startup files take longer than this gives no `PATH`.
+pub(crate) const LOGIN_SHELL_TIMEOUT: SignedDuration = SignedDuration::from_secs(10);
 
 /// Flags every usage read passes after its format flags: no Transcript, no
 /// MCP servers, no hooks (ADR 0001).
@@ -63,6 +66,8 @@ impl UsageRead {
 pub(crate) struct Runner<'a> {
     env: &'a Environment,
     paths: &'a AppPaths,
+    /// The `claude` to run; `None` while none is found.
+    claude: Option<&'a Path>,
 }
 
 /// What `claude auth status --json` says about a Profile folder.
@@ -256,8 +261,60 @@ impl<'a> Runner<'a> {
         }
     }
 
-    pub(crate) fn new(env: &'a Environment, paths: &'a AppPaths) -> Runner<'a> {
-        Runner { env, paths }
+    pub(crate) fn new(
+        env: &'a Environment,
+        paths: &'a AppPaths,
+        claude: Option<&'a Path>,
+    ) -> Runner<'a> {
+        Runner { env, paths, claude }
+    }
+
+    /// Starts the user's login shell (`$SHELL -l`) printing the `PATH` its
+    /// startup files set up, marked with [`crate::claude_code::PATH_MARKER`].
+    pub(crate) fn start_login_shell_path(&self) -> io::Result<Job> {
+        let shell = self
+            .inherited("SHELL")
+            .map(PathBuf::from)
+            .filter(|shell| shell.is_absolute())
+            .ok_or_else(|| io::Error::other("SHELL is not an absolute path"))?;
+        let cwd = self.paths.root().join("spawn-cwd");
+        fs::create_dir_all(&cwd)?;
+        let command = format!(
+            "printf '\\n{}%s\\n' \"$PATH\"",
+            crate::claude_code::PATH_MARKER
+        );
+        let request = SpawnRequest {
+            program: shell.into_os_string(),
+            args: vec!["-l".into(), "-c".into(), command.into()],
+            env: self.cleared_env(),
+            cwd: Some(cwd),
+            stdin: None,
+        };
+        self.job(&request, LOGIN_SHELL_TIMEOUT)
+    }
+
+    /// The last value of an inherited variable.
+    fn inherited(&self, name: &str) -> Option<OsString> {
+        self.env
+            .inherited_vars
+            .iter()
+            .rev()
+            .find(|(var, _)| var == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// The inherited environment minus every `CLAUDE*` and `ANTHROPIC_*`
+    /// variable.
+    fn cleared_env(&self) -> Vec<(OsString, OsString)> {
+        self.env
+            .inherited_vars
+            .iter()
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                !(name.starts_with("CLAUDE") || name.starts_with("ANTHROPIC_"))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Starts `claude auth login --claudeai` (with `--email` when known). It
@@ -369,24 +426,30 @@ impl<'a> Runner<'a> {
         {
             return Err(io::Error::other("Claude Code only runs in Profile folders"));
         }
+        let program = self
+            .claude
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "claude not found"))?;
         let cwd = self.paths.root().join("spawn-cwd");
         fs::create_dir_all(&cwd)?;
         let mut env: Vec<(OsString, OsString)> = self
-            .env
-            .inherited_vars
-            .iter()
-            .filter(|(name, _)| {
-                let name = name.to_string_lossy();
-                !(name.starts_with("CLAUDE") || name.starts_with("ANTHROPIC_"))
-            })
-            .cloned()
+            .cleared_env()
+            .into_iter()
+            .filter(|(name, _)| name != "PATH")
             .collect();
+        // Its folder first, so Claude Code finds the tools installed next
+        // to it (`node` and the like).
+        let mut path = OsString::from(program.parent().unwrap_or(Path::new("/")));
+        if let Some(inherited) = self.inherited("PATH").filter(|path| !path.is_empty()) {
+            path.push(":");
+            path.push(inherited);
+        }
+        env.push(("PATH".into(), path));
         env.push((
             "CLAUDE_CONFIG_DIR".into(),
             config_dir.as_os_str().to_owned(),
         ));
         Ok(SpawnRequest {
-            program: "claude".into(),
+            program: program.as_os_str().to_owned(),
             args: args.iter().map(OsString::from).collect(),
             env,
             cwd: Some(cwd),

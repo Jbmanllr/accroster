@@ -8,13 +8,14 @@ use std::time::{Duration, SystemTime};
 
 use accroster_core::{
     Badge, ClaudeVersions, Command, Core, Effect, Event, MenuItem, ProfileRow, SidebarSyncMode,
+    StatusTone,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin, StubCall};
 use common::*;
 use serde_json::json;
 
 /// When the fake desktop children started, and the same instant as Claude
-/// Code writes it in `procStart` (`ps -o lstart`, in the fake Mac's UTC).
+/// Code writes it in `procStart` (`TZ=UTC ps -o lstart`: always UTC).
 const CHILD_STARTED: &str = "2026-10-25T13:00:00Z";
 const CHILD_PROC_START: &str = "Sun Oct 25 13:00:00 2026";
 
@@ -64,6 +65,35 @@ fn set_age(path: &std::path::Path, age: Duration) {
         .unwrap()
         .set_modified(SystemTime::now() - age)
         .unwrap();
+}
+
+/// How the status line is drawn, if there is one.
+fn status_tone(core: &Core) -> Option<StatusTone> {
+    core.view()
+        .menu
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            MenuItem::Status { tone, .. } => Some(tone),
+            _ => None,
+        })
+}
+
+fn log(mac: &FakeMac) -> String {
+    mac.read_file(format!("{APP_FOLDER}/logs/app.log"))
+        .unwrap_or_default()
+}
+
+/// The status line at the top of the menu, if any.
+fn status(core: &Core) -> Option<String> {
+    core.view()
+        .menu
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            MenuItem::Status { text, .. } => Some(text),
+            _ => None,
+        })
 }
 
 fn header(core: &Core) -> Option<String> {
@@ -300,10 +330,8 @@ fn a_busy_desktop_session_blocks_the_switch_and_is_named() {
 
     assert!(!brought_forward(&effects), "{effects:?}");
     assert_eq!(
-        warnings(&core),
-        [format!(
-            "Claude is running “Fix the build” · switch to {WORK} not started"
-        )]
+        status(&core).as_deref(),
+        Some("Claude is busy: “Fix the build”")
     );
     assert!(action_titles(&core).contains(&"Notify me when idle".to_string()));
 }
@@ -318,10 +346,8 @@ fn a_waiting_desktop_session_blocks_the_switch_too() {
 
     assert!(!brought_forward(&effects), "{effects:?}");
     assert_eq!(
-        warnings(&core),
-        [format!(
-            "Claude is running “Fix the build”, “Write docs” · switch to {WORK} not started"
-        )]
+        status(&core).as_deref(),
+        Some("Claude is busy: “Fix the build”, “Write docs”")
     );
 }
 
@@ -343,10 +369,25 @@ fn a_proc_start_with_a_space_padded_day_is_recognised() {
 
     assert!(!brought_forward(&effects), "{effects:?}");
     assert_eq!(
-        warnings(&core),
-        [format!(
-            "Claude is running “Fix the build” · switch to {WORK} not started"
-        )]
+        status(&core).as_deref(),
+        Some("Claude is busy: “Fix the build”")
+    );
+}
+
+#[test]
+fn proc_start_is_read_in_utc_whatever_the_macs_time_zone() {
+    // The owner's Mac: Paris, an hour ahead of UTC. Read as local time,
+    // every live-process file looked like a reused pid, so the guard
+    // couldn't tell.
+    let (mac, mut core) = desktop_on_perso();
+    mac.clock.set_time_zone("Europe/Paris");
+    desktop_child(&mac, 501, "a", "busy");
+
+    click_in_row(&mut core, WORK, SWITCH);
+
+    assert_eq!(
+        status(&core).as_deref(),
+        Some("Claude is busy: “Fix the build”")
     );
 }
 
@@ -359,10 +400,8 @@ fn an_unknown_status_counts_as_busy() {
 
     assert!(!brought_forward(&effects), "{effects:?}");
     assert_eq!(
-        warnings(&core),
-        [format!(
-            "Claude is running “Write docs” · switch to {WORK} not started"
-        )]
+        status(&core).as_deref(),
+        Some("Claude is busy: “Write docs”")
     );
 }
 
@@ -391,48 +430,94 @@ fn idle_desktop_sessions_let_the_switch_go_ahead() {
     assert!(
         effects.contains(&Effect::Notify {
             title: format!("Switch Claude to {WORK}"),
-            body: format!("Sign out, then sign in as {WORK}"),
+            body: format!("Sign out in Claude, then sign in as {WORK}"),
         }),
         "{effects:?}"
     );
     assert_eq!(
-        warnings(&core),
-        [format!("In Claude: Sign out, then sign in as {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
     );
-    assert!(action_titles(&core).contains(&"Cancel switch".to_string()));
+    assert!(action_titles(&core).contains(&"Cancel".to_string()));
 }
 
 #[test]
-fn a_desktop_child_without_a_file_means_cant_tell_and_asks_first() {
+fn a_desktop_child_without_a_file_is_checked_again_then_asks_first_in_the_menu_and_a_notification()
+{
     let (mac, mut core) = desktop_on_perso();
     desktop_child(&mac, 501, "a", "idle");
     mac.os
         .start_desktop_child(503, CHILD_STARTED.parse().unwrap());
 
     let effects = click_in_row(&mut core, WORK, SWITCH);
-
     assert!(!brought_forward(&effects), "{effects:?}");
     assert_eq!(
-        warnings(&core),
-        ["Can't tell whether Claude is running a turn · switching ends every running turn"]
+        status(&core).as_deref(),
+        Some("Checking that Claude is idle…")
+    );
+    assert!(core.tick_interval() <= Duration::from_secs(1));
+
+    mac.clock.advance(jiff::SignedDuration::from_secs(5));
+    let effects = core.event(Event::Tick);
+
+    let unsure = "Can't tell whether Claude is busy \
+                  (a Claude Code process in Claude reports no status)";
+    assert_eq!(status(&core).as_deref(), Some(unsure));
+    assert_eq!(
+        effects,
+        [Effect::Notify {
+            title: format!("Switch Claude to {WORK}?"),
+            body: "Can't tell whether Claude is busy (a Claude Code process in Claude \
+                   reports no status). Choose Switch anyway or Cancel in AccRoster's menu."
+                .into(),
+        }],
+        "a choice that can't go unnoticed"
+    );
+    assert_eq!(
+        status_tone(&core),
+        Some(StatusTone::NeedsYou),
+        "drawn prominently"
     );
     let effects = press(&mut core, "Switch anyway");
     assert!(brought_forward(&effects), "{effects:?}");
+    let log = log(&mac);
+    for line in [
+        "desktop switch checking",
+        "desktop switch unsure",
+        "desktop switch confirmed anyway",
+        "desktop switch guided",
+    ] {
+        assert!(log.contains(line), "{line}: {log}");
+    }
 }
 
+#[test]
+fn a_child_that_writes_its_file_while_checked_again_lets_the_switch_go_ahead() {
+    let (mac, mut core) = desktop_on_perso();
+    mac.os
+        .start_desktop_child(501, CHILD_STARTED.parse().unwrap());
+    click_in_row(&mut core, WORK, SWITCH);
+
+    live_file(&mac, 501, "a", "idle", "claude-desktop", CHILD_PROC_START);
+    mac.clock.advance(jiff::SignedDuration::from_secs(1));
+    let effects = core.event(Event::Tick);
+
+    assert!(brought_forward(&effects), "{effects:?}");
+}
 #[test]
 fn cant_tell_can_be_cancelled() {
     let (mac, mut core) = desktop_on_perso();
     mac.os
         .start_desktop_child(503, CHILD_STARTED.parse().unwrap());
     click_in_row(&mut core, WORK, SWITCH);
+    mac.clock.advance(jiff::SignedDuration::from_secs(5));
+    core.event(Event::Tick);
 
-    let effects = press(&mut core, "Cancel switch");
+    let effects = press(&mut core, "Cancel");
 
     assert!(effects.is_empty(), "{effects:?}");
-    assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
+    assert_eq!(status(&core), None, "{:?}", core.view().menu.items);
 }
-
 #[test]
 fn notify_me_when_idle_fires_once_when_the_last_turn_ends() {
     let (mac, mut core) = desktop_on_perso();
@@ -442,8 +527,8 @@ fn notify_me_when_idle_fires_once_when_the_last_turn_ends() {
     assert!(press(&mut core, "Notify me when idle").is_empty());
     assert!(core.event(Event::Tick).is_empty(), "still busy");
     assert_eq!(
-        warnings(&core),
-        ["Claude is running “Fix the build” · AccRoster will tell you when it's idle"]
+        status(&core).as_deref(),
+        Some("Claude is busy: “Fix the build” · AccRoster will tell you when it's idle")
     );
 
     live_file(&mac, 501, "a", "idle", "claude-desktop", CHILD_PROC_START);
@@ -456,7 +541,7 @@ fn notify_me_when_idle_fires_once_when_the_last_turn_ends() {
         }]
     );
     assert!(core.event(Event::Tick).is_empty(), "only once");
-    assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
+    assert_eq!(status(&core), None, "{:?}", core.view().menu.items);
 }
 
 #[test]
@@ -551,17 +636,60 @@ fn with_sidebar_sync_on_the_switch_first_syncs_into_the_target_profile() {
 
     let effects = click_in_row(&mut core, WORK, SWITCH);
 
+    assert!(!brought_forward(&effects), "{effects:?}");
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Syncing sidebars into {WORK}… 0 of 1"))
+    );
+    let effects = core.event(Event::Tick);
     assert!(brought_forward(&effects), "{effects:?}");
     let copy: Option<serde_json::Value> = mac.read_json(format!("{work_folder}/local_a.json"));
     assert_eq!(copy.unwrap()["title"], "Fix the build");
     // The copies sync just wrote are not Claude signing in to Work.
     core.event(Event::Tick);
     assert_eq!(
-        warnings(&core),
-        [format!("In Claude: Sign out, then sign in as {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
     );
+    assert!(log(&mac).contains("desktop switch syncing"));
 }
 
+#[test]
+fn a_paused_sync_stops_the_switch_and_says_why_with_switch_anyway() {
+    let (mac, mut core) = desktop_on_perso();
+    mac.os.set_desktop_app_running(true);
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+    // Claude added a field sync doesn't know: Sidebar sync pauses.
+    let mut changed = json!({ "sessionId": "local_z", "cliSessionId": "z", "title": "Z" });
+    changed["brandNewField"] = json!(true);
+    mac.write_sidebar_entry(
+        &FixtureLogin::perso().account_uuid,
+        &FixtureLogin::perso().organization_uuid,
+        "z",
+        &changed,
+    );
+
+    let effects = click_in_row(&mut core, WORK, SWITCH);
+
+    assert!(!brought_forward(&effects), "{effects:?}");
+    let line = status(&core).expect("a status line");
+    assert!(
+        line.starts_with("Sidebar sync stopped: Claude 3.6556.2 changed Sidebar entries"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(&format!("switch to {WORK} not started")),
+        "{line}"
+    );
+    assert_eq!(status_tone(&core), Some(StatusTone::Failed));
+    assert!(
+        effects.iter().any(|effect| matches!(effect,
+            Effect::Notify { title, .. } if *title == format!("Switch to {WORK} not started"))),
+        "{effects:?}"
+    );
+    let effects = press(&mut core, "Switch anyway");
+    assert!(brought_forward(&effects), "{effects:?}");
+}
 #[test]
 fn automatic_sync_waits_while_a_switch_waits_so_its_copies_confirm_nothing() {
     let (mac, mut core) = desktop_on_perso();
@@ -588,8 +716,8 @@ fn automatic_sync_waits_while_a_switch_waits_so_its_copies_confirm_nothing() {
 
     assert!(!mac.path(format!("{work_folder}/local_c.json")).exists());
     assert_eq!(
-        warnings(&core),
-        [format!("In Claude: Sign out, then sign in as {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
     );
 }
 
@@ -606,8 +734,8 @@ fn the_switch_is_confirmed_from_the_folder_claude_writes() {
     );
     assert!(core.event(Event::Tick).is_empty());
     assert_eq!(
-        warnings(&core),
-        [format!("In Claude: Sign out, then sign in as {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
     );
 
     desktop_signed_in_as(&mac, &work());
@@ -621,7 +749,10 @@ fn the_switch_is_confirmed_from_the_folder_claude_writes() {
             body: format!("Claude now uses {WORK}"),
         }]
     );
-    assert_eq!(warnings(&core), [format!("Claude now uses {WORK}")]);
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Claude now uses {WORK}"))
+    );
     assert_eq!(
         header(&core).as_deref(),
         Some("CLI: me@example.com (default login)    Desktop: me · Work Inc")
@@ -650,8 +781,8 @@ fn a_folder_of_another_account_is_flagged_as_a_mismatch() {
         }]
     );
     assert_eq!(
-        warnings(&core),
-        [format!("Claude signed in as another Profile, not {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Claude signed in as another Profile, not {WORK}"))
     );
 }
 
@@ -667,7 +798,10 @@ fn main_log_confirms_when_no_folder_was_written_yet() {
     );
     core.event(Event::Tick);
 
-    assert_eq!(warnings(&core), [format!("Claude now uses {WORK}")]);
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Claude now uses {WORK}"))
+    );
 }
 
 #[test]
@@ -682,8 +816,8 @@ fn main_log_flags_signing_back_in_as_the_old_account() {
     core.event(Event::Tick);
 
     assert_eq!(
-        warnings(&core),
-        [format!("Claude signed in as {PERSO}, not {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Claude signed in as {PERSO}, not {WORK}"))
     );
 }
 
@@ -693,21 +827,24 @@ fn an_unconfirmed_switch_gives_up_after_half_an_hour_and_can_be_cancelled_before
     mac.clock.advance(jiff::SignedDuration::from_mins(29));
     core.event(Event::Tick);
     assert_eq!(
-        warnings(&core),
-        [format!("In Claude: Sign out, then sign in as {WORK}")]
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
     );
     mac.clock.advance(jiff::SignedDuration::from_mins(1));
-    core.event(Event::Tick);
+    let effects = core.event(Event::Tick);
+    let gave_up = format!("Gave up waiting after 30 min for Claude to sign in as {WORK}");
+    assert_eq!(status(&core).as_deref(), Some(&*gave_up));
     assert_eq!(
-        warnings(&core),
-        [format!(
-            "Couldn't confirm Claude switched to {WORK} · check its account menu"
-        )]
+        effects,
+        [Effect::Notify {
+            title: "Claude didn't switch".into(),
+            body: gave_up,
+        }]
     );
 
     click_in_row(&mut core, WORK, SWITCH);
-    press(&mut core, "Cancel switch");
-    assert!(warnings(&core).is_empty(), "{:?}", warnings(&core));
+    press(&mut core, "Cancel");
+    assert_eq!(status(&core), None, "{:?}", core.view().menu.items);
 }
 
 #[test]
@@ -718,6 +855,8 @@ fn no_path_quits_relaunches_or_spawns_anything_against_claude() {
     mac.os
         .start_desktop_child(503, CHILD_STARTED.parse().unwrap());
     effects.extend(click_in_row(&mut core, WORK, SWITCH));
+    mac.clock.advance(jiff::SignedDuration::from_secs(5));
+    effects.extend(core.event(Event::Tick));
     effects.extend(press(&mut core, "Switch anyway"));
     desktop_signed_in_as(&mac, &work());
     sidebar_entry(&mac, &work(), "n", "New one", Duration::ZERO);

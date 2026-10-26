@@ -160,7 +160,9 @@ impl Core {
     /// Collects the `--desktop --resume` runs that ended; a failed or
     /// timed-out hand-over is notified.
     pub(super) fn poll_openings(&mut self) -> Vec<Effect> {
-        let ended = self.openings.poll(&Runner::new(&self.env, &self.paths));
+        let ended = self
+            .openings
+            .poll(&Runner::new(&self.env, &self.paths, self.claude.program()));
         let mut effects = Vec::new();
         for Ended {
             tag: id, finished, ..

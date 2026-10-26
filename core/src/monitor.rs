@@ -239,8 +239,15 @@ impl LimitMonitor {
         ctx: &Context,
         watched: &[Watched],
     ) -> Option<Completed> {
-        // A Profile watched again (signed in again after its Login expired)
-        // is read as soon as allowed.
+        self.notice_watched(watched);
+        self.collect(ctx)
+    }
+
+    /// A Profile watched again (signed in again after its Login expired) is
+    /// read as soon as allowed. Seen both before and after a finished read
+    /// is recorded, so a Profile that read expires counts as unwatched even
+    /// when its sign-in again ends before the next tick.
+    fn notice_watched(&mut self, watched: &[Watched]) {
         let now_watched: HashSet<String> = watched.iter().map(|w| w.id.clone()).collect();
         for id in now_watched.difference(&self.last_watched) {
             if let Some(watch) = self.watches.get_mut(id) {
@@ -248,12 +255,12 @@ impl LimitMonitor {
             }
         }
         self.last_watched = now_watched;
-        self.collect(ctx)
     }
 
     /// Starts the next read that is due, unless one is in flight or polling
     /// is paused. `Some` when it couldn't even start (unreadable).
     pub(crate) fn start_due(&mut self, ctx: &Context, watched: &[Watched]) -> Option<Completed> {
+        self.notice_watched(watched);
         if self.running.is_some() || self.paused() {
             return None;
         }
@@ -485,6 +492,8 @@ impl LimitMonitor {
     }
 
     fn start(&mut self, ctx: &Context, watched: Watched, step: UsageRead) -> Option<Completed> {
+        // Without a `claude` the menu says so once; no read is tried.
+        ctx.claude?;
         let now = ctx.env.clock.now();
         if step == UsageRead::GetUsage {
             let watch = self.watches.entry(watched.id.clone()).or_default();

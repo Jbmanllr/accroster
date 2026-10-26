@@ -9,6 +9,7 @@ use jiff::SignedDuration;
 
 use crate::backups;
 use crate::checks;
+use crate::claude_code::{self, ClaudeLocator};
 use crate::cli_switcher;
 use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
 use crate::discovered::{self, Evidence};
@@ -91,6 +92,8 @@ pub struct Core {
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
+    /// Where `claude` is, once found.
+    claude: ClaudeLocator,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
     /// The All Sessions list and the Session index behind it.
@@ -103,6 +106,10 @@ pub struct Core {
     links: Vec<ProfileLinks>,
     /// What the last "Sync now" did, for Settings.
     sync_note: Option<String>,
+    /// The sync under way, written one sidebar per tick.
+    sync: Option<sidebar::ActiveSync>,
+    /// How the last sync ended, for the menu (for a while).
+    sync_result: Option<sidebar::SyncResult>,
     /// The sidebars' watch while Sidebar sync is on.
     sidebar_watch: sidebar_sync::Watch,
     /// `claude --desktop --resume` runs, by Session id.
@@ -130,6 +137,7 @@ macro_rules! context {
             &$core.logger,
             &$core.settings,
             &$core.safety,
+            &$core.claude,
         )
     };
 }
@@ -140,6 +148,7 @@ fn context_of<'a>(
     logger: &'a Logger,
     settings: &Settings,
     safety: &Safety,
+    claude: &'a ClaudeLocator,
 ) -> profiles::Context<'a> {
     profiles::Context {
         env,
@@ -147,6 +156,7 @@ fn context_of<'a>(
         logger,
         verbose: verbose_logging(settings, env),
         paused: safety.paused(),
+        claude: claude.program(),
     }
 }
 
@@ -192,12 +202,15 @@ impl Core {
             notifier: Notifier::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
+            claude: ClaudeLocator::default(),
             discovered: Vec::new(),
             safety: Safety::load(&paths_for_safety),
             versions: ClaudeVersions::default(),
             links: Vec::new(),
             sessions: SessionIndex::default(),
             sync_note: None,
+            sync: None,
+            sync_result: None,
             sidebar_watch: sidebar_sync::Watch::default(),
             openings: Jobs::default(),
             resume_waiting: None,
@@ -247,6 +260,7 @@ impl Core {
                 "Settings were unreadable and were reset · old file kept as {name}"
             ));
         }
+        core.locate_claude();
         let (profiles, ctx) = core.profiles();
         *profiles = ProfileRegistry::load(&ctx);
         // Checks first: a Safety pause stops a feature before it writes.
@@ -282,11 +296,11 @@ impl Core {
         if self.uninstalled {
             return crate::driver::TICK_INTERVAL;
         }
-        if self.sessions.busy() {
+        if self.sessions.busy() || self.sync.is_some() {
             // The next batch of the Session index, as soon as input allows.
             return Duration::ZERO;
         }
-        if self.profiles.busy() || !self.openings.is_empty() {
+        if self.profiles.busy() || !self.openings.is_empty() || self.claude.looking() {
             // Its end shows at once.
             return RUN_TICK;
         }
@@ -330,6 +344,7 @@ impl Core {
             "command",
             &[("name", Field::Word(command.name()))],
         );
+        self.locate_claude();
         let mut effects = self.handle(command);
         // A run the command started may have ended at once (it couldn't
         // start), and an uninstall with nothing to sign out ends now.
@@ -471,10 +486,7 @@ impl Core {
                 let cleared = desktop.start(&ctx, target);
                 self.guide_desktop_switch(cleared)
             }
-            Command::ConfirmDesktopSwitch => {
-                let cleared = self.desktop.confirm();
-                self.guide_desktop_switch(cleared)
-            }
+            Command::ConfirmDesktopSwitch => self.confirm_desktop_switch(),
             Command::NotifyWhenDesktopIdle => {
                 self.desktop.notify_when_idle();
                 Vec::new()
@@ -567,6 +579,18 @@ impl Core {
                 self.sync_sidebar();
                 Vec::new()
             }
+            Command::SetIncludeSshSessions(on) => {
+                let mut updated = self.settings.clone();
+                updated.leave_out_ssh_sessions = !on;
+                if self.save_settings(updated) {
+                    self.log(
+                        Level::Info,
+                        "sidebar sync ssh sessions",
+                        &[("on", Field::Word(if on { "on" } else { "off" }))],
+                    );
+                }
+                Vec::new()
+            }
             Command::FilterSessions(filter) => {
                 self.sessions.set_filter(filter);
                 Vec::new()
@@ -621,6 +645,7 @@ impl Core {
         if self.uninstalled {
             return Vec::new();
         }
+        self.locate_claude();
         let mut effects = match event {
             Event::Tick => {
                 if self.settings.verbose_logging_until.is_some() && !self.verbose_logging() {
@@ -639,7 +664,9 @@ impl Core {
                 }
                 let signed_in = self.profiles.signed_in();
                 let (desktop, ctx) = self.desktop();
-                effects.extend(desktop.poll(&ctx, &signed_in));
+                let (polled, cleared) = desktop.poll(&ctx, &signed_in);
+                effects.extend(polled);
+                effects.extend(self.guide_desktop_switch(cleared));
                 self.sidebar_watch.notice_switch(&self.env);
                 // While a Guided switch waits, copies sync wrote would look
                 // like Claude writing the target's folder: sync waits too.
@@ -648,6 +675,9 @@ impl Core {
                     && self.sidebar_watch.take_due(self.env.clock.now())
                 {
                     self.sync_sidebar();
+                }
+                if let Some(ended) = self.step_sync() {
+                    effects.extend(self.continue_desktop_switch(&ended));
                 }
                 self.index_sessions();
                 effects
@@ -796,6 +826,11 @@ impl Core {
                 self.warnings
                     .iter()
                     .cloned()
+                    .chain(
+                        self.claude
+                            .missing()
+                            .then(|| claude_code::MISSING.to_owned()),
+                    )
                     .chain(self.safety.warning_lines())
                     .chain(self.profiles.notice().map(str::to_owned)),
             )
@@ -820,7 +855,10 @@ impl Core {
         let menu_bar_dimmed = listed
             .iter()
             .any(|profile| Some(profile.config_dir) == pointer.as_deref() && profile.row.dimmed);
-        items.extend(self.desktop.menu_items());
+        // The status line goes first: a Guided switch's, else a sync's.
+        let mut status = self.desktop.menu_items(self.sync_progress());
+        status.extend(self.sync_menu_items());
+        items.splice(0..0, status);
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
@@ -988,7 +1026,13 @@ impl Core {
                     mode: self.settings.sidebar_sync,
                     sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
                         .then_some(Command::SyncSidebarNow),
-                    note: self.sync_note.clone(),
+                    note: self.sync_settings_note(),
+                    ssh_sessions: Toggle {
+                        on: !self.settings.leave_out_ssh_sessions,
+                        command: Command::SetIncludeSshSessions(
+                            self.settings.leave_out_ssh_sessions,
+                        ),
+                    },
                 },
                 profiles: profile_settings,
                 hidden_discovered: shown
@@ -1350,6 +1394,13 @@ impl Core {
             ),
         }
         Vec::new()
+    }
+
+    /// Looks for `claude` again (cheap once found).
+    fn locate_claude(&mut self) {
+        let verbose = self.verbose_logging();
+        self.claude
+            .update(&self.env, &self.paths, &self.logger, verbose);
     }
 
     /// The Desktop bridge, with what it needs from the rest of the core.

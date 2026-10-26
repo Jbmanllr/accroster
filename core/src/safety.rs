@@ -298,6 +298,15 @@ impl Safety {
             .any(|record| feature_from_key(&record.feature) == Some(feature))
     }
 
+    /// Why `feature` is under a Safety pause, if it is.
+    pub(crate) fn paused_reason(&self, feature: SafetyFeature) -> Option<String> {
+        self.file
+            .paused
+            .iter()
+            .find(|record| feature_from_key(&record.feature) == Some(feature))
+            .map(|record| record.reason.clone())
+    }
+
     /// Ends `feature`'s pause if no check blocks it any more (the caller ran
     /// its checks again first). Returns whether it resumed.
     pub(crate) fn resume(&mut self, feature: SafetyFeature) -> bool {

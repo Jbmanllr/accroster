@@ -137,6 +137,8 @@ pub enum Command {
     /// "Sync now" in Settings: copy every Session's Sidebar entry into every
     /// other Profile's sidebar.
     SyncSidebarNow,
+    /// "Include SSH Sessions" in Settings (on by default).
+    SetIncludeSshSessions(bool),
     /// "Uninstall…" in Settings: asks first ([`Effect::ConfirmUninstall`]).
     AskUninstall,
     /// The uninstall confirmed, or its Retry: unhook the CLI, remove every
@@ -256,6 +258,7 @@ impl Command {
             Command::ResumeFeature(_) => "resume_feature",
             Command::SetSidebarSync(_) => "set_sidebar_sync",
             Command::SyncSidebarNow => "sync_sidebar_now",
+            Command::SetIncludeSshSessions(_) => "set_include_ssh_sessions",
             Command::AskUninstall => "ask_uninstall",
             Command::Uninstall => "uninstall",
             Command::OpenAllSessions => "open_all_sessions",
@@ -532,6 +535,13 @@ pub struct MenuView {
 /// One row of the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
+    /// The status line at the top of the menu: what a Guided switch or a
+    /// Sidebar sync is doing, or how it ended. Disabled; the actions that
+    /// answer it follow as [`MenuItem::Action`]s.
+    Status {
+        text: String,
+        tone: StatusTone,
+    },
     /// A disabled line drawn as a warning (for example, a set-aside settings
     /// file).
     Warning(String),
@@ -560,6 +570,20 @@ pub enum MenuItem {
     Profile(ProfileRow),
     /// A Discovered Profile, drawn greyed. Clicking the row sends `command`.
     Discovered(DiscoveredRow),
+}
+
+/// How a [`MenuItem::Status`] line is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    /// Under way ("Syncing… 3 of 10").
+    Working,
+    /// Waits on the user: drawn prominently ("Can't tell whether Claude is
+    /// busy…", "Sign out in Claude, then sign in as …").
+    NeedsYou,
+    /// Ended well ("Claude now uses …").
+    Done,
+    /// Ended without doing what was asked ("Gave up waiting after 30 min…").
+    Failed,
 }
 
 /// A Discovered Profile's row in the menu: an account the Mac has evidence of
@@ -701,6 +725,8 @@ pub struct SidebarSyncView {
     pub sync_now: Option<Command>,
     /// What the last sync did, or why it didn't run.
     pub note: Option<String>,
+    /// "Include SSH Sessions": [`Command::SetIncludeSshSessions`].
+    pub ssh_sessions: Toggle,
 }
 
 /// One Profile in Settings > Profiles, in the user's order.

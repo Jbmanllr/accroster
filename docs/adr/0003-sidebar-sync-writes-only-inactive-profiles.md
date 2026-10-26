@@ -11,10 +11,15 @@ Sidebar sync copies each existing Sidebar entry (`local_*.json`) into every othe
 
 ## Consequences
 
-- A copy keeps the file name, `sessionId` and `cliSessionId`, and clears `bridgeSessionIds` and the connector snapshot (`remoteMcpServersConfig`, `enabledMcpTools`). Scratch, SSH/WSL and scheduled-task entries are skipped.
+- A copy keeps the file name, `sessionId` and `cliSessionId`, and clears `bridgeSessionIds` and the connector snapshot (`remoteMcpServersConfig`, `enabledMcpTools`). Scratch, WSL and scheduled-task entries are skipped. SSH entries are copied unless the user turns off "Include SSH Sessions" (on by default); see the amendment below.
+- Skipping stays strict but is reported: each run's result says how many Sessions it left out and why ("left out 17 SSH and 21 scratch Sessions"), and a run writes one sidebar at a time so the menu and Settings show its progress.
 - A `deleted_*` tombstone only stops sync re-adding that Session to that Profile.
 - Entries carry no per-field timestamps, so sync keeps its own record of each copy's title and archive state as of the last run; a copy that differs from the record changed and wins. If two changed, the active Profile's copy wins, else the newest file.
 - If the desktop app's dormant multi-account mode is ever enabled, inactive Profiles may be written in the background: sync detects it, stops and warns.
 - Every write follows the safety bar: backup, temp file then rename, abort on unknown files.
 - While the desktop app runs, sync leaves alone every Organization folder of the desktop's account, not only the Active Profile's. The app records the active account (`lastKnownAccountUuid`) but not the active Organization, and guessing it from the newest-written folder could be wrong, so a wrong guess would mean writing the folder the app is using. The cost: a Login's other Organizations only sync once Claude is quit or switched to another account.
 - The dormant multi-account mode's second proxy, "a target folder changed since sync's own record", is narrowed to: a folder sync may write, of an account other than the one the desktop used at the last run, whose copies changed since that run, with no account switch in between (the desktop's folder unchanged and no `Login-state transition` line in `main.log` since; a shorter log counts as a switch). Taken literally, every account switch and every edit in the desktop's own folder would also pause sync, so the literal proxy pauses on ordinary use. The exact file is still read again right before it is replaced, and any difference from the plan pauses sync.
+
+## Amendment: SSH Sessions are included
+
+The owner's first real switch left out 17 desktop SSH Sessions (entries with `sshConfig`, `sshRemoteTranscriptPath` or `sshRemoteProcessId`), which made sync look broken. They are now copied by default, with the same field clearing, backups and conflict rules as local entries; Settings › Sidebar sync has an "Include SSH Sessions" checkbox to leave them out. A copy also drops `sshReattach`: it binds the Session's remote process to the login that started it, so a copy under another login must not claim it. How a copy behaves when opened under another login is not verified yet, so the app says nothing about it. WSL, scheduled-task and scratch Sessions stay skipped.

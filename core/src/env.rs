@@ -125,8 +125,8 @@ pub trait RunningProcess: Send {
 pub trait Clock: Send {
     fn now(&self) -> Timestamp;
 
-    /// The Mac's own time zone: dates and times are shown in it, and local
-    /// times other programs write (Claude Code's `procStart`) are read in it.
+    /// The Mac's own time zone: dates and times are shown in it. (Claude
+    /// Code's `procStart` is always UTC, so it isn't read in it.)
     fn time_zone(&self) -> jiff::tz::TimeZone {
         jiff::tz::TimeZone::system()
     }
@@ -164,6 +164,12 @@ pub trait OsFacts: Send {
     /// running. When the process table can't be read, it counts as running:
     /// that is the case in which fewer files get written.
     fn desktop_app_running(&self) -> bool;
+    /// The system's program folders searched for `claude` after
+    /// `~/.local/bin` and `~/.claude/local` (Homebrew's, then the classic
+    /// one).
+    fn program_folders(&self) -> Vec<PathBuf> {
+        vec!["/opt/homebrew/bin".into(), "/usr/local/bin".into()]
+    }
 }
 
 /// Where Claude Code reads managed (administrator) settings.

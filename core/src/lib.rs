@@ -7,6 +7,7 @@
 
 mod backups;
 mod checks;
+mod claude_code;
 mod claude_json;
 mod cli_switcher;
 mod core;
@@ -38,7 +39,7 @@ pub use env::{
 pub use env::{LoginItem, LoginItemStatus, SystemLoginItem};
 pub use interface::{
     AboutView, Badge, Command, Effect, Event, LimitBar, MOST_HEADROOM, MenuBarView, MenuItem,
-    MenuView, ProfileRow, SettingsView, View,
+    MenuView, ProfileRow, SettingsView, StatusTone, View,
 };
 pub use interface::{
     AllSessionsView, OpenChoice, RunningDot, SessionDetail, SessionFilter, SessionRow,

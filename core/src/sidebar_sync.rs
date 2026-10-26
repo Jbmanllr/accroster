@@ -9,10 +9,12 @@
 //!   alone. If Claude runs and its account can't be read, nothing is written.
 //!   Folders are never created and files are never deleted.
 //! - **What it copies.** `local_*.json` entries only (never one for a
-//!   CLI-only Session), skipping scratch, SSH/WSL and scheduled-task
+//!   CLI-only Session), skipping scratch, WSL, scheduled-task and (when
+//!   "Include SSH Sessions" is off, ADR 0003's amendment) SSH
 //!   Sessions, files over 10 MB, empty and unparsable files. A copy keeps the
 //!   file name and every field; `bridgeSessionIds`, `remoteMcpServersConfig`
-//!   and `enabledMcpTools` are cleared when present. A `deleted_<id>`
+//!   and `enabledMcpTools` are cleared when present, and `sshReattach` is
+//!   dropped. Each run counts the Sessions it left out, by why. A `deleted_<id>`
 //!   tombstone in a folder stops the Session being added there again.
 //! - **Which copy wins.** Entries carry no per-field times, so sync keeps
 //!   its own record (`state/sidebar-sync.json`, hashes only) of each copy as
@@ -32,7 +34,7 @@
 //!   writes in any other folder while it runs, more than 30 s after the last
 //!   account switch, is the other trace of the dormant multi-account mode.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,6 +63,11 @@ const CLEARED: [&str; 3] = [
     "enabledMcpTools",
 ];
 
+/// Fields a copy drops: `sshReattach` binds an SSH Session's remote process
+/// to the login that started it, so a copy under another login must not
+/// claim it (ADR 0003).
+const DROPPED: [&str; 1] = ["sshReattach"];
+
 /// The fields that make up an entry's title, and its archive state.
 const TITLE_FIELDS: [&str; 5] = [
     "title",
@@ -71,20 +78,50 @@ const TITLE_FIELDS: [&str; 5] = [
 ];
 const ARCHIVE_FIELDS: [&str; 2] = ["isArchived", "autoArchiveExempt"];
 
-/// Entries with any of these are SSH, WSL or scheduled-task Sessions.
-const SKIP_MARKERS: [&str; 6] = [
-    "sshConfig",
-    "sshRemoteTranscriptPath",
-    "sshRemoteProcessId",
-    "wslConfig",
-    "scheduledTaskId",
-    "notifySessionId",
-];
+/// Entries with any of these are SSH Sessions.
+const SSH_MARKERS: [&str; 3] = ["sshConfig", "sshRemoteTranscriptPath", "sshRemoteProcessId"];
+/// … WSL Sessions.
+const WSL_MARKERS: [&str; 1] = ["wslConfig"];
+/// … scheduled-task Sessions.
+const SCHEDULED_MARKERS: [&str; 2] = ["scheduledTaskId", "notifySessionId"];
+
+/// Why a Session is never copied: it belongs to one desktop login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LeftOut {
+    Ssh,
+    Wsl,
+    Scratch,
+    ScheduledTask,
+}
+
+impl LeftOut {
+    /// How the sync report names them ("17 SSH").
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            LeftOut::Ssh => "SSH",
+            LeftOut::Wsl => "WSL",
+            LeftOut::Scratch => "scratch",
+            LeftOut::ScheduledTask => "scheduled-task",
+        }
+    }
+
+    /// Its log field.
+    pub(crate) fn log_key(self) -> &'static str {
+        match self {
+            LeftOut::Ssh => "skipped_ssh",
+            LeftOut::Wsl => "skipped_wsl",
+            LeftOut::Scratch => "skipped_scratch",
+            LeftOut::ScheduledTask => "skipped_scheduled",
+        }
+    }
+}
 
 /// What one run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Run {
     Synced(Report),
+    /// Not started: Sidebar sync is under a Safety pause.
+    Paused,
     /// Claude runs but its account can't be read, so any folder could be
     /// the one it uses: nothing was written.
     DesktopAccountUnknown,
@@ -106,6 +143,9 @@ pub(crate) struct Report {
     pub not_backed_up: usize,
     /// Claude was running, so its account's folders were left alone.
     pub left_desktop_account: bool,
+    /// Sessions never copied, by why (each counted once, whatever the
+    /// number of sidebars holding it).
+    pub left_out: BTreeMap<LeftOut, usize>,
 }
 
 /// `state/sidebar-sync.json`: sync's record as of its last run. Hashes only
@@ -171,8 +211,8 @@ struct Entry {
 /// Everything under `claude-code-sessions/`, plus what the checks found.
 struct Read {
     folders: Vec<Folder>,
-    /// File names of entries sync never copies (scratch, SSH/WSL, scheduled).
-    skipped: BTreeSet<String>,
+    /// File names of entries sync never copies, with why.
+    skipped: BTreeMap<String, LeftOut>,
     unknown_fields: BTreeSet<String>,
 }
 
@@ -350,17 +390,47 @@ fn active_key(desktop_paths: &DesktopPaths) -> Option<String> {
     Some(format!("{}/{org}", account.account_uuid))
 }
 
-/// "Sync now".
-pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
+/// A sync under way: planned in one go, then written one sidebar (folder)
+/// per [`SyncRun::step`], so the menu can show its progress. Sync's record
+/// is saved after every folder, so a run cut short leaves it true to disk.
+pub(crate) struct SyncRun {
+    read: Read,
+    /// Folder index and its writes, in folder order.
+    pending: VecDeque<(usize, Vec<Write>)>,
+    total: usize,
+    report: Report,
+    /// Sync's record so far: the old one, with each folder written since
+    /// as it is now.
+    record: Record,
+    /// What the finished run records.
+    decided: BTreeMap<String, Groups>,
+    active_key: Option<String>,
+    log_length: Option<u64>,
+    /// Folders written into so far, by key.
+    written: BTreeSet<String>,
+}
+
+/// How a "Sync now" starts.
+pub(crate) enum Begun {
+    /// Writing: call [`SyncRun::step`] until it ends.
+    Running(Box<SyncRun>),
+    /// It ended before writing anything (nothing to write, or stopped).
+    Ended(Run),
+}
+
+/// "Sync now": reads every sidebar, checks it and plans every write.
+/// With `include_ssh` ("Include SSH Sessions", the default), SSH Sessions
+/// are copied too; WSL, scratch and scheduled-task Sessions never are.
+pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_ssh: bool) -> Begun {
     let desktop_paths = DesktopPaths::new(&env.home);
     let desktop = desktop::desktop_account(&desktop_paths);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
-        return Run::DesktopAccountUnknown;
+        return Begun::Ended(Run::DesktopAccountUnknown);
     }
-    let read = read_all(&env.home);
+    let read = read_all(&env.home, include_ssh);
     if !read.unknown_fields.is_empty() {
-        return Run::UnknownFields(read.unknown_fields);
+        return Begun::Ended(Run::UnknownFields(read.unknown_fields));
     }
     let record = load(paths);
     let active_key = active_key(&desktop_paths);
@@ -399,27 +469,53 @@ pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
             })
             .count();
         if changed > 0 {
-            return Run::FoldersChanged(changed);
+            return Begun::Ended(Run::FoldersChanged(changed));
         }
     }
 
-    let mut report = Report {
+    let mut by_folder: BTreeMap<usize, Vec<Write>> = BTreeMap::new();
+    for write in writes {
+        by_folder.entry(write.folder).or_default().push(write);
+    }
+    let report = Report {
         left_desktop_account: running,
+        left_out: read.left_out(),
         ..Report::default()
     };
-    let mut written: BTreeMap<(usize, String), Map<String, Value>> = BTreeMap::new();
-    let now = env.clock.now();
-    let by_folder: BTreeMap<usize, Vec<&Write>> =
-        writes.iter().fold(BTreeMap::new(), |mut map, write| {
-            map.entry(write.folder).or_insert_with(Vec::new).push(write);
-            map
-        });
-    for (index, folder_writes) in by_folder {
-        let folder = &read.folders[index];
-        if backups::back_up_folder(&paths.backups(), &folder.path, now).is_err() {
-            report.not_backed_up += 1;
-            continue;
+    let mut sync = SyncRun {
+        total: by_folder.len(),
+        pending: by_folder.into_iter().collect(),
+        read,
+        report,
+        record,
+        decided,
+        active_key,
+        log_length,
+        written: BTreeSet::new(),
+    };
+    if sync.pending.is_empty() {
+        return Begun::Ended(sync.finish(paths));
+    }
+    Begun::Running(Box::new(sync))
+}
+
+impl SyncRun {
+    /// Sidebars written so far, and how many this run writes.
+    pub(crate) fn progress(&self) -> (usize, usize) {
+        (self.total - self.pending.len(), self.total)
+    }
+
+    /// Writes the next sidebar; `Some` once the run ended.
+    pub(crate) fn step(&mut self, env: &Environment, paths: &AppPaths) -> Option<Run> {
+        let Some((index, folder_writes)) = self.pending.pop_front() else {
+            return Some(self.finish(paths));
+        };
+        let folder = &self.read.folders[index];
+        if backups::back_up_folder(&paths.backups(), &folder.path, env.clock.now()).is_err() {
+            self.report.not_backed_up += 1;
+            return self.pending.is_empty().then(|| self.finish(paths));
         }
+        let mut copies = copy_records(folder);
         let mut wrote_any = false;
         for write in folder_writes {
             let file = folder.path.join(&write.name);
@@ -431,7 +527,12 @@ pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
             };
             let expected = folder.copies.get(&write.name).map(|entry| &entry.bytes);
             if now_there.as_ref() != expected {
-                return Run::FoldersChanged(1);
+                if wrote_any {
+                    self.written.insert(folder.key.clone());
+                    self.record.folders.insert(folder.key.clone(), copies);
+                    save(paths, &self.record);
+                }
+                return Some(Run::FoldersChanged(1));
             }
             let Ok(bytes) = serde_json::to_vec(&Value::Object(write.body.clone())) else {
                 continue;
@@ -443,41 +544,51 @@ pub(crate) fn run(env: &Environment, paths: &AppPaths) -> Run {
                     .write(true)
                     .open(&file)
                     .and_then(|copy| copy.set_modified(write.modified));
-                written.insert((index, write.name.clone()), write.body.clone());
-                report.written += 1;
+                copies.insert(write.name.clone(), copy_record(&write.body));
+                self.report.written += 1;
                 wrote_any = true;
             }
         }
         if wrote_any {
-            report.folders += 1;
+            self.report.folders += 1;
+            self.written.insert(folder.key.clone());
+            self.record.folders.insert(folder.key.clone(), copies);
+            save(paths, &self.record);
         }
+        self.pending.is_empty().then(|| self.finish(paths))
     }
 
-    // The new record: every copy as it is now, and what was decided.
-    let mut new_record = Record {
-        folders: BTreeMap::new(),
-        sessions: decided,
-        desktop_folder: active_key,
-        main_log_length: log_length,
-    };
-    for (index, folder) in read.folders.iter().enumerate() {
-        let mut copies = copy_records(folder);
-        for ((written_in, name), body) in &written {
-            if *written_in == index {
-                copies.insert(name.clone(), copy_record(body));
-            }
-        }
-        new_record.folders.insert(folder.key.clone(), copies);
+    /// Saves the finished run's record: every copy as it is now, and what
+    /// was decided.
+    fn finish(&mut self, paths: &AppPaths) -> Run {
+        let folders = self
+            .read
+            .folders
+            .iter()
+            .map(|folder| {
+                let copies = match self.record.folders.get(&folder.key) {
+                    Some(copies) if self.written.contains(&folder.key) => copies.clone(),
+                    _ => copy_records(folder),
+                };
+                (folder.key.clone(), copies)
+            })
+            .collect();
+        self.record = Record {
+            folders,
+            sessions: std::mem::take(&mut self.decided),
+            desktop_folder: self.active_key.clone(),
+            main_log_length: self.log_length,
+        };
+        save(paths, &self.record);
+        Run::Synced(self.report.clone())
     }
-    save(paths, &new_record);
-    Run::Synced(report)
 }
 
 /// Resuming after a Safety pause: the user accepts the folders as they are
 /// now, so the next run compares against them.
 pub(crate) fn accept_current(env: &Environment, paths: &AppPaths) {
     let desktop_paths = DesktopPaths::new(&env.home);
-    let read = read_all(&env.home);
+    let read = read_all(&env.home, false);
     let mut record = load(paths);
     record.folders = read
         .folders
@@ -509,7 +620,7 @@ fn plan(
         .folders
         .iter()
         .flat_map(|folder| folder.copies.keys())
-        .filter(|name| !read.skipped.contains(*name))
+        .filter(|name| !read.skipped.contains_key(*name))
         .collect();
     let mut writes = Vec::new();
     let mut decided = BTreeMap::new();
@@ -635,9 +746,12 @@ fn take_fields(body: &mut Map<String, Value>, from: &Map<String, Value>, fields:
     }
 }
 
-/// Empties the account-bound fields that are present: lists to `[]`,
+/// Drops [`DROPPED`] and empties the account-bound fields that are present: lists to `[]`,
 /// anything else to `{}`.
 fn clear(body: &mut Map<String, Value>) {
+    for field in DROPPED {
+        body.remove(field);
+    }
     for field in CLEARED {
         if let Some(value) = body.get_mut(field) {
             *value = match value {
@@ -654,8 +768,8 @@ fn clear(body: &mut Map<String, Value>) {
 fn same_but_cleared(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
     let strip = |body: &Map<String, Value>| {
         let mut body = body.clone();
-        for field in CLEARED {
-            body.remove(field);
+        for field in CLEARED.iter().chain(&DROPPED) {
+            body.remove(*field);
         }
         body
     };
@@ -696,11 +810,11 @@ fn hash(value: &Value) -> String {
 }
 
 /// Reads every `<account>/<org>/` folder (real folders with uuid names).
-fn read_all(home: &Path) -> Read {
+fn read_all(home: &Path, include_ssh: bool) -> Read {
     let root = sidebar_root(home);
     let mut read = Read {
         folders: Vec::new(),
-        skipped: BTreeSet::new(),
+        skipped: BTreeMap::new(),
         unknown_fields: BTreeSet::new(),
     };
     for (account, account_path) in uuid_folders(&root) {
@@ -712,14 +826,14 @@ fn read_all(home: &Path) -> Read {
                 copies: BTreeMap::new(),
                 tombstones: BTreeSet::new(),
             };
-            read_folder(&mut folder, &mut read);
+            read_folder(&mut folder, &mut read, include_ssh);
             read.folders.push(folder);
         }
     }
     read
 }
 
-fn read_folder(folder: &mut Folder, read: &mut Read) {
+fn read_folder(folder: &mut Folder, read: &mut Read, include_ssh: bool) {
     let Ok(entries) = fs::read_dir(&folder.path) else {
         return;
     };
@@ -756,8 +870,8 @@ fn read_folder(folder: &mut Folder, read: &mut Read) {
                 read.unknown_fields.insert(reportable(key));
             }
         }
-        if never_copied(&body) {
-            read.skipped.insert(name.clone());
+        if let Some(why) = left_out(&body, include_ssh) {
+            read.skipped.insert(name.clone(), why);
         }
         let Ok(modified) = meta.modified() else {
             continue;
@@ -773,18 +887,41 @@ fn read_folder(folder: &mut Folder, read: &mut Read) {
     }
 }
 
-/// Scratch, SSH/WSL and scheduled-task Sessions.
-fn never_copied(body: &Map<String, Value>) -> bool {
+/// Why sync never copies this entry, if it doesn't: SSH, WSL, scratch and
+/// scheduled-task Sessions.
+fn left_out(body: &Map<String, Value>, include_ssh: bool) -> Option<LeftOut> {
+    let has = |markers: &[&str]| {
+        markers
+            .iter()
+            .any(|marker| body.get(*marker).is_some_and(|value| !value.is_null()))
+    };
     let scratch = |field: &str| {
         body.get(field)
             .and_then(Value::as_str)
             .is_some_and(|cwd| cwd.contains("/scratch-workspaces/"))
     };
-    scratch("cwd")
-        || scratch("originCwd")
-        || SKIP_MARKERS
-            .iter()
-            .any(|marker| body.get(*marker).is_some_and(|value| !value.is_null()))
+    if has(&SSH_MARKERS) && !include_ssh {
+        Some(LeftOut::Ssh)
+    } else if has(&WSL_MARKERS) {
+        Some(LeftOut::Wsl)
+    } else if has(&SCHEDULED_MARKERS) {
+        Some(LeftOut::ScheduledTask)
+    } else if scratch("cwd") || scratch("originCwd") {
+        Some(LeftOut::Scratch)
+    } else {
+        None
+    }
+}
+
+impl Read {
+    /// The Sessions left out, counted by why.
+    fn left_out(&self) -> BTreeMap<LeftOut, usize> {
+        let mut counts = BTreeMap::new();
+        for why in self.skipped.values() {
+            *counts.entry(*why).or_insert(0) += 1;
+        }
+        counts
+    }
 }
 
 /// Real subfolders whose names are uuids, sorted.
