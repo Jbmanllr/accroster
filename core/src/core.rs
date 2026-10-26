@@ -24,7 +24,7 @@ use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening;
-use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget, SignedInProfile};
+use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
 use crate::runner::Jobs;
 use crate::safety::{CheckId, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
@@ -1195,52 +1195,49 @@ impl Core {
     /// order (by nickname when set), then Discovered Profiles.
     fn sidebar_profiles(&self) -> Vec<SidebarProfile> {
         let signed_in = self.profiles.signed_in();
-        let name_of = |profile: &SignedInProfile| {
-            (self.settings.nicknames.get(&profile.id).cloned())
-                .unwrap_or_else(|| profile.name.clone())
-        };
-        let mut sidebars: Vec<SidebarProfile> = self
-            .profiles
-            .ordered_ids(&self.settings.profile_order)
-            .into_iter()
-            .filter_map(|id| {
-                let profile = signed_in.iter().find(|profile| profile.id == id)?;
-                Some(SidebarProfile {
-                    pair: profile.key.clone(),
-                    name: name_of(profile),
-                    signed_in: true,
-                })
-            })
-            .collect();
-        for (evidence, choice) in self.shown_discovered() {
-            if sidebars.iter().any(|sidebar| sidebar.pair == evidence.pair) {
+        let discovered = self.shown_discovered();
+        let mut sidebars = Vec::new();
+        // Each Profile, then its account's sidebars in other Organizations,
+        // named by Organization: a full name would hide what differs.
+        for id in self.profiles.ordered_ids(&self.settings.profile_order) {
+            let Some(profile) = signed_in.iter().find(|profile| profile.id == id) else {
                 continue;
-            }
-            let account = &evidence.pair.account_uuid;
-            // A signed-in account's sidebar in another of its Organizations:
-            // named after its Profile and that Organization, when a Profile
-            // in it says what it is called.
-            let profile = signed_in.iter().find(|p| &p.key.account_uuid == account);
-            let name = match profile {
-                Some(profile) => {
-                    let organization = signed_in
-                        .iter()
-                        .find(|p| p.key.organization_uuid == evidence.pair.organization_uuid)
-                        .map(|p| p.organization_name.as_str())
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("another Organization");
-                    format!("{} · {organization}", name_of(profile))
-                }
-                None => evidence.hidden_title(
-                    choice.and_then(|c| c.nickname.as_deref()),
-                    &self.env.clock.time_zone(),
-                ),
             };
             sidebars.push(SidebarProfile {
-                pair: evidence.pair.clone(),
-                name,
-                signed_in: profile.is_some(),
+                pair: profile.key.clone(),
+                name: (self.settings.nicknames.get(&id).cloned())
+                    .unwrap_or_else(|| profile.name.clone()),
+                signed_in: true,
             });
+            let others = discovered.iter().filter(|(evidence, _)| {
+                evidence.pair.account_uuid == profile.key.account_uuid
+                    && evidence.pair != profile.key
+            });
+            for (evidence, _) in others {
+                let organization = signed_in
+                    .iter()
+                    .find(|p| p.key.organization_uuid == evidence.pair.organization_uuid)
+                    .map(|p| p.organization_label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or("another Organization");
+                sidebars.push(SidebarProfile {
+                    pair: evidence.pair.clone(),
+                    name: format!("↳ in {organization}"),
+                    signed_in: true,
+                });
+            }
+        }
+        for (evidence, choice) in &discovered {
+            if !sidebars.iter().any(|sidebar| sidebar.pair == evidence.pair) {
+                sidebars.push(SidebarProfile {
+                    pair: evidence.pair.clone(),
+                    name: evidence.hidden_title(
+                        choice.and_then(|c| c.nickname.as_deref()),
+                        &self.env.clock.time_zone(),
+                    ),
+                    signed_in: false,
+                });
+            }
         }
         sidebars
     }
