@@ -15,7 +15,7 @@ use accroster_core::{
     AllSessionsView, Badge, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect,
     Event, LimitBar, MOST_HEADROOM, MenuItem, ProfileRow, ProfileSettings, RunningDot,
     SafetyFeature, SessionDetail, SessionFilter, SessionRow, SettingsView, SidebarGroup,
-    SidebarSyncMode, View,
+    SidebarSyncMode, StatusTone, View,
 };
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -161,6 +161,7 @@ struct SettingsWindow {
     sidebar_sync_automatic: Retained<NSButton>,
     sync_now: Retained<NSButton>,
     sidebar_sync_note: Retained<NSTextField>,
+    sync_ssh_sessions: Retained<NSButton>,
     cli_switching: Retained<NSButton>,
     cli_switching_note: Retained<NSTextField>,
     launch_at_login: Retained<NSButton>,
@@ -354,6 +355,14 @@ define_class!(
         #[unsafe(method(retryUninstallClicked:))]
         fn retry_uninstall_clicked(&self, _sender: &NSButton) {
             self.send(Command::Uninstall);
+        }
+
+        /// "Include SSH Sessions".
+        #[unsafe(method(syncSshSessionsClicked:))]
+        fn sync_ssh_sessions_clicked(&self, sender: &NSButton) {
+            self.send(Command::SetIncludeSshSessions(
+                sender.state() == NSControlStateValueOn,
+            ));
         }
 
         #[unsafe(method(syncNowClicked:))]
@@ -756,6 +765,7 @@ impl Ui {
             let row = match item {
                 MenuItem::Separator => NSMenuItem::separatorItem(mtm),
                 MenuItem::Warning(text) => disabled_item(mtm, &format!("⚠︎ {text}")),
+                MenuItem::Status { text, tone } => status_item(mtm, text, *tone),
                 MenuItem::Detail(text) => disabled_item(mtm, text),
                 MenuItem::Submenu { title, items } => {
                     let row = menu_item(mtm, title);
@@ -1448,10 +1458,13 @@ impl Ui {
             sel!(sidebarSyncAutomaticClicked:),
         );
         layout.place(&sidebar_sync_automatic, NOTE_X, None, 4.0);
+        let sync_ssh_sessions = checkbox("Include SSH Sessions", sel!(syncSshSessionsClicked:));
+        layout.place(&sync_ssh_sessions, NOTE_X, None, 4.0);
         let sync_now = push_button("Sync now", sel!(syncNowClicked:));
         layout.place(&sync_now, NOTE_X - 6.0, None, 2.0);
         let sidebar_sync_note = note("");
-        layout.place(&sidebar_sync_note, NOTE_X, Some((NOTE_WIDTH, 28.0)), 4.0);
+        // Room for a result that lists what was left out.
+        layout.place(&sidebar_sync_note, NOTE_X, Some((NOTE_WIDTH, 44.0)), 4.0);
 
         layout.place(&heading(mtm, "Notifications"), 20.0, None, 6.0);
         let thresholds_label =
@@ -1530,6 +1543,7 @@ impl Ui {
             sidebar_sync_automatic,
             sync_now,
             sidebar_sync_note,
+            sync_ssh_sessions,
             cli_switching,
             cli_switching_note,
             launch_at_login,
@@ -2513,6 +2527,47 @@ fn stack(
     stack
 }
 
+/// The status line at the top of the menu: disabled, with a sign and a
+/// colour by tone. A line that waits on the user is bold orange, so the
+/// choice under it can't be missed.
+fn status_item(mtm: MainThreadMarker, text: &str, tone: StatusTone) -> Retained<NSMenuItem> {
+    let (sign, font, color) = match tone {
+        StatusTone::Working => (
+            "⟳",
+            NSFont::menuFontOfSize(0.0),
+            NSColor::secondaryLabelColor(),
+        ),
+        StatusTone::NeedsYou => (
+            "⚠︎",
+            NSFont::boldSystemFontOfSize(NSFont::systemFontSize()),
+            NSColor::systemOrangeColor(),
+        ),
+        StatusTone::Done => ("✓", NSFont::menuFontOfSize(0.0), NSColor::labelColor()),
+        StatusTone::Failed => (
+            "✕",
+            NSFont::boldSystemFontOfSize(NSFont::systemFontSize()),
+            NSColor::systemRedColor(),
+        ),
+    };
+    let title = format!("{sign} {text}");
+    let item = disabled_item(mtm, &title);
+    let attributes = unsafe {
+        NSDictionary::<NSAttributedStringKey, AnyObject>::from_slices(
+            &[NSFontAttributeName, NSForegroundColorAttributeName],
+            &[&*font, &*color],
+        )
+    };
+    let attributed = unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(&title),
+            Some(&attributes),
+        )
+    };
+    item.setAttributedTitle(Some(&attributed));
+    item
+}
+
 fn disabled_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
     let item = menu_item(mtm, title);
     item.setEnabled(false);
@@ -2579,6 +2634,16 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
         .sidebar_sync_automatic
         .setEnabled(sync.mode != SidebarSyncMode::Off);
     settings.sync_now.setEnabled(sync.sync_now.is_some());
+    settings
+        .sync_ssh_sessions
+        .setState(if sync.ssh_sessions.on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    settings
+        .sync_ssh_sessions
+        .setEnabled(sync.mode != SidebarSyncMode::Off);
     let sync_text = match (&sync.note, sync.mode) {
         (Some(note), _) => note.clone(),
         (None, SidebarSyncMode::Off) => "Off: sidebars are left as they are.".to_owned(),

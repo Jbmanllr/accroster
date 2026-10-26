@@ -8,13 +8,16 @@
 //! - **Busy signal:** the live-process files `~/.claude/sessions/<pid>.json`
 //!   that the desktop's Claude Code children write (the desktop sets no
 //!   `CLAUDE_CONFIG_DIR`). A file counts when its `pid` is alive with a
-//!   matching `procStart` and its `entrypoint` is `claude-desktop`; `idle` is
-//!   idle, anything else (`busy`, `waiting`, unknown) is busy. A desktop child
-//!   process without such a file means "can't tell". The `.key` files next to
-//!   them are never opened.
-//! - **Guided switch:** guard, then bring Claude forward with "Sign out, then
-//!   sign in as …", then confirm from the Sidebar folder Claude writes (or
-//!   `main.log`).
+//!   matching `procStart` (UTC) and its `entrypoint` is `claude-desktop`;
+//!   `idle` is idle, anything else (`busy`, `waiting`, unknown) is busy. A
+//!   desktop child process without such a file means "can't tell", looked
+//!   at again for a few seconds before the user is asked. The `.key` files
+//!   next to them are never opened.
+//! - **Guided switch:** guard, then (the core) sync the sidebars, then bring
+//!   Claude forward with "Sign out in Claude, then sign in as …", then
+//!   confirm from the Sidebar folder Claude writes (or `main.log`). Each
+//!   step is one status line at the top of the menu, and each outcome a
+//!   notification.
 //!
 //! AccRoster never quits or relaunches Claude: nothing here can.
 
@@ -28,7 +31,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 use crate::env::Environment;
-use crate::interface::{ClaudeVersions, Command, Effect, MenuItem, ProfileKey};
+use crate::interface::{ClaudeVersions, Command, Effect, MenuItem, ProfileKey, StatusTone};
 use crate::logging::{Field, Level};
 use crate::profiles::{Context, SignedInProfile};
 
@@ -252,8 +255,9 @@ pub(crate) enum Guard {
     Clear,
     /// These desktop Sessions are running a turn or waiting, by title.
     Busy(Vec<String>),
-    /// A desktop Claude Code child runs without a readable live-process file.
-    CantTell,
+    /// This many desktop Claude Code children run without a readable
+    /// live-process file.
+    CantTell(usize),
 }
 
 /// The fields of a live-process file the guard reads.
@@ -289,9 +293,10 @@ pub(crate) fn guard(env: &Environment, paths: &DesktopPaths) -> Guard {
         .os
         .desktop_claude_code_children()
         .into_iter()
-        .any(|pid| !live.iter().any(|process| process.pid == pid));
-    if unaccounted {
-        Guard::CantTell
+        .filter(|pid| !live.iter().any(|process| process.pid == *pid))
+        .count();
+    if unaccounted > 0 {
+        Guard::CantTell(unaccounted)
     } else {
         Guard::Clear
     }
@@ -304,7 +309,6 @@ fn live_desktop_processes(env: &Environment, paths: &DesktopPaths) -> Vec<LivePr
     let Ok(entries) = fs::read_dir(paths.live_processes()) else {
         return Vec::new();
     };
-    let time_zone = env.clock.time_zone();
     entries
         .flatten()
         .filter_map(|entry| {
@@ -319,15 +323,16 @@ fn live_desktop_processes(env: &Environment, paths: &DesktopPaths) -> Vec<LivePr
                 return None;
             }
             let facts = env.os.process(process.pid)?;
-            let started = parse_proc_start(process.proc_start.as_deref()?, &time_zone)?;
+            let started = parse_proc_start(process.proc_start.as_deref()?)?;
             (started.as_second() == facts.started_at.as_second()).then_some(process)
         })
         .collect()
 }
 
 /// `procStart` as `ps -o lstart` prints it (`Sun Oct 25 14:02:11 2026`, the
-/// day space-padded), in the Mac's local time.
-pub(crate) fn parse_proc_start(text: &str, time_zone: &jiff::tz::TimeZone) -> Option<Timestamp> {
+/// day space-padded). Claude Code runs it as `LC_ALL=C TZ=UTC ps …`, so the
+/// time is UTC whatever the Mac's time zone.
+pub(crate) fn parse_proc_start(text: &str) -> Option<Timestamp> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -340,7 +345,10 @@ pub(crate) fn parse_proc_start(text: &str, time_zone: &jiff::tz::TimeZone) -> Op
     let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
     let date = jiff::civil::Date::new(year.parse().ok()?, month, day.parse().ok()?).ok()?;
     let time = jiff::civil::Time::new(hour, minute, second, 0).ok()?;
-    let zoned = date.to_datetime(time).to_zoned(time_zone.clone()).ok()?;
+    let zoned = date
+        .to_datetime(time)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()?;
     Some(zoned.timestamp())
 }
 
@@ -452,6 +460,9 @@ fn snapshot(paths: &DesktopPaths) -> Snapshot {
 }
 
 enum Step {
+    /// The guard couldn't tell at first: it looks again for a few seconds
+    /// (a Claude Code process just started writes its file shortly after).
+    Checking { target: Target, since: Timestamp },
     /// A desktop turn is running; nothing was done.
     Blocked {
         target: Target,
@@ -459,7 +470,12 @@ enum Step {
         notify_when_idle: bool,
     },
     /// The guard couldn't tell; waiting for "Switch anyway" or "Cancel".
-    Unsure { target: Target },
+    Unsure { target: Target, reason: String },
+    /// The sidebars sync into the target's before Claude is brought forward.
+    Syncing { target: Target },
+    /// The sync before the switch stopped; waiting for "Switch anyway" or
+    /// "Cancel".
+    SyncStopped { target: Target, reason: String },
     /// Claude was brought forward; waiting to see which account it writes.
     Waiting {
         target: Target,
@@ -473,67 +489,130 @@ enum Step {
     },
 }
 
+/// How long "can't tell" is looked at again before asking the user.
+const CANT_TELL_GRACE: SignedDuration = SignedDuration::from_secs(5);
+
+/// What "Switch anyway" lets through.
+pub(crate) enum Confirmed {
+    /// The guard couldn't tell: sync (when on), then guide.
+    Unsure(Target),
+    /// The sync before the switch stopped: guide without it.
+    SyncStopped(Target),
+}
+
 /// The Guided switch in progress, and the outcome of the last one.
 #[derive(Default)]
 pub(crate) struct DesktopBridge {
     step: Option<Step>,
-    notice: Option<String>,
+    outcome: Option<(String, StatusTone)>,
 }
 
 impl DesktopBridge {
-    /// Whether a switch is waiting for Claude to sign in.
+    /// Whether a switch is checking the guard again or waiting for Claude to
+    /// sign in: the core checks back every second.
     pub(crate) fn waiting(&self) -> bool {
-        matches!(self.step, Some(Step::Waiting { .. }))
+        matches!(
+            self.step,
+            Some(Step::Waiting { .. } | Step::Checking { .. })
+        )
     }
 
     /// "Switch desktop app to this Profile…": runs the guard. Returns the
     /// target when nothing stands in the way: the caller syncs the sidebars
     /// (spec step 2), then calls [`DesktopBridge::guide`].
     pub(crate) fn start(&mut self, ctx: &Context, target: Target) -> Option<Target> {
-        self.notice = None;
+        self.outcome = None;
         let paths = DesktopPaths::new(&ctx.env.home);
         match guard(ctx.env, &paths) {
             Guard::Busy(sessions) => {
-                log(
-                    ctx,
-                    Level::Info,
-                    "desktop switch blocked",
-                    &[
-                        ("profile", Field::Profile(&target.profile_id)),
-                        ("busy_sessions", Field::Number(sessions.len() as i64)),
-                    ],
-                );
-                self.step = Some(Step::Blocked {
-                    target,
-                    sessions,
-                    notify_when_idle: false,
-                });
+                self.block(ctx, target, sessions);
                 None
             }
-            Guard::CantTell => {
+            Guard::CantTell(_) => {
                 log(
                     ctx,
                     Level::Info,
-                    "desktop switch unsure",
-                    &[("profile", Field::Profile(&target.profile_id))],
+                    "desktop switch checking",
+                    &[profile(&target)],
                 );
-                self.step = Some(Step::Unsure { target });
+                self.step = Some(Step::Checking {
+                    target,
+                    since: ctx.env.clock.now(),
+                });
                 None
             }
             Guard::Clear => Some(target),
         }
     }
 
-    /// "Switch anyway" after "can't tell": the target, as for
-    /// [`DesktopBridge::start`].
-    pub(crate) fn confirm(&mut self) -> Option<Target> {
-        match self.step.take() {
-            Some(Step::Unsure { target }) => Some(target),
+    fn block(&mut self, ctx: &Context, target: Target, sessions: Vec<String>) {
+        log(
+            ctx,
+            Level::Info,
+            "desktop switch blocked",
+            &[
+                profile(&target),
+                ("busy_sessions", Field::Number(sessions.len() as i64)),
+            ],
+        );
+        self.step = Some(Step::Blocked {
+            target,
+            sessions,
+            notify_when_idle: false,
+        });
+    }
+
+    /// "Switch anyway", after "can't tell" or a stopped sync.
+    pub(crate) fn confirm(&mut self, ctx: &Context) -> Option<Confirmed> {
+        let confirmed = match self.step.take() {
+            Some(Step::Unsure { target, .. }) => Confirmed::Unsure(target),
+            Some(Step::SyncStopped { target, .. }) => Confirmed::SyncStopped(target),
             other => {
                 self.step = other;
-                None
+                return None;
             }
+        };
+        log(ctx, Level::Info, "desktop switch confirmed anyway", &[]);
+        Some(confirmed)
+    }
+
+    /// The sidebars sync into `target`'s before Claude is brought forward.
+    pub(crate) fn syncing(&mut self, ctx: &Context, target: Target) {
+        log(
+            ctx,
+            Level::Info,
+            "desktop switch syncing",
+            &[profile(&target)],
+        );
+        self.step = Some(Step::Syncing { target });
+    }
+
+    /// The target whose sync is under way, if the switch still waits on it.
+    pub(crate) fn sync_target(&self) -> Option<&Target> {
+        match &self.step {
+            Some(Step::Syncing { target }) => Some(target),
+            _ => None,
         }
+    }
+
+    /// The sync before the switch stopped for `reason`: asks before going on
+    /// without it.
+    pub(crate) fn sync_stopped(&mut self, ctx: &Context, reason: String) -> Vec<Effect> {
+        let Some(Step::Syncing { target }) = self.step.take() else {
+            return Vec::new();
+        };
+        log(
+            ctx,
+            Level::Warn,
+            "desktop switch sync stopped",
+            &[profile(&target)],
+        );
+        let effects = vec![Effect::Notify {
+            title: format!("Switch to {} not started", target.name),
+            body: format!("Sidebar sync stopped: {reason}"),
+        }];
+        self.step = Some(Step::SyncStopped { target, reason });
+        effects
     }
 
     /// "Notify me when idle" after a block.
@@ -546,19 +625,44 @@ impl DesktopBridge {
         }
     }
 
-    /// "Cancel switch": forgets the switch. Claude is left as it is.
+    /// "Cancel": forgets the switch. Claude is left as it is.
     pub(crate) fn cancel(&mut self, ctx: &Context) {
         if self.step.take().is_some() {
             log(ctx, Level::Info, "desktop switch cancelled", &[]);
         }
-        self.notice = None;
+        self.outcome = None;
     }
 
-    /// Time passed: re-checks a blocked switch the user wants to hear about,
-    /// and looks for the account a guided Claude signed in to.
-    pub(crate) fn poll(&mut self, ctx: &Context, profiles: &[SignedInProfile]) -> Vec<Effect> {
+    /// Time passed: looks again when the guard couldn't tell, re-checks a
+    /// blocked switch the user wants to hear about, and looks for the
+    /// account a guided Claude signed in to. Returns the effects and the
+    /// target once the guard lets it through.
+    pub(crate) fn poll(
+        &mut self,
+        ctx: &Context,
+        profiles: &[SignedInProfile],
+    ) -> (Vec<Effect>, Option<Target>) {
         let paths = DesktopPaths::new(&ctx.env.home);
+        let now = ctx.env.clock.now();
         match &mut self.step {
+            Some(Step::Checking { target, since }) => {
+                let target = target.clone();
+                let since = *since;
+                match guard(ctx.env, &paths) {
+                    Guard::Clear => {
+                        self.step = None;
+                        (Vec::new(), Some(target))
+                    }
+                    Guard::Busy(sessions) => {
+                        self.block(ctx, target, sessions);
+                        (Vec::new(), None)
+                    }
+                    Guard::CantTell(_) if now.duration_since(since) < CANT_TELL_GRACE => {
+                        (Vec::new(), None)
+                    }
+                    Guard::CantTell(unaccounted) => (self.unsure(ctx, target, unaccounted), None),
+                }
+            }
             Some(Step::Blocked {
                 target,
                 sessions,
@@ -566,16 +670,17 @@ impl DesktopBridge {
             }) => match guard(ctx.env, &paths) {
                 Guard::Busy(now) => {
                     *sessions = now;
-                    Vec::new()
+                    (Vec::new(), None)
                 }
-                Guard::Clear | Guard::CantTell => {
+                Guard::Clear | Guard::CantTell(_) => {
                     let body = format!("You can switch Claude to {} now", target.name);
                     self.step = None;
                     log(ctx, Level::Info, "desktop idle", &[]);
-                    vec![Effect::Notify {
+                    let effects = vec![Effect::Notify {
                         title: "Claude is idle".into(),
                         body,
-                    }]
+                    }];
+                    (effects, None)
                 }
             },
             Some(Step::Waiting {
@@ -586,68 +691,116 @@ impl DesktopBridge {
                 log_offset,
             }) => {
                 let outcome = confirmation(&paths, target, previous.as_ref(), before, *log_offset);
-                let timed_out = ctx.env.clock.now().duration_since(*started_at) >= CONFIRM_TIMEOUT;
+                let timed_out = now.duration_since(*started_at) >= CONFIRM_TIMEOUT;
                 let target = target.clone();
-                self.finish(ctx, target, outcome, timed_out, profiles)
+                (self.finish(ctx, target, outcome, timed_out, profiles), None)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), None),
         }
     }
 
-    /// The bridge's menu lines, shown with the other warnings.
-    pub(crate) fn menu_items(&self) -> Vec<MenuItem> {
-        let cancel = || MenuItem::Action {
-            title: "Cancel switch".into(),
-            command: Command::CancelDesktopSwitch,
+    /// The guard still can't tell: asks the user, in the menu and in a
+    /// notification, so the choice can't go unnoticed.
+    fn unsure(&mut self, ctx: &Context, target: Target, unaccounted: usize) -> Vec<Effect> {
+        let reason = match unaccounted {
+            1 => "a Claude Code process in Claude reports no status".to_owned(),
+            n => format!("{n} Claude Code processes in Claude report no status"),
         };
-        let mut items = Vec::new();
+        log(
+            ctx,
+            Level::Info,
+            "desktop switch unsure",
+            &[
+                profile(&target),
+                ("unaccounted", Field::Number(unaccounted as i64)),
+            ],
+        );
+        let effects = vec![Effect::Notify {
+            title: format!("Switch Claude to {}?", target.name),
+            body: format!(
+                "Can't tell whether Claude is busy ({reason}). Choose Switch anyway or Cancel in AccRoster's menu."
+            ),
+        }];
+        self.step = Some(Step::Unsure { target, reason });
+        effects
+    }
+
+    /// The status line and its actions, at the top of the menu. `sync` is
+    /// the sync's progress (sidebars written, of how many) while one runs.
+    pub(crate) fn menu_items(&self, sync: Option<(usize, usize)>) -> Vec<MenuItem> {
+        let status = |text: String, tone| MenuItem::Status { text, tone };
+        let action = |title: &str, command| MenuItem::Action {
+            title: title.into(),
+            command,
+        };
+        let cancel = || action("Cancel", Command::CancelDesktopSwitch);
+        let anyway = || action("Switch anyway", Command::ConfirmDesktopSwitch);
         match &self.step {
-            None => {}
+            None => self
+                .outcome
+                .iter()
+                .map(|(text, tone)| status(text.clone(), *tone))
+                .collect(),
+            Some(Step::Checking { .. }) => vec![
+                status("Checking that Claude is idle…".into(), StatusTone::Working),
+                cancel(),
+            ],
             Some(Step::Blocked {
-                target,
                 sessions,
                 notify_when_idle,
+                ..
             }) => {
-                let running = format!("Claude is running {}", sessions.join(", "));
+                let busy = format!("Claude is busy: {}", sessions.join(", "));
                 if *notify_when_idle {
-                    items.push(MenuItem::Warning(format!(
-                        "{running} · AccRoster will tell you when it's idle"
-                    )));
+                    vec![
+                        status(
+                            format!("{busy} · AccRoster will tell you when it's idle"),
+                            StatusTone::Working,
+                        ),
+                        cancel(),
+                    ]
                 } else {
-                    items.push(MenuItem::Warning(format!(
-                        "{running} · switch to {} not started",
-                        target.name
-                    )));
-                    items.push(MenuItem::Action {
-                        title: "Notify me when idle".into(),
-                        command: Command::NotifyWhenDesktopIdle,
-                    });
+                    vec![
+                        status(busy, StatusTone::NeedsYou),
+                        action("Notify me when idle", Command::NotifyWhenDesktopIdle),
+                        cancel(),
+                    ]
                 }
-                items.push(cancel());
             }
-            Some(Step::Unsure { .. }) => {
-                items.push(MenuItem::Warning(
-                    "Can't tell whether Claude is running a turn · switching ends every running turn"
-                        .into(),
-                ));
-                items.push(MenuItem::Action {
-                    title: "Switch anyway".into(),
-                    command: Command::ConfirmDesktopSwitch,
-                });
-                items.push(cancel());
+            Some(Step::Unsure { reason, .. }) => vec![
+                status(
+                    format!("Can't tell whether Claude is busy ({reason})"),
+                    StatusTone::NeedsYou,
+                ),
+                anyway(),
+                cancel(),
+            ],
+            Some(Step::Syncing { target }) => {
+                let progress =
+                    sync.map_or(String::new(), |(done, total)| format!(" {done} of {total}"));
+                vec![
+                    status(
+                        format!("Syncing sidebars into {}…{progress}", target.name),
+                        StatusTone::Working,
+                    ),
+                    cancel(),
+                ]
             }
+            Some(Step::SyncStopped { target, reason }) => vec![
+                status(
+                    format!(
+                        "Sidebar sync stopped: {reason} · switch to {} not started",
+                        target.name
+                    ),
+                    StatusTone::Failed,
+                ),
+                anyway(),
+                cancel(),
+            ],
             Some(Step::Waiting { target, .. }) => {
-                items.push(MenuItem::Warning(format!(
-                    "In Claude: {}",
-                    instruction(target)
-                )));
-                items.push(cancel());
+                vec![status(instruction(target), StatusTone::NeedsYou), cancel()]
             }
         }
-        if let Some(notice) = &self.notice {
-            items.push(MenuItem::Warning(notice.clone()));
-        }
-        items
     }
 
     /// Brings Claude forward with the instruction and starts watching for
@@ -668,7 +821,7 @@ impl DesktopBridge {
             ctx,
             Level::Info,
             "desktop switch guided",
-            &[("profile", Field::Profile(&target.profile_id))],
+            &[profile(&target)],
         );
         let effects = vec![
             Effect::BringDesktopAppForward,
@@ -677,6 +830,7 @@ impl DesktopBridge {
                 body: instruction(&target),
             },
         ];
+        self.outcome = None;
         self.step = Some(Step::Waiting {
             target,
             started_at: ctx.env.clock.now(),
@@ -696,39 +850,43 @@ impl DesktopBridge {
         timed_out: bool,
         profiles: &[SignedInProfile],
     ) -> Vec<Effect> {
-        let profile = [("profile", Field::Profile(&target.profile_id))];
+        let fields = [profile(&target)];
         let confirmed = matches!(outcome, Some(Outcome::Confirmed));
-        let (title, text) = match outcome {
+        let (title, text, tone) = match outcome {
             Some(Outcome::Confirmed) => {
-                log(ctx, Level::Info, "desktop switch confirmed", &profile);
+                log(ctx, Level::Info, "desktop switch confirmed", &fields);
                 (
                     "Claude switched",
                     format!("Claude now uses {}", target.name),
+                    StatusTone::Done,
                 )
             }
             Some(Outcome::Other(account)) => {
-                log(ctx, Level::Warn, "desktop switch mismatch", &profile);
+                log(ctx, Level::Warn, "desktop switch mismatch", &fields);
                 let actual = account
                     .profile(profiles)
                     .map_or("another Profile", |profile| &profile.name);
                 (
                     "Claude signed in to another Profile",
                     format!("Claude signed in as {actual}, not {}", target.name),
+                    StatusTone::Failed,
                 )
             }
             None if timed_out => {
-                log(ctx, Level::Warn, "desktop switch unconfirmed", &profile);
-                self.step = None;
-                self.notice = Some(format!(
-                    "Couldn't confirm Claude switched to {} · check its account menu",
-                    target.name
-                ));
-                return Vec::new();
+                log(ctx, Level::Warn, "desktop switch unconfirmed", &fields);
+                (
+                    "Claude didn't switch",
+                    format!(
+                        "Gave up waiting after 30 min for Claude to sign in as {}",
+                        target.name
+                    ),
+                    StatusTone::Failed,
+                )
             }
             None => return Vec::new(),
         };
         self.step = None;
-        self.notice = Some(text.clone());
+        self.outcome = Some((text.clone(), tone));
         let mut effects = vec![Effect::Notify {
             title: title.into(),
             body: text,
@@ -742,9 +900,13 @@ impl DesktopBridge {
     }
 }
 
+fn profile(target: &Target) -> (&'static str, Field<'_>) {
+    ("profile", Field::Profile(&target.profile_id))
+}
+
 /// What the user does in Claude.
 fn instruction(target: &Target) -> String {
-    format!("Sign out, then sign in as {}", target.name)
+    format!("Sign out in Claude, then sign in as {}", target.name)
 }
 
 enum Outcome {

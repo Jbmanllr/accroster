@@ -41,6 +41,10 @@ pub(crate) struct Settings {
     /// Sidebar sync's mode; Off until chosen.
     #[serde(default)]
     pub sidebar_sync: SidebarSyncMode,
+    /// "Include SSH Sessions" turned off: Sidebar sync leaves SSH Sessions
+    /// out. Included by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leave_out_ssh_sessions: bool,
     /// The global notification thresholds, in whole percent, lowest first.
     #[serde(default)]
     pub thresholds: Thresholds,

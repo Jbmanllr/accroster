@@ -58,6 +58,13 @@ pub struct FakeMac {
     /// The app's entry in System Settings → Login Items.
     pub login_item: FakeLoginItem,
     extra_vars: Mutex<Vec<(OsString, OsString)>>,
+    /// Opened from Finder or the Dock: the app inherits launchd's minimal
+    /// `PATH`, without the stub `claude`.
+    opened_from_finder: Mutex<bool>,
+    /// The stub login shell (`$SHELL`) and the file holding the `PATH` it
+    /// gives its commands.
+    login_shell: PathBuf,
+    login_path: PathBuf,
 }
 
 impl Default for FakeMac {
@@ -77,6 +84,7 @@ impl FakeMac {
         let home = root.path().join("Users").join("tester");
         fs::create_dir_all(&home).expect("create the fake home");
         let claude = StubClaude::install(&root.path().join("stub claude"));
+        let (login_shell, login_path) = install_login_shell(&root.path().join("login shell"));
         FakeMac {
             _root: root,
             home,
@@ -85,6 +93,9 @@ impl FakeMac {
             os: FakeOs::default(),
             login_item: FakeLoginItem::default(),
             extra_vars: Mutex::new(Vec::new()),
+            opened_from_finder: Mutex::new(false),
+            login_shell,
+            login_path,
         }
     }
 
@@ -92,11 +103,16 @@ impl FakeMac {
     /// [`Environment`] sharing the same home, stub, clock and OS facts, so a
     /// test can relaunch the core to check what survives a restart.
     pub fn environment(&self) -> Environment {
+        let path = if *self.opened_from_finder.lock().unwrap() {
+            LAUNCHD_PATH.into()
+        } else {
+            self.spawn_path()
+        };
         let mut inherited_vars: Vec<(OsString, OsString)> = vec![
             ("HOME".into(), self.home.clone().into()),
-            ("PATH".into(), self.spawn_path()),
+            ("PATH".into(), path),
             ("USER".into(), "tester".into()),
-            ("SHELL".into(), "/bin/zsh".into()),
+            ("SHELL".into(), self.login_shell.clone().into()),
         ];
         inherited_vars.extend(self.extra_vars.lock().unwrap().iter().cloned());
         Environment {
@@ -121,6 +137,33 @@ impl FakeMac {
             .lock()
             .unwrap()
             .push((name.into(), value.into()));
+    }
+
+    /// Later launches are opened from Finder or the Dock: the app inherits
+    /// launchd's minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which
+    /// has no `claude`.
+    pub fn open_from_finder(&self) {
+        *self.opened_from_finder.lock().unwrap() = true;
+    }
+
+    /// Installs a `claude` in `~/<relative_dir>` that runs the stub (as the
+    /// real installer's `~/.local/bin/claude` runs the real one), and
+    /// returns its path.
+    pub fn install_claude_in(&self, relative_dir: impl AsRef<Path>) -> PathBuf {
+        let stub = self.claude.bin_dir().join("claude");
+        let path = self.write_file(
+            relative_dir.as_ref().join("claude"),
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", stub.display()),
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make claude executable");
+        path
+    }
+
+    /// The `PATH` the user's login shell (`$SHELL -l`) sets up for its
+    /// commands. It starts as `/usr/bin:/bin`, with no `claude`.
+    pub fn set_login_shell_path(&self, path: &str) {
+        fs::write(&self.login_path, path).expect("write the login shell's PATH");
     }
 
     /// The `PATH` spawns see: the stub first, then the system folders `sh`
@@ -698,36 +741,63 @@ impl StubClaude {
 
 // ----- Fake clock and OS facts ----------------------------------------------------
 
+/// The `PATH` launchd gives an app opened from Finder or the Dock.
+pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// A stub login shell: run as `$SHELL -l -c <command>`, it runs `command`
+/// with `sh` under the `PATH` written in `path_file`, as a login shell runs
+/// it under the `PATH` its startup files set up.
+fn install_login_shell(dir: &Path) -> (PathBuf, PathBuf) {
+    fs::create_dir_all(dir).expect("create the login shell's folder");
+    let path_file = dir.join("PATH");
+    fs::write(&path_file, "/usr/bin:/bin").expect("write the login shell's PATH");
+    let shell = dir.join("zsh");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -l ] && shift\nPATH=$(cat '{}')\nexport PATH\nexec /bin/sh \"$@\"\n",
+            path_file.display()
+        ),
+    )
+    .expect("write the login shell");
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755))
+        .expect("make the login shell executable");
+    (shell, path_file)
+}
+
 /// A clock that only moves when the test says so. Clones share the time.
 #[derive(Debug, Clone)]
-pub struct FakeClock(Arc<Mutex<Timestamp>>);
+pub struct FakeClock(Arc<Mutex<(Timestamp, jiff::tz::TimeZone)>>);
 
 impl FakeClock {
     pub fn at(time: Timestamp) -> FakeClock {
-        FakeClock(Arc::new(Mutex::new(time)))
+        FakeClock(Arc::new(Mutex::new((time, jiff::tz::TimeZone::UTC))))
     }
 
     pub fn set(&self, time: Timestamp) {
-        *self.0.lock().unwrap() = time;
+        self.0.lock().unwrap().0 = time;
     }
 
     pub fn advance(&self, by: SignedDuration) {
         let mut now = self.0.lock().unwrap();
-        *now = now.checked_add(by).expect("time stays in range");
+        now.0 = now.0.checked_add(by).expect("time stays in range");
+    }
+
+    /// Moves the Mac to the IANA time zone `name` (it starts in UTC).
+    pub fn set_time_zone(&self, name: &str) {
+        self.0.lock().unwrap().1 = jiff::tz::TimeZone::get(name).expect("a known time zone");
     }
 }
 
-/// The fake Mac's time zone is UTC, so local times in fixtures (Claude Code's
-/// `procStart`) read the same as the clock.
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().0
     }
 
-    /// UTC, so shown dates and times (and fixture `procStart`s) don't depend
-    /// on the machine running the tests.
+    /// UTC unless a test moves the Mac, so shown dates and times don't
+    /// depend on the machine running the tests.
     fn time_zone(&self) -> jiff::tz::TimeZone {
-        jiff::tz::TimeZone::UTC
+        self.0.lock().unwrap().1.clone()
     }
 }
 
@@ -827,6 +897,12 @@ impl OsFacts for FakeOs {
 
     fn desktop_app_running(&self) -> bool {
         self.0.lock().unwrap().desktop_app_running
+    }
+
+    /// None: the real Mac's `/opt/homebrew/bin` and `/usr/local/bin` stay
+    /// out of the tests.
+    fn program_folders(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 }
 

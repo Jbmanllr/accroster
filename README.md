@@ -14,7 +14,7 @@ AccRoster is a lightweight native macOS menu bar app, written in Rust. It is pre
 
 Releases are signed with a Developer ID and notarized by Apple, so macOS opens them without a security warning. One download runs on Apple Silicon and Intel Macs. It needs macOS 14 or later.
 
-Install [Claude Code](https://code.claude.com/docs/en/overview) first: AccRoster drives the `claude` it finds on your Mac and holds no sign-in of its own.
+Install [Claude Code](https://code.claude.com/docs/en/overview) first: AccRoster drives the `claude` it finds on your Mac and holds no sign-in of its own. Opened from Finder or the Dock, an app gets no shell `PATH`, so AccRoster also looks in `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin` and `/usr/local/bin`, then asks your login shell once; it never uses the desktop app's bundled copy. If it still finds none, the menu says so: install Claude Code, or open AccRoster from a terminal once (it remembers where `claude` was).
 
 macOS asks for permissions when a feature first needs them:
 

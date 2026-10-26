@@ -485,6 +485,8 @@ impl LimitMonitor {
     }
 
     fn start(&mut self, ctx: &Context, watched: Watched, step: UsageRead) -> Option<Completed> {
+        // Without a `claude` the menu says so once; no read is tried.
+        ctx.claude?;
         let now = ctx.env.clock.now();
         if step == UsageRead::GetUsage {
             let watch = self.watches.entry(watched.id.clone()).or_default();

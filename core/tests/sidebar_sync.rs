@@ -8,7 +8,9 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use accroster_core::{CheckStatus, Command, Core, Effect, Event, SafetyFeature, SidebarSyncMode};
+use accroster_core::{
+    CheckStatus, Command, Core, Effect, Event, MenuItem, SafetyFeature, SidebarSyncMode,
+};
 use accroster_fake_mac::FakeMac;
 use common::*;
 use serde_json::{Value, json};
@@ -113,6 +115,20 @@ fn sync(core: &mut Core) {
         .sync_now
         .expect("Sync now is offered");
     core.command(command);
+    // The run writes one sidebar per tick.
+    settle(core);
+}
+
+/// The menu's status line, if any.
+fn status(core: &Core) -> Option<String> {
+    core.view()
+        .menu
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            MenuItem::Status { text, .. } => Some(text),
+            _ => None,
+        })
 }
 
 fn note(core: &Core) -> String {
@@ -231,7 +247,39 @@ fn a_copy_keeps_the_file_name_and_every_field_but_clears_the_connector_and_bridg
         Some(original),
         "the source is left as it was"
     );
-    assert_eq!(note(&core), "Updated 2 Sidebar entries in 1 Profile");
+    assert_eq!(note(&core), "Synced 2 entries into 1 sidebar");
+}
+
+#[test]
+fn a_sync_reports_its_progress_one_sidebar_at_a_time_then_what_it_did() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    put(&mac, PERSO, "s2", &entry("s2", "Two"));
+    empty_folder(&mac, WORK);
+    empty_folder(&mac, PERSO_TEAM);
+    let mut core = manual(&mac);
+
+    core.command(Command::SyncSidebarNow);
+
+    assert_eq!(note(&core), "Syncing… 0 of 2");
+    assert_eq!(status(&core).as_deref(), Some("Syncing… 0 of 2"));
+    core.event(Event::Tick);
+    assert_eq!(status(&core).as_deref(), Some("Syncing… 1 of 2"));
+    core.event(Event::Tick);
+    assert_eq!(note(&core), "Synced 4 entries into 2 sidebars");
+    assert_eq!(
+        status(&core).as_deref(),
+        Some("Synced 4 entries into 2 sidebars"),
+        "the menu says how it ended too"
+    );
+    mac.clock.advance(jiff::SignedDuration::from_mins(10));
+    core.event(Event::Tick);
+    assert_eq!(status(&core), None, "for a while");
+    let log = mac
+        .read_file(format!("{APP_FOLDER}/logs/app.log"))
+        .unwrap_or_default();
+    assert!(log.contains("sidebar sync started folders=2"), "{log}");
+    assert!(log.contains("sidebar synced entries=4 folders=2"), "{log}");
 }
 
 #[test]
@@ -255,7 +303,95 @@ fn every_profile_gets_every_session_and_a_second_sync_has_nothing_to_do() {
 }
 
 #[test]
-fn scratch_ssh_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied() {
+fn ssh_sessions_are_included_by_default_without_the_reattach_binding_and_can_be_left_out() {
+    let mac = FakeMac::new();
+    let mut ssh = entry("ssh", "On the VPS");
+    ssh["sshConfig"] = json!({"sshHost": "vps"});
+    ssh["sshRemoteProcessId"] = json!(4242);
+    ssh["sshReattach"] = json!({"pid": 4242, "token": "bound-to-perso"});
+    put(&mac, PERSO, "ssh", &ssh);
+    let mut scratch = entry("scratch", "Scratch");
+    scratch["cwd"] = json!("/Users/me/Library/Application Support/Claude/scratch-workspaces/a/x");
+    put(&mac, PERSO, "scratch", &scratch);
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    assert!(
+        core.view().settings.sidebar_sync.ssh_sessions.on,
+        "on by default"
+    );
+
+    sync(&mut core);
+
+    let mut expected = without_cleared(ssh.clone());
+    expected.as_object_mut().unwrap().remove("sshReattach");
+    assert_eq!(read(&mac, WORK, "ssh"), Some(expected));
+    assert_eq!(read(&mac, PERSO, "ssh"), Some(ssh), "the source keeps it");
+    assert_eq!(read(&mac, WORK, "scratch"), None, "scratch stays left out");
+    assert_eq!(
+        note(&core),
+        "Synced 1 entry into 1 sidebar · left out 1 scratch Session \
+         (not synced: they belong to one desktop login)"
+    );
+
+    // Turned off, a new SSH Session is left out, and that is remembered.
+    let option = core.view().settings.sidebar_sync.ssh_sessions;
+    core.command(option.command);
+    let mut ssh2 = entry("ssh2", "Also on the VPS");
+    ssh2["sshConfig"] = json!({"sshHost": "vps"});
+    put(&mac, PERSO, "ssh2", &ssh2);
+    sync(&mut core);
+    assert_eq!(read(&mac, WORK, "ssh2"), None);
+    drop(core);
+    let core = mac.launch();
+    assert!(!core.view().settings.sidebar_sync.ssh_sessions.on);
+}
+
+/// "Include SSH Sessions" turned off.
+fn leave_out_ssh(core: &mut Core) {
+    let option = core.view().settings.sidebar_sync.ssh_sessions;
+    assert!(option.on);
+    core.command(option.command);
+}
+
+#[test]
+fn the_result_counts_the_sessions_left_out_by_kind() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    for (id, cwd) in [("scratch1", "a"), ("scratch2", "b")] {
+        let mut scratch = entry(id, "Scratch");
+        scratch["cwd"] = json!(format!(
+            "/Users/me/Library/Application Support/Claude/scratch-workspaces/{cwd}/x"
+        ));
+        put(&mac, PERSO, id, &scratch);
+    }
+    let mut ssh = entry("ssh", "Remote");
+    ssh["sshConfig"] = json!({"sshHost": "vps"});
+    put(&mac, PERSO, "ssh", &ssh);
+    // The same SSH Session in a second sidebar counts once.
+    put(&mac, WORK, "ssh", &ssh);
+    let mut core = manual(&mac);
+    leave_out_ssh(&mut core);
+
+    sync(&mut core);
+
+    assert_eq!(
+        note(&core),
+        "Synced 1 entry into 1 sidebar · left out 1 SSH and 2 scratch Sessions \
+         (not synced: they belong to one desktop login)"
+    );
+    assert_eq!(
+        status(&core).as_deref(),
+        Some("Synced 1 entry into 1 sidebar · left out 1 SSH and 2 scratch Sessions"),
+        "the menu's line is shorter"
+    );
+    let log = mac
+        .read_file(format!("{APP_FOLDER}/logs/app.log"))
+        .unwrap_or_default();
+    assert!(log.contains("skipped_ssh=1 skipped_scratch=2"), "{log}");
+}
+
+#[test]
+fn scratch_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied() {
     let mac = FakeMac::new();
     let mut scratch = entry("scratch", "Scratch");
     scratch["cwd"] = json!(format!(
@@ -263,9 +399,6 @@ fn scratch_ssh_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copi
         PERSO.0, PERSO.1
     ));
     put(&mac, PERSO, "scratch", &scratch);
-    let mut ssh = entry("ssh", "Remote");
-    ssh["sshConfig"] = json!({"host": "box"});
-    put(&mac, PERSO, "ssh", &ssh);
     let mut wsl = entry("wsl", "WSL");
     wsl["wslConfig"] = json!({"distro": "x"});
     put(&mac, PERSO, "wsl", &wsl);
@@ -322,7 +455,7 @@ fn while_claude_runs_no_write_lands_in_any_folder_of_the_desktops_account() {
     );
     assert_eq!(
         note(&core),
-        "Updated 1 Sidebar entry in 1 Profile · the Profile Claude is using syncs once Claude is quit"
+        "Synced 1 entry into 1 sidebar · the Profile Claude is using syncs once Claude is quit"
     );
 
     mac.os.set_desktop_app_running(false);
@@ -746,6 +879,8 @@ fn copies_sync_wrote_itself_do_not_start_another_run() {
     let s1 = put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
     changed(&mut core, &[s1]);
     mac.clock.advance(seconds(3));
+    core.event(Event::Tick);
+    // One sidebar per tick: Perso's and Work's.
     core.event(Event::Tick);
     let copy = mac.path(entry_path(PERSO, "w1"));
     assert!(copy.exists());

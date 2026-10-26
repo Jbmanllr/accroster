@@ -1,15 +1,36 @@
 //! Sidebar sync as the core runs it (ADR 0003): the mode, "Sync now", the
 //! Automatic watch, the dormant multi-account pause, and the sync before a
-//! Guided switch. What sync writes is decided in [`crate::sidebar_sync`].
+//! Guided switch. What sync writes is decided in [`crate::sidebar_sync`];
+//! a run writes one sidebar per tick, so the menu and Settings show its
+//! progress ("Syncing… 3 of 10") and then what it did.
 
 use std::path::PathBuf;
 
+use jiff::{SignedDuration, Timestamp};
+
 use super::Core;
-use crate::desktop::Target;
-use crate::interface::{ClaudeVersions, Effect, SafetyFeature, SidebarSyncMode};
+use crate::desktop::{Confirmed, Target};
+use crate::interface::{
+    ClaudeVersions, Effect, MenuItem, SafetyFeature, SidebarSyncMode, StatusTone,
+};
 use crate::logging::{Field, Level};
 use crate::safety::{CheckId, Finding};
-use crate::sidebar_sync::{self, Run};
+use crate::sidebar_sync::{self, Begun, LeftOut, Run, SyncRun};
+
+/// How long the menu shows how the last sync ended.
+const RESULT_SHOWN_FOR: SignedDuration = SignedDuration::from_mins(5);
+
+/// A sync under way.
+pub(super) struct ActiveSync {
+    run: Box<SyncRun>,
+}
+
+/// How the last sync ended, for the menu.
+pub(super) struct SyncResult {
+    text: String,
+    tone: StatusTone,
+    at: Timestamp,
+}
 
 impl Core {
     /// The Sidebar sync mode in Settings. Turning sync on checks the Sidebar
@@ -21,6 +42,7 @@ impl Core {
             return;
         }
         self.sync_note = None;
+        self.sync_result = None;
         self.log(
             Level::Info,
             "sidebar sync mode",
@@ -33,15 +55,19 @@ impl Core {
                 }),
             )],
         );
+        if mode == SidebarSyncMode::Off && self.sync.take().is_some() {
+            self.log(Level::Info, "sidebar sync stopped: turned off", &[]);
+        }
         self.check_sidebar_entries();
         self.settle();
     }
 
-    /// "Sync now": checks the Sidebar entries again, then copies every entry
-    /// into every other Profile's sidebar (ADR 0003).
-    pub(super) fn sync_sidebar(&mut self) {
-        if self.settings.sidebar_sync == SidebarSyncMode::Off {
-            return;
+    /// "Sync now" (or Automatic mode, or a Guided switch): checks the
+    /// Sidebar entries again, plans the run and starts it (ADR 0003).
+    /// Returns how it ended when it ended at once.
+    pub(super) fn sync_sidebar(&mut self) -> Option<Run> {
+        if self.settings.sidebar_sync == SidebarSyncMode::Off || self.sync.is_some() {
+            return None;
         }
         self.sidebar_watch.ran();
         self.check_sidebar_entries();
@@ -50,23 +76,111 @@ impl Core {
             self.sync_note =
                 Some("Sidebar sync is paused · see Diagnostics for why and to resume it".into());
             self.log(Level::Info, "sidebar sync not run: paused", &[]);
-            return;
+            self.show_result(StatusTone::Failed);
+            return Some(Run::Paused);
         }
-        match sidebar_sync::run(&self.env, &self.paths) {
+        match sidebar_sync::begin(
+            &self.env,
+            &self.paths,
+            !self.settings.leave_out_ssh_sessions,
+        ) {
+            Begun::Ended(run) => {
+                self.sync_ended(&run);
+                Some(run)
+            }
+            Begun::Running(run) => {
+                let (_, total) = run.progress();
+                self.log(
+                    Level::Info,
+                    "sidebar sync started",
+                    &[("folders", Field::Number(total as i64))],
+                );
+                self.sync = Some(ActiveSync { run });
+                self.sync_result = None;
+                None
+            }
+        }
+    }
+
+    /// Writes the next sidebar of the run under way; returns how the run
+    /// ended once it did.
+    pub(super) fn step_sync(&mut self) -> Option<Run> {
+        let active = self.sync.as_mut()?;
+        let ended = active.run.step(&self.env, &self.paths)?;
+        self.sync = None;
+        self.sync_ended(&ended);
+        Some(ended)
+    }
+
+    /// The run's progress (sidebars written, of how many), while one runs.
+    pub(super) fn sync_progress(&self) -> Option<(usize, usize)> {
+        self.sync.as_ref().map(|active| active.run.progress())
+    }
+
+    /// Settings' line: the progress while a run is under way, else what the
+    /// last one did.
+    pub(super) fn sync_settings_note(&self) -> Option<String> {
+        match self.sync_progress() {
+            Some(progress) => Some(syncing(progress)),
+            None => self.sync_note.clone(),
+        }
+    }
+
+    /// The menu's sync status line, while a run is under way (unless a
+    /// Guided switch shows its own) and for a while after it ended.
+    pub(super) fn sync_menu_items(&self) -> Vec<MenuItem> {
+        if self.desktop.sync_target().is_some() {
+            return Vec::new();
+        }
+        if let Some(progress) = self.sync_progress() {
+            return vec![MenuItem::Status {
+                text: syncing(progress),
+                tone: StatusTone::Working,
+            }];
+        }
+        let now = self.env.clock.now();
+        self.sync_result
+            .iter()
+            .filter(|result| now.duration_since(result.at) < RESULT_SHOWN_FOR)
+            .map(|result| MenuItem::Status {
+                text: result.text.clone(),
+                tone: result.tone,
+            })
+            .collect()
+    }
+
+    fn show_result(&mut self, tone: StatusTone) {
+        self.sync_result = self.sync_note.clone().map(|text| SyncResult {
+            text,
+            tone,
+            at: self.env.clock.now(),
+        });
+    }
+
+    /// Records how a run ended: the log, Settings' note, the menu's line and
+    /// any Safety pause.
+    fn sync_ended(&mut self, run: &Run) {
+        match run {
             Run::Synced(report) => {
                 self.safety
                     .record(CheckId::MultiAccountMode, Finding::pass());
-                self.log(
-                    Level::Info,
-                    "sidebar synced",
-                    &[
-                        ("entries", Field::Number(report.written as i64)),
-                        ("folders", Field::Number(report.folders as i64)),
-                        ("not_backed_up", Field::Number(report.not_backed_up as i64)),
-                    ],
-                );
-                self.sync_note = Some(sync_note(&report));
+                let mut fields = vec![
+                    ("entries", Field::Number(report.written as i64)),
+                    ("folders", Field::Number(report.folders as i64)),
+                    ("not_backed_up", Field::Number(report.not_backed_up as i64)),
+                ];
+                for (why, count) in &report.left_out {
+                    fields.push((why.log_key(), Field::Number(*count as i64)));
+                }
+                self.log(Level::Info, "sidebar synced", &fields);
+                self.sync_note = Some(sync_note(report));
+                self.sync_result = Some(SyncResult {
+                    text: sync_menu_line(report),
+                    tone: StatusTone::Done,
+                    at: self.env.clock.now(),
+                });
             }
+            Run::Paused => {}
             Run::DesktopAccountUnknown => {
                 self.log(
                     Level::Info,
@@ -75,11 +189,12 @@ impl Core {
                 );
                 self.sync_note =
                     Some("Couldn't tell which Profile Claude is using · nothing was synced".into());
+                self.show_result(StatusTone::Failed);
             }
             Run::UnknownFields(fields) => {
                 let detail = format!(
                     "unknown fields: {}",
-                    fields.into_iter().collect::<Vec<_>>().join(", ")
+                    fields.iter().cloned().collect::<Vec<_>>().join(", ")
                 );
                 let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
                 self.safety.record(
@@ -89,7 +204,7 @@ impl Core {
                 self.paused_sync_note();
             }
             Run::FoldersChanged(count) => {
-                let whose = if count > 1 { "sidebars" } else { "sidebar" };
+                let whose = if *count > 1 { "sidebars" } else { "sidebar" };
                 let detail =
                     format!("{count} {whose} Claude wasn't using changed since the last sync");
                 self.pause_for_multi_account(detail);
@@ -148,21 +263,73 @@ impl Core {
         self.log(Level::Warn, "sidebar sync stopped before writing", &[]);
         self.sync_note =
             Some("Sidebar sync is paused · nothing was written · see Diagnostics".into());
+        self.show_result(StatusTone::Failed);
     }
 
     /// A Guided switch the guard let through: syncs the sidebars first when
     /// Sidebar sync is on (so the target's sidebar has every Session when
-    /// Claude opens it), then brings Claude forward.
+    /// Claude opens it), then brings Claude forward. The sync runs over the
+    /// next ticks; [`Core::continue_desktop_switch`] picks up when it ends.
     pub(super) fn guide_desktop_switch(&mut self, cleared: Option<Target>) -> Vec<Effect> {
         let Some(target) = cleared else {
             return Vec::new();
         };
-        if self.settings.sidebar_sync != SidebarSyncMode::Off {
-            self.sync_sidebar();
+        if self.settings.sidebar_sync == SidebarSyncMode::Off {
+            let (desktop, ctx) = self.desktop();
+            return desktop.guide(&ctx, target);
         }
         let (desktop, ctx) = self.desktop();
-        desktop.guide(&ctx, target)
+        desktop.syncing(&ctx, target);
+        match (self.sync.is_some(), self.sync_sidebar()) {
+            // A run already under way (Sync now, Automatic) serves.
+            (true, _) | (false, None) => Vec::new(),
+            (false, Some(ended)) => self.continue_desktop_switch(&ended),
+        }
     }
+
+    /// "Switch anyway": after "can't tell", the switch syncs (when on) then
+    /// guides; after a stopped sync, it guides without syncing.
+    pub(super) fn confirm_desktop_switch(&mut self) -> Vec<Effect> {
+        let (desktop, ctx) = self.desktop();
+        match desktop.confirm(&ctx) {
+            Some(Confirmed::Unsure(target)) => self.guide_desktop_switch(Some(target)),
+            Some(Confirmed::SyncStopped(target)) => {
+                let (desktop, ctx) = self.desktop();
+                desktop.guide(&ctx, target)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// A sync ended while a Guided switch waited on it: guide, or say why
+    /// the switch stopped.
+    pub(super) fn continue_desktop_switch(&mut self, ended: &Run) -> Vec<Effect> {
+        let Some(target) = self.desktop.sync_target().cloned() else {
+            return Vec::new();
+        };
+        let reason = match ended {
+            Run::Synced(_) => {
+                let (desktop, ctx) = self.desktop();
+                return desktop.guide(&ctx, target);
+            }
+            Run::Paused => self
+                .safety
+                .paused_reason(SafetyFeature::SidebarSync)
+                .unwrap_or_else(|| "it is paused".into()),
+            Run::DesktopAccountUnknown => "couldn't tell which Profile Claude is using".into(),
+            Run::UnknownFields(_) => {
+                format!("{} changed Sidebar entries", desktop_name(&self.versions))
+            }
+            Run::FoldersChanged(_) => "Claude wrote to a Profile it isn't using".into(),
+        };
+        let (desktop, ctx) = self.desktop();
+        desktop.sync_stopped(&ctx, reason)
+    }
+}
+
+/// "Syncing… 3 of 10".
+fn syncing((done, total): (usize, usize)) -> String {
+    format!("Syncing… {done} of {total}")
 }
 
 /// "Claude 3.6556.2", or "Claude" when the desktop app's version is unknown.
@@ -175,25 +342,33 @@ pub(super) fn desktop_name(versions: &ClaudeVersions) -> String {
 
 /// Settings' line after a sync.
 fn sync_note(report: &sidebar_sync::Report) -> String {
+    sync_line(report, true)
+}
+
+/// The menu's shorter line: what was written and left out, without the
+/// explanations Settings gives.
+fn sync_menu_line(report: &sidebar_sync::Report) -> String {
+    sync_line(report, false)
+}
+
+fn sync_line(report: &sidebar_sync::Report, explained: bool) -> String {
+    let plural = |count: usize, one: &str, many: &str| {
+        format!(
+            "{} {}",
+            thousands(count),
+            if count == 1 { one } else { many }
+        )
+    };
     let mut note = if report.written == 0 {
         "Every sidebar was already in sync".to_owned()
     } else {
-        let entries = if report.written == 1 {
-            "entry"
-        } else {
-            "entries"
-        };
-        let profiles = if report.folders == 1 {
-            "Profile"
-        } else {
-            "Profiles"
-        };
         format!(
-            "Updated {} Sidebar {entries} in {} {profiles}",
-            report.written, report.folders
+            "Synced {} into {}",
+            plural(report.written, "entry", "entries"),
+            plural(report.folders, "sidebar", "sidebars")
         )
     };
-    if report.left_desktop_account {
+    if report.left_desktop_account && explained {
         note.push_str(" · the Profile Claude is using syncs once Claude is quit");
     }
     if report.not_backed_up > 0 {
@@ -202,5 +377,42 @@ fn sync_note(report: &sidebar_sync::Report) -> String {
             report.not_backed_up
         ));
     }
+    if !report.left_out.is_empty() {
+        note.push_str(&left_out_part(&report.left_out, explained));
+    }
     note
+}
+
+/// " · left out 17 SSH and 21 scratch Sessions (not synced: …)".
+fn left_out_part(left_out: &std::collections::BTreeMap<LeftOut, usize>, explained: bool) -> String {
+    let parts: Vec<String> = left_out
+        .iter()
+        .map(|(why, count)| format!("{} {}", thousands(*count), why.name()))
+        .collect();
+    let listed = match parts.as_slice() {
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => String::new(),
+    };
+    let total: usize = left_out.values().sum();
+    let sessions = if total == 1 { "Session" } else { "Sessions" };
+    let why = if explained {
+        " (not synced: they belong to one desktop login)"
+    } else {
+        ""
+    };
+    format!(" · left out {listed} {sessions}{why}")
+}
+
+/// `5014` as "5,014".
+fn thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
