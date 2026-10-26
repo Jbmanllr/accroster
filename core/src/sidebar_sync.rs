@@ -12,9 +12,9 @@
 //!   read, nothing is written. Folders are never created and files are
 //!   never deleted.
 //! - **What it copies.** `local_*.json` entries only (never one for a
-//!   CLI-only Session), skipping scratch, WSL, scheduled-task and (when
-//!   "Include SSH Sessions" is off, ADR 0003's amendment) SSH
-//!   Sessions, files over 10 MB, empty and unparsable files. A copy keeps the
+//!   CLI-only Session), skipping WSL and scheduled-task Sessions, SSH and
+//!   No-folder Sessions when "Include SSH and No-folder Sessions" is off
+//!   (ADR 0003's amendments), files over 10 MB, empty and unparsable files. A copy keeps the
 //!   file name and every field; `bridgeSessionIds`, `remoteMcpServersConfig`
 //!   and `enabledMcpTools` are cleared when present, and `sshReattach` is
 //!   dropped. Each run counts the Sessions it left out, by why. A `deleted_<id>`
@@ -86,12 +86,15 @@ const WSL_MARKERS: [&str; 1] = ["wslConfig"];
 /// … scheduled-task Sessions.
 const SCHEDULED_MARKERS: [&str; 2] = ["scheduledTaskId", "notifySessionId"];
 
-/// Why a Session is never copied: it belongs to one desktop login.
+/// The kind of a Session sync left out. SSH and No-folder Sessions only
+/// when "Include SSH and No-folder Sessions" is off; WSL and scheduled-task
+/// Sessions always: Claude runs those on one account only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LeftOut {
     Ssh,
+    /// A "No folder" Session, working in Claude's scratch workspace.
+    NoFolder,
     Wsl,
-    Scratch,
     ScheduledTask,
 }
 
@@ -100,9 +103,17 @@ impl LeftOut {
     pub(crate) fn name(self) -> &'static str {
         match self {
             LeftOut::Ssh => "SSH",
+            LeftOut::NoFolder => "No-folder",
             LeftOut::Wsl => "WSL",
-            LeftOut::Scratch => "scratch",
             LeftOut::ScheduledTask => "scheduled-task",
+        }
+    }
+
+    /// Why they were left out, in plain words.
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            LeftOut::Ssh | LeftOut::NoFolder => "Include SSH and No-folder Sessions is off",
+            LeftOut::Wsl | LeftOut::ScheduledTask => "Claude runs those on one account only",
         }
     }
 
@@ -110,8 +121,8 @@ impl LeftOut {
     pub(crate) fn log_key(self) -> &'static str {
         match self {
             LeftOut::Ssh => "skipped_ssh",
+            LeftOut::NoFolder => "skipped_no_folder",
             LeftOut::Wsl => "skipped_wsl",
-            LeftOut::Scratch => "skipped_scratch",
             LeftOut::ScheduledTask => "skipped_scheduled",
         }
     }
@@ -420,16 +431,17 @@ pub(crate) enum Begun {
 }
 
 /// "Sync now": reads every sidebar, checks it and plans every write.
-/// With `include_ssh` ("Include SSH Sessions", the default), SSH Sessions
-/// are copied too; WSL, scratch and scheduled-task Sessions never are.
-pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_ssh: bool) -> Begun {
+/// With `include_optional` ("Include SSH and No-folder Sessions", the
+/// default), SSH and No-folder Sessions are copied too; WSL and
+/// scheduled-task Sessions never are.
+pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_optional: bool) -> Begun {
     let desktop_paths = DesktopPaths::new(&env.home);
     let desktop = desktop::desktop_account(&desktop_paths);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
         return Begun::Ended(Run::DesktopAccountUnknown);
     }
-    let read = read_all(&env.home, include_ssh);
+    let read = read_all(&env.home, include_optional);
     let record = load(paths);
     let active_key = active_key(&desktop_paths);
     let active = read
@@ -829,7 +841,7 @@ fn hash(value: &Value) -> String {
 }
 
 /// Reads every `<account>/<org>/` folder (real folders with uuid names).
-fn read_all(home: &Path, include_ssh: bool) -> Read {
+fn read_all(home: &Path, include_optional: bool) -> Read {
     let root = sidebar_root(home);
     let mut read = Read {
         folders: Vec::new(),
@@ -844,14 +856,14 @@ fn read_all(home: &Path, include_ssh: bool) -> Read {
                 copies: BTreeMap::new(),
                 tombstones: BTreeSet::new(),
             };
-            read_folder(&mut folder, &mut read, include_ssh);
+            read_folder(&mut folder, &mut read, include_optional);
             read.folders.push(folder);
         }
     }
     read
 }
 
-fn read_folder(folder: &mut Folder, read: &mut Read, include_ssh: bool) {
+fn read_folder(folder: &mut Folder, read: &mut Read, include_optional: bool) {
     let Ok(entries) = fs::read_dir(&folder.path) else {
         return;
     };
@@ -883,7 +895,7 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_ssh: bool) {
         if body.get("sessionId").and_then(Value::as_str) != Some(stem) {
             continue;
         }
-        if let Some(why) = left_out(&body, include_ssh) {
+        if let Some(why) = left_out(&body, include_optional) {
             read.skipped.insert(name.clone(), why);
         }
         let Ok(modified) = meta.modified() else {
@@ -900,9 +912,11 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_ssh: bool) {
     }
 }
 
-/// Why sync never copies this entry, if it doesn't: SSH, WSL, scratch and
-/// scheduled-task Sessions.
-fn left_out(body: &Map<String, Value>, include_ssh: bool) -> Option<LeftOut> {
+/// Why sync doesn't copy this entry, if it doesn't: WSL and scheduled-task
+/// Sessions, and SSH and No-folder ones unless `include_optional`. A
+/// No-folder Session's copy keeps pointing at its scratch workspace
+/// (`scratch-workspaces/<account>/<org>/<id>`), which stays where it is.
+fn left_out(body: &Map<String, Value>, include_optional: bool) -> Option<LeftOut> {
     let has = |markers: &[&str]| {
         markers
             .iter()
@@ -913,14 +927,16 @@ fn left_out(body: &Map<String, Value>, include_ssh: bool) -> Option<LeftOut> {
             .and_then(Value::as_str)
             .is_some_and(|cwd| cwd.contains("/scratch-workspaces/"))
     };
-    if has(&SSH_MARKERS) && !include_ssh {
-        Some(LeftOut::Ssh)
-    } else if has(&WSL_MARKERS) {
+    if has(&WSL_MARKERS) {
         Some(LeftOut::Wsl)
     } else if has(&SCHEDULED_MARKERS) {
         Some(LeftOut::ScheduledTask)
+    } else if include_optional {
+        None
+    } else if has(&SSH_MARKERS) {
+        Some(LeftOut::Ssh)
     } else if scratch("cwd") || scratch("originCwd") {
-        Some(LeftOut::Scratch)
+        Some(LeftOut::NoFolder)
     } else {
         None
     }

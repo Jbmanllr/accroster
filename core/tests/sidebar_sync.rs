@@ -303,20 +303,31 @@ fn every_profile_gets_every_session_and_a_second_sync_has_nothing_to_do() {
 }
 
 #[test]
-fn ssh_sessions_are_included_by_default_without_the_reattach_binding_and_can_be_left_out() {
+fn ssh_and_no_folder_sessions_are_included_by_default_and_can_be_left_out() {
     let mac = FakeMac::new();
     let mut ssh = entry("ssh", "On the VPS");
     ssh["sshConfig"] = json!({"sshHost": "vps"});
     ssh["sshRemoteProcessId"] = json!(4242);
     ssh["sshReattach"] = json!({"pid": 4242, "token": "bound-to-perso"});
     put(&mac, PERSO, "ssh", &ssh);
-    let mut scratch = entry("scratch", "Scratch");
-    scratch["cwd"] = json!("/Users/me/Library/Application Support/Claude/scratch-workspaces/a/x");
-    put(&mac, PERSO, "scratch", &scratch);
+    // A "No folder" Session: its working folder is Claude's scratch
+    // workspace for Perso, and stays there.
+    let workspace = format!(
+        "/Users/me/Library/Application Support/Claude/scratch-workspaces/{}/{}/x",
+        PERSO.0, PERSO.1
+    );
+    let mut no_folder = entry("scratch", "Quick question");
+    no_folder["cwd"] = json!(workspace);
+    no_folder["originCwd"] = json!(workspace);
+    put(&mac, PERSO, "scratch", &no_folder);
     empty_folder(&mac, WORK);
     let mut core = manual(&mac);
     assert!(
-        core.view().settings.sidebar_sync.ssh_sessions.on,
+        core.view()
+            .settings
+            .sidebar_sync
+            .ssh_and_no_folder_sessions
+            .on,
         "on by default"
     );
 
@@ -326,35 +337,52 @@ fn ssh_sessions_are_included_by_default_without_the_reattach_binding_and_can_be_
     expected.as_object_mut().unwrap().remove("sshReattach");
     assert_eq!(read(&mac, WORK, "ssh"), Some(expected));
     assert_eq!(read(&mac, PERSO, "ssh"), Some(ssh), "the source keeps it");
-    assert_eq!(read(&mac, WORK, "scratch"), None, "scratch stays left out");
     assert_eq!(
-        note(&core),
-        "Synced 1 entry into 1 sidebar · left out 1 scratch Session \
-         (not synced: they belong to one desktop login)"
+        read(&mac, WORK, "scratch"),
+        Some(without_cleared(no_folder)),
+        "the copy points at the same scratch workspace"
     );
+    assert_eq!(note(&core), "Synced 2 entries into 1 sidebar");
 
-    // Turned off, a new SSH Session is left out, and that is remembered.
-    let option = core.view().settings.sidebar_sync.ssh_sessions;
+    // Turned off, new SSH and No-folder Sessions are left out, and that is
+    // remembered.
+    let option = core.view().settings.sidebar_sync.ssh_and_no_folder_sessions;
     core.command(option.command);
     let mut ssh2 = entry("ssh2", "Also on the VPS");
     ssh2["sshConfig"] = json!({"sshHost": "vps"});
     put(&mac, PERSO, "ssh2", &ssh2);
+    let mut no_folder2 = entry("scratch2", "Another question");
+    no_folder2["cwd"] = json!(format!("{workspace}2"));
+    put(&mac, PERSO, "scratch2", &no_folder2);
     sync(&mut core);
     assert_eq!(read(&mac, WORK, "ssh2"), None);
+    assert_eq!(read(&mac, WORK, "scratch2"), None);
+    assert_eq!(
+        note(&core),
+        "Every sidebar was already in sync · left out 2 SSH and 2 No-folder Sessions \
+         (Include SSH and No-folder Sessions is off)"
+    );
     drop(core);
     let core = mac.launch();
-    assert!(!core.view().settings.sidebar_sync.ssh_sessions.on);
+    assert!(
+        !core
+            .view()
+            .settings
+            .sidebar_sync
+            .ssh_and_no_folder_sessions
+            .on
+    );
 }
 
-/// "Include SSH Sessions" turned off.
-fn leave_out_ssh(core: &mut Core) {
-    let option = core.view().settings.sidebar_sync.ssh_sessions;
+/// "Include SSH and No-folder Sessions" turned off.
+fn leave_out_ssh_and_no_folder(core: &mut Core) {
+    let option = core.view().settings.sidebar_sync.ssh_and_no_folder_sessions;
     assert!(option.on);
     core.command(option.command);
 }
 
 #[test]
-fn the_result_counts_the_sessions_left_out_by_kind() {
+fn the_result_counts_the_sessions_left_out_by_kind_and_says_why() {
     let mac = FakeMac::new();
     put(&mac, PERSO, "s1", &entry("s1", "One"));
     for (id, cwd) in [("scratch1", "a"), ("scratch2", "b")] {
@@ -369,36 +397,39 @@ fn the_result_counts_the_sessions_left_out_by_kind() {
     put(&mac, PERSO, "ssh", &ssh);
     // The same SSH Session in a second sidebar counts once.
     put(&mac, WORK, "ssh", &ssh);
+    let mut scheduled = entry("task", "Nightly");
+    scheduled["scheduledTaskId"] = json!("task-1");
+    put(&mac, PERSO, "task", &scheduled);
     let mut core = manual(&mac);
-    leave_out_ssh(&mut core);
+    leave_out_ssh_and_no_folder(&mut core);
 
     sync(&mut core);
 
     assert_eq!(
         note(&core),
-        "Synced 1 entry into 1 sidebar · left out 1 SSH and 2 scratch Sessions \
-         (not synced: they belong to one desktop login)"
+        "Synced 1 entry into 1 sidebar · left out 1 SSH and 2 No-folder Sessions \
+         (Include SSH and No-folder Sessions is off) · left out 1 scheduled-task Session \
+         (Claude runs those on one account only)"
     );
     assert_eq!(
         status(&core).as_deref(),
-        Some("Synced 1 entry into 1 sidebar · left out 1 SSH and 2 scratch Sessions"),
+        Some(
+            "Synced 1 entry into 1 sidebar · left out 1 SSH, 2 No-folder and 1 scheduled-task Sessions"
+        ),
         "the menu's line is shorter"
     );
     let log = mac
         .read_file(format!("{APP_FOLDER}/logs/app.log"))
         .unwrap_or_default();
-    assert!(log.contains("skipped_ssh=1 skipped_scratch=2"), "{log}");
+    assert!(
+        log.contains("skipped_ssh=1 skipped_no_folder=2 skipped_scheduled=1"),
+        "{log}"
+    );
 }
 
 #[test]
-fn scratch_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied() {
+fn wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied() {
     let mac = FakeMac::new();
-    let mut scratch = entry("scratch", "Scratch");
-    scratch["cwd"] = json!(format!(
-        "/Users/me/Library/Application Support/Claude/scratch-workspaces/{}/{}/x",
-        PERSO.0, PERSO.1
-    ));
-    put(&mac, PERSO, "scratch", &scratch);
     let mut wsl = entry("wsl", "WSL");
     wsl["wslConfig"] = json!({"distro": "x"});
     put(&mac, PERSO, "wsl", &wsl);
@@ -424,6 +455,11 @@ fn scratch_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied()
         mac.list(SIDEBAR),
         [PERSO.0, WORK.0],
         "no Profile folder is created"
+    );
+    assert_eq!(
+        note(&core),
+        "Every sidebar was already in sync · left out 1 WSL and 1 scheduled-task Sessions \
+         (Claude runs those on one account only)"
     );
 }
 
@@ -463,13 +499,13 @@ fn while_claude_runs_its_accounts_sidebars_only_gain_the_sessions_they_lack() {
     );
     assert_eq!(
         note(&core),
-        "Synced 5 entries into 3 sidebars · 4 added to the sidebar Claude is using: \
-         Claude shows them once it's reopened · 1 changed entry there syncs once Claude is quit"
+        "Synced 5 entries into 3 sidebars · 4 added to the sidebar Claude is using · \
+         Reopen Claude to show them · 1 changed entry there syncs once Claude is quit"
     );
     assert_eq!(
         status(&core).as_deref(),
         Some(
-            "Synced 5 entries into 3 sidebars · 4 added to Claude's sidebar, shown once it's reopened"
+            "Synced 5 entries into 3 sidebars · 4 added to Claude's sidebar · Reopen Claude to show them"
         )
     );
 

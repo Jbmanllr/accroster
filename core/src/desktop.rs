@@ -18,8 +18,12 @@
 //!   confirm from the Sidebar folder Claude writes (or `main.log`). Each
 //!   step is one status line at the top of the menu, and each outcome a
 //!   notification.
+//! - **Reopen Claude:** offered after a sync added entries to the sidebar
+//!   Claude is using while it runs (Claude reads it only at launch). Guard,
+//!   wait while busy, then quit Claude and open it again.
 //!
-//! AccRoster never quits or relaunches Claude: nothing here can.
+//! AccRoster quits and reopens Claude only for Reopen Claude, which the user
+//! clicks, and only once Claude is idle (or the user chose Reopen anyway).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -548,6 +552,11 @@ pub(crate) struct DesktopBridge {
 }
 
 impl DesktopBridge {
+    /// Whether a switch is under way (from the guard to the confirmation).
+    pub(crate) fn active(&self) -> bool {
+        self.step.is_some()
+    }
+
     /// Whether a switch is checking the guard again or waiting for Claude to
     /// sign in: the core checks back every second.
     pub(crate) fn waiting(&self) -> bool {
@@ -742,10 +751,7 @@ impl DesktopBridge {
     /// The guard still can't tell: asks the user, in the menu and in a
     /// notification, so the choice can't go unnoticed.
     fn unsure(&mut self, ctx: &Context, target: Target, unaccounted: usize) -> Vec<Effect> {
-        let reason = match unaccounted {
-            1 => "a Claude Code process in Claude reports no status".to_owned(),
-            n => format!("{n} Claude Code processes in Claude report no status"),
-        };
+        let reason = cant_tell_reason(unaccounted);
         log(
             ctx,
             Level::Info,
@@ -940,6 +946,14 @@ impl DesktopBridge {
     }
 }
 
+/// Why the guard can't tell, for the status line.
+fn cant_tell_reason(unaccounted: usize) -> String {
+    match unaccounted {
+        1 => "a Claude Code process in Claude reports no status".to_owned(),
+        n => format!("{n} Claude Code processes in Claude report no status"),
+    }
+}
+
 fn profile(target: &Target) -> (&'static str, Field<'_>) {
     ("profile", Field::Profile(&target.profile_id))
 }
@@ -1022,6 +1036,271 @@ fn log_signed_in_since(log: &Path, offset: u64) -> bool {
         return false;
     }
     String::from_utf8_lossy(&appended).contains(SIGNED_IN_LINE)
+}
+
+// ----- Reopen Claude ---------------------------------------------------------------
+
+/// How long Claude gets to quit, then to open again, after Reopen Claude.
+const REOPEN_TIMEOUT: SignedDuration = SignedDuration::from_secs(30);
+
+/// Where a Reopen Claude stands.
+enum ReopenStep {
+    /// A desktop turn is running: quits once the guard clears.
+    Waiting { sessions: Vec<String> },
+    /// The guard couldn't tell; waiting for "Reopen anyway" or "Cancel".
+    Unsure { reason: String },
+    /// Asked Claude to quit; waiting for it to exit.
+    Quitting { since: Timestamp },
+    /// Asked Claude to open; waiting for it to run.
+    Opening { since: Timestamp },
+}
+
+/// Reopen Claude: the offer after a sync added entries to the sidebar Claude
+/// is using while it runs, and the reopen under way.
+#[derive(Default)]
+pub(crate) struct Reopen {
+    /// Claude runs without some Sessions sync added to its sidebar.
+    offered: bool,
+    step: Option<ReopenStep>,
+}
+
+/// How a Reopen Claude ended: its status line and tone.
+pub(crate) type ReopenOutcome = (String, StatusTone);
+
+impl Reopen {
+    /// A sync added entries to the sidebar Claude is using while it runs.
+    pub(crate) fn offer(&mut self) {
+        self.offered = true;
+    }
+
+    /// Whether "Reopen Claude" is offered (no reopen under way).
+    pub(crate) fn offered(&self) -> bool {
+        self.offered && self.step.is_none()
+    }
+
+    /// Whether a reopen is under way.
+    pub(crate) fn active(&self) -> bool {
+        self.step.is_some()
+    }
+
+    /// Whether the core should check back every second: while waiting for
+    /// Claude to go idle, quit or open.
+    pub(crate) fn waiting(&self) -> bool {
+        matches!(
+            self.step,
+            Some(
+                ReopenStep::Waiting { .. }
+                    | ReopenStep::Quitting { .. }
+                    | ReopenStep::Opening { .. }
+            )
+        )
+    }
+
+    /// Whether Claude is being quit or opened: Sidebar sync waits, so it
+    /// doesn't write while Claude shuts down or starts up.
+    pub(crate) fn restarting(&self) -> bool {
+        matches!(
+            self.step,
+            Some(ReopenStep::Quitting { .. } | ReopenStep::Opening { .. })
+        )
+    }
+
+    /// "Reopen Claude": runs the busy guard and quits Claude when it is
+    /// idle.
+    pub(crate) fn start(&mut self, ctx: &Context) -> Vec<Effect> {
+        if !self.offered() {
+            return Vec::new();
+        }
+        log(ctx, Level::Info, "desktop reopen requested", &[]);
+        let paths = DesktopPaths::new(&ctx.env.home);
+        self.guarded(ctx, guard(ctx.env, &paths))
+    }
+
+    /// Acts on what the guard found: quits when clear, else waits or asks.
+    fn guarded(&mut self, ctx: &Context, found: Guard) -> Vec<Effect> {
+        match found {
+            Guard::Clear => self.quit(ctx),
+            Guard::Busy(sessions) => {
+                if !matches!(self.step, Some(ReopenStep::Waiting { .. })) {
+                    log(
+                        ctx,
+                        Level::Info,
+                        "desktop reopen waiting",
+                        &[("busy_sessions", Field::Number(sessions.len() as i64))],
+                    );
+                }
+                self.step = Some(ReopenStep::Waiting { sessions });
+                Vec::new()
+            }
+            Guard::CantTell(unaccounted) => {
+                log(
+                    ctx,
+                    Level::Info,
+                    "desktop reopen unsure",
+                    &[("unaccounted", Field::Number(unaccounted as i64))],
+                );
+                self.step = Some(ReopenStep::Unsure {
+                    reason: cant_tell_reason(unaccounted),
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    /// Asks Claude to quit (or, when it already has, to open).
+    fn quit(&mut self, ctx: &Context) -> Vec<Effect> {
+        self.offered = false;
+        let since = ctx.env.clock.now();
+        if !ctx.env.os.desktop_app_running() {
+            log(ctx, Level::Info, "desktop reopen opening", &[]);
+            self.step = Some(ReopenStep::Opening { since });
+            return vec![Effect::BringDesktopAppForward];
+        }
+        log(ctx, Level::Info, "desktop reopen quitting", &[]);
+        self.step = Some(ReopenStep::Quitting { since });
+        vec![Effect::QuitDesktopApp]
+    }
+
+    /// "Reopen anyway", after the guard couldn't tell.
+    pub(crate) fn confirm(&mut self, ctx: &Context) -> Vec<Effect> {
+        if !matches!(self.step, Some(ReopenStep::Unsure { .. })) {
+            return Vec::new();
+        }
+        log(ctx, Level::Info, "desktop reopen confirmed anyway", &[]);
+        self.quit(ctx)
+    }
+
+    /// "Cancel", before Claude was asked to quit: Claude is left as it is
+    /// and Reopen Claude stays offered.
+    pub(crate) fn cancel(&mut self, ctx: &Context) {
+        if matches!(
+            self.step,
+            Some(ReopenStep::Waiting { .. } | ReopenStep::Unsure { .. })
+        ) {
+            self.step = None;
+            log(ctx, Level::Info, "desktop reopen cancelled", &[]);
+        }
+    }
+
+    /// Time passed: re-checks a busy Claude, and follows Claude quitting and
+    /// opening. Returns the effects, and the outcome once it ended.
+    pub(crate) fn poll(&mut self, ctx: &Context) -> (Vec<Effect>, Option<ReopenOutcome>) {
+        let now = ctx.env.clock.now();
+        match &self.step {
+            None => {
+                // Claude quit by other means reads its sidebar when it opens.
+                if self.offered && !ctx.env.os.desktop_app_running() {
+                    self.offered = false;
+                }
+                (Vec::new(), None)
+            }
+            Some(ReopenStep::Unsure { .. }) => (Vec::new(), None),
+            Some(ReopenStep::Waiting { .. }) => {
+                let paths = DesktopPaths::new(&ctx.env.home);
+                (self.guarded(ctx, guard(ctx.env, &paths)), None)
+            }
+            Some(ReopenStep::Quitting { since }) => {
+                if !ctx.env.os.desktop_app_running() {
+                    log(ctx, Level::Info, "desktop reopen opening", &[]);
+                    self.step = Some(ReopenStep::Opening { since: now });
+                    return (vec![Effect::BringDesktopAppForward], None);
+                }
+                if now.duration_since(*since) < REOPEN_TIMEOUT {
+                    return (Vec::new(), None);
+                }
+                log(ctx, Level::Warn, "desktop reopen: claude didn't quit", &[]);
+                // Claude still runs without the Sessions: offered again.
+                self.offered = true;
+                self.end(
+                    ("Claude didn't quit", "Try ⌘Q in Claude"),
+                    "Claude didn't quit · try ⌘Q in Claude",
+                    StatusTone::Failed,
+                )
+            }
+            Some(ReopenStep::Opening { since }) => {
+                if ctx.env.os.desktop_app_running() {
+                    log(ctx, Level::Info, "desktop reopened", &[]);
+                    return self.end(
+                        (
+                            "Claude reopened",
+                            "Its sidebar now shows the synced Sessions",
+                        ),
+                        "Claude reopened · its sidebar now shows the synced Sessions",
+                        StatusTone::Done,
+                    );
+                }
+                if now.duration_since(*since) < REOPEN_TIMEOUT {
+                    return (Vec::new(), None);
+                }
+                log(ctx, Level::Warn, "desktop reopen: claude didn't open", &[]);
+                self.end(
+                    (
+                        "Claude didn't open",
+                        "Open Claude from your Applications folder",
+                    ),
+                    "Claude didn't open · open it from your Applications folder",
+                    StatusTone::Failed,
+                )
+            }
+        }
+    }
+
+    /// Ends the reopen with a notification (`title`, `body`) and the status
+    /// line `line`.
+    fn end(
+        &mut self,
+        (title, body): (&str, &str),
+        line: &str,
+        tone: StatusTone,
+    ) -> (Vec<Effect>, Option<ReopenOutcome>) {
+        self.step = None;
+        let effects = vec![Effect::Notify {
+            title: title.into(),
+            body: body.into(),
+        }];
+        (effects, Some((line.into(), tone)))
+    }
+
+    /// The status line of the reopen under way, if any.
+    pub(crate) fn status(&self) -> Option<(String, StatusTone)> {
+        Some(match self.step.as_ref()? {
+            ReopenStep::Waiting { sessions } => (
+                format!("Waiting for Claude to finish: {}", sessions.join(", ")),
+                StatusTone::Working,
+            ),
+            ReopenStep::Unsure { reason } => (
+                format!("Can't tell whether Claude is busy ({reason})"),
+                StatusTone::NeedsYou,
+            ),
+            ReopenStep::Quitting { .. } | ReopenStep::Opening { .. } => {
+                ("Reopening Claude…".into(), StatusTone::Working)
+            }
+        })
+    }
+
+    /// The status line of the reopen under way and the actions answering
+    /// it, at the top of the menu.
+    pub(crate) fn menu_items(&self) -> Vec<MenuItem> {
+        let Some((text, tone)) = self.status() else {
+            return Vec::new();
+        };
+        let action = |title: &str, command| MenuItem::Action {
+            title: title.into(),
+            command,
+        };
+        let mut items = vec![MenuItem::Status { text, tone }];
+        match self.step {
+            Some(ReopenStep::Waiting { .. }) => {
+                items.push(action("Cancel", Command::CancelReopenDesktopApp));
+            }
+            Some(ReopenStep::Unsure { .. }) => {
+                items.push(action("Reopen anyway", Command::ConfirmReopenDesktopApp));
+                items.push(action("Cancel", Command::CancelReopenDesktopApp));
+            }
+            _ => {}
+        }
+        items
+    }
 }
 
 fn log(ctx: &Context, level: Level, message: &'static str, fields: &[(&'static str, Field<'_>)]) {

@@ -160,6 +160,8 @@ struct SettingsWindow {
     sidebar_sync: Retained<NSButton>,
     sidebar_sync_automatic: Retained<NSButton>,
     sync_now: Retained<NSButton>,
+    /// Shown while the core offers Reopen Claude.
+    reopen_claude: Retained<NSButton>,
     sidebar_sync_note: Retained<NSTextField>,
     sync_ssh_sessions: Retained<NSButton>,
     cli_switching: Retained<NSButton>,
@@ -357,10 +359,10 @@ define_class!(
             self.send(Command::Uninstall);
         }
 
-        /// "Include SSH Sessions".
+        /// "Include SSH and No-folder Sessions".
         #[unsafe(method(syncSshSessionsClicked:))]
         fn sync_ssh_sessions_clicked(&self, sender: &NSButton) {
-            self.send(Command::SetIncludeSshSessions(
+            self.send(Command::SetIncludeSshAndNoFolderSessions(
                 sender.state() == NSControlStateValueOn,
             ));
         }
@@ -368,6 +370,11 @@ define_class!(
         #[unsafe(method(syncNowClicked:))]
         fn sync_now_clicked(&self, _sender: &NSButton) {
             self.send(Command::SyncSidebarNow);
+        }
+
+        #[unsafe(method(reopenClaudeClicked:))]
+        fn reopen_claude_clicked(&self, _sender: &NSButton) {
+            self.send(Command::ReopenDesktopApp);
         }
 
         /// The thresholds field was committed: whole percents separated by
@@ -987,6 +994,7 @@ impl Ui {
                 });
             }
             Effect::BringDesktopAppForward => bring_desktop_app_forward(),
+            Effect::QuitDesktopApp => quit_desktop_app(),
             Effect::RunInTerminal(line) => run_in_terminal(&line),
             Effect::ShowInTerminal { tty } => show_in_terminal(tty.as_deref()),
             Effect::Notify { title, body } => notifications::post(&title, &body, None),
@@ -1472,10 +1480,14 @@ impl Ui {
             sel!(sidebarSyncAutomaticClicked:),
         );
         layout.place(&sidebar_sync_automatic, NOTE_X, None, 4.0);
-        let sync_ssh_sessions = checkbox("Include SSH Sessions", sel!(syncSshSessionsClicked:));
+        let sync_ssh_sessions = checkbox(
+            "Include SSH and No-folder Sessions",
+            sel!(syncSshSessionsClicked:),
+        );
         layout.place(&sync_ssh_sessions, NOTE_X, None, 4.0);
         let sync_now = push_button("Sync now", sel!(syncNowClicked:));
-        layout.place(&sync_now, NOTE_X - 6.0, None, 2.0);
+        let reopen_claude = push_button("Reopen Claude", sel!(reopenClaudeClicked:));
+        layout.place_row(&[&sync_now, &reopen_claude], NOTE_X - 6.0, 2.0);
         let sidebar_sync_note = note("");
         // Room for a result that lists what was left out.
         layout.place(&sidebar_sync_note, NOTE_X, Some((NOTE_WIDTH, 44.0)), 4.0);
@@ -1556,6 +1568,7 @@ impl Ui {
             sidebar_sync,
             sidebar_sync_automatic,
             sync_now,
+            reopen_claude,
             sidebar_sync_note,
             sync_ssh_sessions,
             cli_switching,
@@ -2302,8 +2315,8 @@ fn profile_row_content(mtm: MainThreadMarker, row: &ProfileRow) -> Retained<NSVi
 /// The Claude desktop app's bundle id.
 const DESKTOP_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
 
-/// Opens Claude, or brings it forward when it runs. Never quits or relaunches
-/// it: `openApplicationAtURL` activates a running app in place.
+/// Opens Claude, or brings it forward when it runs:
+/// `openApplicationAtURL` activates a running app in place (like `open -b`).
 fn bring_desktop_app_forward() {
     use objc2_app_kit::NSWorkspaceOpenConfiguration;
     let workspace = NSWorkspace::sharedWorkspace();
@@ -2315,6 +2328,20 @@ fn bring_desktop_app_forward() {
     let configuration = NSWorkspaceOpenConfiguration::configuration();
     configuration.setActivates(true);
     workspace.openApplicationAtURL_configuration_completionHandler(&url, &configuration, None);
+}
+
+/// Asks Claude to quit the way ⌘Q does (`terminate` sends it the quit Apple
+/// event; Claude may still ask first), never force-quits it. Returns at
+/// once: the core watches for Claude to exit and says so when it doesn't
+/// (a refused request included). Only Reopen Claude sends this.
+fn quit_desktop_app() {
+    use objc2_app_kit::NSRunningApplication;
+    let running = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+        &NSString::from_str(DESKTOP_BUNDLE_ID),
+    );
+    for app in running.iter() {
+        app.terminate();
+    }
 }
 
 /// A Discovered Profile row: greyed `Sign in to …`, a submenu arrow, and the
@@ -2648,9 +2675,10 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
         .sidebar_sync_automatic
         .setEnabled(sync.mode != SidebarSyncMode::Off);
     settings.sync_now.setEnabled(sync.sync_now.is_some());
+    settings.reopen_claude.setHidden(sync.reopen.is_none());
     settings
         .sync_ssh_sessions
-        .setState(if sync.ssh_sessions.on {
+        .setState(if sync.ssh_and_no_folder_sessions.on {
             NSControlStateValueOn
         } else {
             NSControlStateValueOff
