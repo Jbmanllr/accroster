@@ -441,6 +441,18 @@ fn sign_in_call_number(mac: &FakeMac, n: usize) -> accroster_fake_mac::RecordedC
     }
 }
 
+/// Waits until the stub process for `call` has exited.
+fn wait_until_exited(call: &accroster_fake_mac::RecordedCall) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !call.exited() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stub never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// An app with one expired Profile signed in as `work()`.
 fn mac_with_expired_work() -> (FakeMac, Core) {
     let mac = mac_signing_in_work_reading(rate_limits_unavailable());
@@ -462,9 +474,12 @@ fn sign_in_again_in_the_same_folder_with_the_email_fixes_an_expired_login() {
     mac.clock.advance(jiff::SignedDuration::from_mins(1));
 
     click_in_row(&mut core, 0, "Sign in again…");
+    // The sign-in ends before the next tick, with no tick in between that
+    // sees the Profile still expired: its reading is refreshed anyway.
+    let call = sign_in_call_number(&mac, 2);
+    wait_until_exited(&call);
     let effects = wait_for_sign_in(&mut core);
 
-    let call = sign_in_call_number(&mac, 2);
     assert_eq!(
         call.args,
         ["auth", "login", "--claudeai", "--email", "me@work.example"]

@@ -633,6 +633,19 @@ impl RecordedCall {
             .status()
             .is_ok_and(|status| status.success())
     }
+
+    /// Whether the stub process for this call has exited, reaped or not (a
+    /// zombie still answers [`RecordedCall::still_running`]).
+    pub fn exited(&self) -> bool {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &self.pid.to_string()])
+            .output()
+            .is_ok_and(|output| {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            })
+    }
 }
 
 /// The stub `claude` executable and its state folder.
