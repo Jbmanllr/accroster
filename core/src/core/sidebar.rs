@@ -83,6 +83,7 @@ impl Core {
             &self.env,
             &self.paths,
             !self.settings.leave_out_ssh_and_no_folder_sessions,
+            &mut self.sidebar_entries,
         ) {
             Begun::Ended(run) => {
                 self.sync_ended(&run);
@@ -106,7 +107,9 @@ impl Core {
     /// ended once it did.
     pub(super) fn step_sync(&mut self) -> Option<Run> {
         let active = self.sync.as_mut()?;
-        let ended = active.run.step(&self.env, &self.paths)?;
+        let ended = active
+            .run
+            .step(&self.env, &self.paths, &mut self.sidebar_entries)?;
         self.sync = None;
         self.sync_ended(&ended);
         Some(ended)
@@ -202,6 +205,7 @@ impl Core {
                     ("entries", Field::Number(report.written as i64)),
                     ("folders", Field::Number(report.folders as i64)),
                     ("not_backed_up", Field::Number(report.not_backed_up as i64)),
+                    ("parsed", Field::Number(report.parsed as i64)),
                 ];
                 for (why, count) in &report.left_out {
                     fields.push((why.log_key(), Field::Number(*count as i64)));

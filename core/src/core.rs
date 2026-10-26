@@ -117,6 +117,8 @@ pub struct Core {
     sync_result: Option<sidebar::SyncResult>,
     /// The sidebars' watch while Sidebar sync is on.
     sidebar_watch: sidebar_sync::Watch,
+    /// The Sidebar entries as the last sync read or wrote them.
+    sidebar_entries: sidebar_sync::EntryCache,
     /// `claude --desktop --resume` runs, by Session id.
     openings: Jobs<String>,
     /// A Resume whose checks wait for the `auth status` cross-check.
@@ -222,6 +224,7 @@ impl Core {
             sync: None,
             sync_result: None,
             sidebar_watch: sidebar_sync::Watch::default(),
+            sidebar_entries: sidebar_sync::EntryCache::default(),
             openings: Jobs::default(),
             resume_waiting: None,
             uninstalling: None,

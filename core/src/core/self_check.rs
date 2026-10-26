@@ -277,7 +277,7 @@ impl Core {
         }
         if feature == SafetyFeature::SidebarSync {
             // The user accepts the sidebars as they are now.
-            sidebar_sync::accept_current(&self.env, &self.paths);
+            sidebar_sync::accept_current(&self.env, &self.paths, &mut self.sidebar_entries);
             self.sync_note = None;
             self.sync_result = None;
         }
