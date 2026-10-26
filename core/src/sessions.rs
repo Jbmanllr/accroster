@@ -393,7 +393,9 @@ impl SessionIndex {
         for path in changed {
             if let Ok(inside) = path.strip_prefix(&projects) {
                 if inside.components().count() == 2 && is_jsonl(path) {
-                    transcripts.push(path.clone());
+                    if !is_subagent(path) {
+                        transcripts.push(path.clone());
+                    }
                 } else {
                     all_transcripts = true;
                 }
@@ -1022,6 +1024,14 @@ fn is_jsonl(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
+/// A subagent's Transcript kept next to its Session's own (`agent-<id>.jsonl`,
+/// as SSH Sessions do): part of that Session, not a Session itself.
+fn is_subagent(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("agent-"))
+}
+
 /// The size and mtime of a regular file that isn't a link.
 fn regular_file_stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::symlink_metadata(path).ok()?;
@@ -1038,7 +1048,7 @@ fn regular_file_stamp(path: &Path) -> Option<Stamp> {
 
 /// Every top-level `~/.claude/projects/<project>/<id>.jsonl`, with its size
 /// and mtime. Links (folders or files) aren't followed, and subagent
-/// Transcripts, one folder deeper, aren't reached.
+/// Transcripts, one folder deeper or named `agent-*`, are skipped.
 fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
     let mut found = BTreeMap::new();
     for (project, kind) in real_children(&projects_root(home)) {
@@ -1046,7 +1056,7 @@ fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
             continue;
         }
         for (path, kind) in real_children(&project) {
-            if !kind.is_file() || !is_jsonl(&path) {
+            if !kind.is_file() || !is_jsonl(&path) || is_subagent(&path) {
                 continue;
             }
             if let Some(stamp) = regular_file_stamp(&path) {
