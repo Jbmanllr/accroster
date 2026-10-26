@@ -58,6 +58,12 @@ On every run the shim silently unsets the variables that would put another accou
 - If the chosen Profile's folder is missing, the shim prints an error and exits with status 1. It never falls back to `~/.claude`.
 - The IDE extensions, the Claude desktop app and anything not started from your shell don't go through the shim, so they use `~/.claude`.
 
+## Sidebar sync
+
+Turn on Sidebar sync in Settings to copy every Session's entry into every Profile's sidebar in the Claude desktop app, on "Sync now" or automatically. It copies, never deletes. While Claude runs, the sidebar it is using only gains the Sessions it lacks, and Claude shows them once it's reopened: the result line then offers **Reopen Claude**.
+
+AccRoster quits and reopens Claude only when you click Reopen Claude, and only once Claude is idle. If a desktop Session is running a turn, it waits and names it (Cancel leaves Claude alone); if it can't tell, it asks first (Reopen anyway or Cancel). It asks Claude to quit the way ⌘Q does, never force-quits it, and opens it again once it has quit. Sync itself, Automatic sync included, never quits Claude.
+
 ## Uninstall
 
 Use Settings → Uninstall…. It lists what it removes and what stays, then runs these steps in order. Each step is skipped when it is already done, so if it stops or is interrupted, run it again to finish; `claude` keeps working at every point.

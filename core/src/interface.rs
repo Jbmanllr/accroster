@@ -139,6 +139,14 @@ pub enum Command {
     SyncSidebarNow,
     /// "Include SSH Sessions" in Settings (on by default).
     SetIncludeSshSessions(bool),
+    /// "Reopen Claude", offered after a sync added Sessions to the sidebar
+    /// Claude is using while it runs: waits until Claude is idle, then
+    /// quits Claude and opens it again.
+    ReopenDesktopApp,
+    /// "Reopen anyway", when the busy guard couldn't tell.
+    ConfirmReopenDesktopApp,
+    /// "Cancel" while Reopen Claude waits for Claude.
+    CancelReopenDesktopApp,
     /// "Uninstall…" in Settings: asks first ([`Effect::ConfirmUninstall`]).
     AskUninstall,
     /// The uninstall confirmed, or its Retry: unhook the CLI, remove every
@@ -259,6 +267,9 @@ impl Command {
             Command::SetSidebarSync(_) => "set_sidebar_sync",
             Command::SyncSidebarNow => "sync_sidebar_now",
             Command::SetIncludeSshSessions(_) => "set_include_ssh_sessions",
+            Command::ReopenDesktopApp => "reopen_desktop_app",
+            Command::ConfirmReopenDesktopApp => "confirm_reopen_desktop_app",
+            Command::CancelReopenDesktopApp => "cancel_reopen_desktop_app",
             Command::AskUninstall => "ask_uninstall",
             Command::Uninstall => "uninstall",
             Command::OpenAllSessions => "open_all_sessions",
@@ -360,9 +371,14 @@ pub enum Effect {
     /// Put this text on the general pasteboard.
     CopyToClipboard(String),
     /// Bring the Claude desktop app (`com.anthropic.claudefordesktop`)
-    /// forward, opening it if it isn't running. Nothing ever quits or
-    /// relaunches it.
+    /// forward, opening it if it isn't running.
     BringDesktopAppForward,
+    /// Ask the Claude desktop app to quit, as the user's ⌘Q does (Claude
+    /// may still ask before quitting). Sent only for Reopen Claude, which
+    /// the user clicked, once Claude is idle or the user chose Reopen
+    /// anyway; the core then waits for it to exit and opens it with
+    /// [`Effect::BringDesktopAppForward`].
+    QuitDesktopApp,
     /// Post a user notification.
     Notify { title: String, body: String },
     /// Post a user notification with one action button titled `action`;
@@ -723,8 +739,12 @@ pub struct SidebarSyncView {
     pub mode: SidebarSyncMode,
     /// "Sync now", present while sync is on: [`Command::SyncSidebarNow`].
     pub sync_now: Option<Command>,
-    /// What the last sync did, or why it didn't run.
+    /// What the last sync did, or why it didn't run, or how Reopen Claude
+    /// is going.
     pub note: Option<String>,
+    /// "Reopen Claude", present while it is offered:
+    /// [`Command::ReopenDesktopApp`].
+    pub reopen: Option<Command>,
     /// "Include SSH Sessions": [`Command::SetIncludeSshSessions`].
     pub ssh_sessions: Toggle,
 }

@@ -1,6 +1,6 @@
 //! The Desktop bridge: which Profile the Claude desktop app uses, the busy
 //! guard, and the Guided switch that walks the user through signing out and
-//! in. AccRoster never quits Claude.
+//! in. The switch never quits Claude.
 
 mod common;
 
@@ -846,8 +846,11 @@ fn an_unconfirmed_switch_gives_up_after_half_an_hour_and_can_be_cancelled_before
     assert_eq!(status(&core), None, "{:?}", core.view().menu.items);
 }
 
+/// AccRoster quits and reopens Claude only for Reopen Claude
+/// (`reopen_claude.rs`): a Guided switch, blocked, unsure or let through,
+/// only brings Claude forward and notifies.
 #[test]
-fn no_path_quits_relaunches_or_spawns_anything_against_claude() {
+fn the_guided_switch_never_quits_relaunches_or_spawns_anything_against_claude() {
     let (mac, mut core) = desktop_on_perso();
     let spawns_before = mac.claude.calls().len();
     let mut effects = Vec::new();

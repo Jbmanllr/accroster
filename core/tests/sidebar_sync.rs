@@ -463,13 +463,13 @@ fn while_claude_runs_its_accounts_sidebars_only_gain_the_sessions_they_lack() {
     );
     assert_eq!(
         note(&core),
-        "Synced 5 entries into 3 sidebars · 4 added to the sidebar Claude is using: \
-         Claude shows them once it's reopened · 1 changed entry there syncs once Claude is quit"
+        "Synced 5 entries into 3 sidebars · 4 added to the sidebar Claude is using · \
+         Reopen Claude to show them · 1 changed entry there syncs once Claude is quit"
     );
     assert_eq!(
         status(&core).as_deref(),
         Some(
-            "Synced 5 entries into 3 sidebars · 4 added to Claude's sidebar, shown once it's reopened"
+            "Synced 5 entries into 3 sidebars · 4 added to Claude's sidebar · Reopen Claude to show them"
         )
     );
 

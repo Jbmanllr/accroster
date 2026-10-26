@@ -11,7 +11,7 @@ use jiff::{SignedDuration, Timestamp};
 use super::Core;
 use crate::desktop::{Confirmed, Target};
 use crate::interface::{
-    ClaudeVersions, Effect, MenuItem, SafetyFeature, SidebarSyncMode, StatusTone,
+    ClaudeVersions, Command, Effect, MenuItem, SafetyFeature, SidebarSyncMode, StatusTone,
 };
 use crate::logging::{Field, Level};
 use crate::safety::{CheckId, Finding};
@@ -120,14 +120,25 @@ impl Core {
     /// Settings' line: the progress while a run is under way, else what the
     /// last one did.
     pub(super) fn sync_settings_note(&self) -> Option<String> {
-        match self.sync_progress() {
-            Some(progress) => Some(syncing(progress)),
+        if let Some(progress) = self.sync_progress() {
+            return Some(syncing(progress));
+        }
+        match self.reopen.status() {
+            Some((text, _)) => Some(text),
             None => self.sync_note.clone(),
         }
     }
 
+    /// Whether "Reopen Claude" is offered: not while a Guided switch has
+    /// Claude's attention.
+    pub(super) fn reopen_offered(&self) -> bool {
+        self.reopen.offered() && !self.desktop.active()
+    }
+
     /// The menu's sync status line, while a run is under way (unless a
-    /// Guided switch shows its own) and for a while after it ended.
+    /// Guided switch shows its own) and for a while after it ended, with
+    /// "Reopen Claude" while it is offered; a reopen under way shows its
+    /// own line instead of the result.
     pub(super) fn sync_menu_items(&self) -> Vec<MenuItem> {
         if self.desktop.sync_target().is_some() {
             return Vec::new();
@@ -138,15 +149,38 @@ impl Core {
                 tone: StatusTone::Working,
             }];
         }
+        if self.reopen.active() {
+            return self.reopen.menu_items();
+        }
         let now = self.env.clock.now();
-        self.sync_result
+        let mut items: Vec<MenuItem> = self
+            .sync_result
             .iter()
             .filter(|result| now.duration_since(result.at) < RESULT_SHOWN_FOR)
             .map(|result| MenuItem::Status {
                 text: result.text.clone(),
                 tone: result.tone,
             })
-            .collect()
+            .collect();
+        if !items.is_empty() && self.reopen_offered() {
+            items.push(MenuItem::Action {
+                title: "Reopen Claude".into(),
+                command: Command::ReopenDesktopApp,
+            });
+        }
+        items
+    }
+
+    /// Follows a Reopen Claude under way; its outcome becomes the sync's
+    /// result line, in the menu and Settings.
+    pub(super) fn poll_reopen(&mut self) -> Vec<Effect> {
+        let (reopen, ctx) = self.reopen();
+        let (effects, outcome) = reopen.poll(&ctx);
+        if let Some((text, tone)) = outcome {
+            self.sync_note = Some(text);
+            self.show_result(tone);
+        }
+        effects
     }
 
     fn show_result(&mut self, tone: StatusTone) {
@@ -173,6 +207,9 @@ impl Core {
                     fields.push((why.log_key(), Field::Number(*count as i64)));
                 }
                 self.log(Level::Info, "sidebar synced", &fields);
+                if report.added_to_desktop > 0 {
+                    self.reopen.offer();
+                }
                 self.sync_note = Some(sync_note(report));
                 self.sync_result = Some(SyncResult {
                     text: sync_menu_line(report),
@@ -356,12 +393,9 @@ fn sync_line(report: &sidebar_sync::Report, explained: bool) -> String {
     if report.added_to_desktop > 0 {
         let added = thousands(report.added_to_desktop);
         note.push_str(&if explained {
-            format!(
-                " · {added} added to the sidebar Claude is using: \
-                 Claude shows them once it's reopened"
-            )
+            format!(" · {added} added to the sidebar Claude is using · Reopen Claude to show them")
         } else {
-            format!(" · {added} added to Claude's sidebar, shown once it's reopened")
+            format!(" · {added} added to Claude's sidebar · Reopen Claude to show them")
         });
     }
     if report.held_for_desktop > 0 && explained {

@@ -11,7 +11,7 @@ use crate::backups;
 use crate::checks;
 use crate::claude_code::{self, ClaudeLocator};
 use crate::cli_switcher;
-use crate::desktop::{DesktopAccount, DesktopBridge, DesktopPaths, NewestEntries, Target};
+use crate::desktop::{DesktopAccount, DesktopBridge, DesktopPaths, NewestEntries, Reopen, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
@@ -92,6 +92,9 @@ pub struct Core {
     /// What the last CLI switching change left for the user to do.
     cli_note: Option<String>,
     desktop: DesktopBridge,
+    /// Reopen Claude: offered after a sync added to the sidebar Claude is
+    /// using while it runs.
+    reopen: Reopen,
     /// Where `claude` is, once found.
     claude: ClaudeLocator,
     /// Discovered pairs as of the last scan (launch, menu open).
@@ -207,6 +210,7 @@ impl Core {
             notifier: Notifier::default(),
             cli_note: None,
             desktop: DesktopBridge::default(),
+            reopen: Reopen::default(),
             claude: ClaudeLocator::default(),
             discovered: Vec::new(),
             discovery: discovered::Scanner::default(),
@@ -311,7 +315,8 @@ impl Core {
             // Its end shows at once.
             return RUN_TICK;
         }
-        let idle = if self.profiles.signing_in() || self.desktop.waiting() {
+        let idle = if self.profiles.signing_in() || self.desktop.waiting() || self.reopen.waiting()
+        {
             // An Automatic sync waits for the switch to end (see `Tick`).
             Duration::from_secs(1)
         } else {
@@ -486,12 +491,29 @@ impl Core {
                     .iter()
                     .find(|profile| profile.id == id)
                     .map(Target::of);
-                let Some(target) = target else {
+                // One thing at a time with Claude: a reopen under way first.
+                let Some(target) = target.filter(|_| !self.reopen.active()) else {
                     return Vec::new();
                 };
                 let (desktop, ctx) = self.desktop();
                 let cleared = desktop.start(&ctx, target);
                 self.guide_desktop_switch(cleared)
+            }
+            Command::ReopenDesktopApp => {
+                if self.desktop.active() {
+                    return Vec::new();
+                }
+                let (reopen, ctx) = self.reopen();
+                reopen.start(&ctx)
+            }
+            Command::ConfirmReopenDesktopApp => {
+                let (reopen, ctx) = self.reopen();
+                reopen.confirm(&ctx)
+            }
+            Command::CancelReopenDesktopApp => {
+                let (reopen, ctx) = self.reopen();
+                reopen.cancel(&ctx);
+                Vec::new()
             }
             Command::ConfirmDesktopSwitch => self.confirm_desktop_switch(),
             Command::NotifyWhenDesktopIdle => {
@@ -674,11 +696,14 @@ impl Core {
                 let (polled, cleared) = desktop.poll(&ctx, &signed_in);
                 effects.extend(polled);
                 effects.extend(self.guide_desktop_switch(cleared));
+                effects.extend(self.poll_reopen());
                 self.sidebar_watch.notice_switch(&self.env);
                 // While a Guided switch waits, copies sync wrote would look
                 // like Claude writing the target's folder: sync waits too.
+                // So it does while Claude quits and opens again.
                 if self.settings.sidebar_sync == SidebarSyncMode::Automatic
                     && !self.desktop.waiting()
+                    && !self.reopen.restarting()
                     && self.sidebar_watch.take_due(self.env.clock.now())
                 {
                     self.sync_sidebar();
@@ -1039,6 +1064,7 @@ impl Core {
                     sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
                         .then_some(Command::SyncSidebarNow),
                     note: self.sync_settings_note(),
+                    reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
                     ssh_sessions: Toggle {
                         on: !self.settings.leave_out_ssh_sessions,
                         command: Command::SetIncludeSshSessions(
@@ -1436,6 +1462,11 @@ impl Core {
     /// The Desktop bridge, with what it needs from the rest of the core.
     fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
         (&mut self.desktop, context!(self))
+    }
+
+    /// Reopen Claude, with what it needs from the rest of the core.
+    fn reopen(&mut self) -> (&mut Reopen, profiles::Context<'_>) {
+        (&mut self.reopen, context!(self))
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
