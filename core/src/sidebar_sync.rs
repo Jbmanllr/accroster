@@ -2,7 +2,9 @@
 //! every Profile folder under `claude-code-sessions/<account>/<org>/`.
 //!
 //! - **Where it writes.** Every existing Profile folder (signed in to
-//!   AccRoster or not: a folder is a Profile's sidebar). While Claude runs,
+//!   AccRoster or not: a folder is a Profile's sidebar), except another
+//!   account's folder in a signed-in Profile's personal Organization, an
+//!   account switch's leftover that is only read. While Claude runs,
 //!   a folder of the desktop's account only gains the entries it lacks:
 //!   Claude overwrites the entries it holds from memory, and its Active
 //!   Organization can't be read from disk, so no entry already in any
@@ -536,11 +538,15 @@ pub(crate) enum Begun {
 /// With `include_optional` ("Include SSH and No-folder Sessions", the
 /// default), SSH and No-folder Sessions are copied too; WSL and
 /// scheduled-task Sessions never are. `cache` holds the entries as of the
-/// last run; this one parses only those changed since.
+/// last run; this one parses only those changed since. `personal` maps each
+/// signed-in Profile's personal Organization to its account: a folder of
+/// another account in one is an account switch's leftover, read for its
+/// Sessions but never written into.
 pub(crate) fn begin(
     env: &Environment,
     paths: &AppPaths,
     include_optional: bool,
+    personal: &BTreeMap<String, String>,
     cache: &mut EntryCache,
 ) -> Begun {
     let desktop_paths = DesktopPaths::new(&env.home);
@@ -565,7 +571,14 @@ pub(crate) fn begin(
                 .is_some_and(|account| account.account_uuid == folder.account)
     };
 
-    let (writes, decided, held) = plan(&read, &record, active, &add_only);
+    let leftover = |folder: &Folder| {
+        let organization = folder.key.split('/').nth(1).unwrap_or_default();
+        personal
+            .get(organization)
+            .is_some_and(|owner| *owner != folder.account)
+    };
+
+    let (writes, decided, held) = plan(&read, &record, active, &add_only, &leftover);
 
     // The dormant multi-account mode: since the last run, with no account
     // switch, a folder sync may write changed although it belongs to an
@@ -798,6 +811,7 @@ fn plan(
     record: &Record,
     active: Option<usize>,
     add_only: &impl Fn(&Folder) -> bool,
+    leftover: &impl Fn(&Folder) -> bool,
 ) -> (Vec<Write>, BTreeMap<String, Groups>, usize) {
     let names: BTreeSet<&String> = read
         .folders
@@ -857,6 +871,9 @@ fn plan(
         };
         let transcript = source.entry.transcript.as_deref();
         for (index, folder) in read.folders.iter().enumerate() {
+            if leftover(folder) {
+                continue;
+            }
             let existing = folder.copies.get(name);
             if existing.is_none() && transcript.is_some_and(|id| folder.tombstones.contains(id)) {
                 continue;

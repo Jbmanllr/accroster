@@ -290,6 +290,8 @@ pub(crate) struct SidebarProfile {
     /// Its account is a signed-in Profile in AccRoster (in this or another
     /// Organization).
     pub signed_in: bool,
+    /// An account switch's leftover folder: never listed.
+    pub hidden: bool,
 }
 
 /// The Session index and the All Sessions window's state.
@@ -710,11 +712,13 @@ impl SessionIndex {
         }
     }
 
-    /// The Sidebars to list: `known` (each marked when not signed in), then
-    /// any other account/Organization folder holding an entry.
+    /// The Sidebars to list: `known` (each marked when not signed in, hidden
+    /// ones left out), then any other account/Organization folder holding an
+    /// entry.
     fn sidebar_profiles(&self, known: &[SidebarProfile]) -> Vec<(ProfileKey, String)> {
         let mut listed: Vec<(ProfileKey, String)> = known
             .iter()
+            .filter(|profile| !profile.hidden)
             .map(|profile| {
                 let name = if profile.signed_in {
                     profile.name.clone()
@@ -729,7 +733,8 @@ impl SessionIndex {
             .values()
             .filter_map(|(_, entry)| entry.as_ref())
         {
-            if !listed.iter().any(|(pair, _)| *pair == entry.pair) {
+            let hidden = known.iter().any(|p| p.hidden && p.pair == entry.pair);
+            if !hidden && !listed.iter().any(|(pair, _)| *pair == entry.pair) {
                 // A uuid appears only in hover detail.
                 let name = format!("Unknown Login {NOT_SIGNED_IN}");
                 listed.push((entry.pair.clone(), name));

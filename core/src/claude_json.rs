@@ -71,6 +71,12 @@ impl LoginNames {
             .join(" · ")
     }
 
+    /// The Organization is Claude's personal default (`<email>'s
+    /// Organization`), which only its owner can be in.
+    pub fn personal_organization(&self) -> bool {
+        !self.email.is_empty() && self.organization_name == format!("{}'s Organization", self.email)
+    }
+
     /// The Organization as people call it: its name when that tells, else
     /// the person's (`Ada Lovelace's Organization`) for the personal default.
     pub fn organization_label(&self) -> String {

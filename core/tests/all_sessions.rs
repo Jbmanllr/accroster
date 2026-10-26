@@ -82,6 +82,7 @@ const ACCOUNT_A: &str = "aaaaaaaa-1111-4111-8111-111111111111";
 const ORG_A: &str = "aaaaaaaa-2222-4222-8222-222222222222";
 const ACCOUNT_B: &str = "bbbbbbbb-1111-4111-8111-111111111111";
 const ORG_B: &str = "bbbbbbbb-2222-4222-8222-222222222222";
+const ORG_C: &str = "cccccccc-2222-4222-8222-222222222222";
 
 const S1: &str = "11111111-0000-4000-8000-000000000001";
 const S2: &str = "11111111-0000-4000-8000-000000000002";
@@ -873,7 +874,7 @@ fn search_narrows_the_filtered_list() {
 }
 
 #[test]
-fn a_profiles_sidebars_in_other_organizations_follow_it_named_by_organization() {
+fn a_profiles_sidebars_in_other_organizations_follow_it_and_leftovers_are_hidden() {
     let mac = FakeMac::new();
     let perso = FixtureLogin::perso();
     let ada = FixtureLogin::new(
@@ -883,11 +884,18 @@ fn a_profiles_sidebars_in_other_organizations_follow_it_named_by_organization() 
         "ada@example.com's Organization",
     )
     .named(Some("Ada Lovelace"), None);
-    mac.write_json(format!("{PROFILES}/p1/.claude.json"), &perso.claude_json());
-    mac.write_json(format!("{PROFILES}/p2/.claude.json"), &ada.claude_json());
+    let acme = FixtureLogin::new(ACCOUNT_B, ORG_B, "team@example.com", "Acme");
+    for (folder, login) in [("p1", &perso), ("p2", &ada), ("p3", &acme)] {
+        mac.write_json(
+            format!("{PROFILES}/{folder}/.claude.json"),
+            &login.claude_json(),
+        );
+    }
     transcript(&mac, S1, "app", 5, &[]);
-    // Perso is a member of Ada's Organization, and of one no Profile is in.
-    for org in [ORG_A, ORG_B] {
+    // Perso in Acme (a Team) and in an Organization no Profile is in; its
+    // folder in Ada's personal Organization is a leftover of an account
+    // switch: no one else can be in a personal Organization.
+    for org in [ORG_A, ORG_B, ORG_C] {
         mac.write_sidebar_entry(
             &perso.account_uuid,
             org,
@@ -912,9 +920,10 @@ fn a_profiles_sidebars_in_other_organizations_follow_it_named_by_organization() 
         names,
         [
             "me@example.com",
-            "↳ in Ada Lovelace's Organization",
+            "↳ in Acme",
             "↳ in another Organization",
             "Ada Lovelace · ada@example.com",
+            "team@example.com · Acme",
         ]
     );
 }
