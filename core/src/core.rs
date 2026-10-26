@@ -1,5 +1,6 @@
 //! [`Core`]: the one object the UI layer talks to.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -1208,6 +1209,7 @@ impl Core {
                 name: (self.settings.nicknames.get(&id).cloned())
                     .unwrap_or_else(|| profile.name.clone()),
                 signed_in: true,
+                hidden: false,
             });
             let others = discovered.iter().filter(|(evidence, _)| {
                 evidence.pair.account_uuid == profile.key.account_uuid
@@ -1224,6 +1226,7 @@ impl Core {
                     pair: evidence.pair.clone(),
                     name: format!("↳ in {organization}"),
                     signed_in: true,
+                    hidden: false,
                 });
             }
         }
@@ -1236,8 +1239,17 @@ impl Core {
                         &self.env.clock.time_zone(),
                     ),
                     signed_in: false,
+                    hidden: false,
                 });
             }
+        }
+        for evidence in self.discovered.iter().filter(|e| self.is_leftover(&e.pair)) {
+            sidebars.push(SidebarProfile {
+                pair: evidence.pair.clone(),
+                name: String::new(),
+                signed_in: false,
+                hidden: true,
+            });
         }
         sidebars
     }
@@ -1256,7 +1268,6 @@ impl Core {
         self.discovered = found;
     }
 
-    /// Discovered pairs without a signed-in Profile, with the user's choices.
     /// The Discovered rows (shown or hidden): [`Core::shown_discovered`]
     /// without the Sidebar folders of an account that has a signed-in
     /// Profile. Those are the same Login in another Organization, and Sidebar
@@ -1275,10 +1286,33 @@ impl Core {
             .collect()
     }
 
+    /// Each signed-in Profile's personal Organization, with the one account
+    /// that can be in it.
+    fn personal_organizations(&self) -> BTreeMap<String, String> {
+        self.profiles
+            .signed_in()
+            .into_iter()
+            .filter(|profile| profile.personal_organization)
+            .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
+            .collect()
+    }
+
+    /// Another account paired with a Profile's personal Organization: no one
+    /// else can be in that Organization, so its Sidebar folder is what an
+    /// account switch in the desktop app left behind.
+    fn is_leftover(&self, pair: &ProfileKey) -> bool {
+        self.personal_organizations()
+            .get(&pair.organization_uuid)
+            .is_some_and(|owner| *owner != pair.account_uuid)
+    }
+
+    /// Discovered pairs without a signed-in Profile, with the user's choices,
+    /// leftovers ([`Core::is_leftover`]) left out.
     fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
         self.discovered
             .iter()
             .filter(|evidence| !self.profiles.has_signed_in(&evidence.pair))
+            .filter(|evidence| !self.is_leftover(&evidence.pair))
             .map(|evidence| (evidence, self.choice(&evidence.pair)))
             .collect()
     }

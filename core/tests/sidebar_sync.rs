@@ -741,6 +741,35 @@ fn a_rename_or_an_archive_in_any_copy_carries_over_to_the_others() {
 }
 
 #[test]
+fn a_leftover_folder_in_another_profiles_personal_organization_is_read_but_never_written() {
+    let mac = FakeMac::new();
+    let work = accroster_fake_mac::FixtureLogin::new(
+        WORK.0,
+        WORK.1,
+        "work@example.com",
+        "work@example.com's Organization",
+    );
+    mac.write_json(format!("{PROFILES}/p2/.claude.json"), &work.claude_json());
+    // Perso's account paired with Work's personal Organization: a folder an
+    // account switch left behind, holding one Session nowhere else.
+    let leftover = (PERSO.0, WORK.1);
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    put(&mac, leftover, "s2", &entry("s2", "Two"));
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    sync(&mut core);
+
+    for profile in [PERSO, WORK] {
+        assert!(read(&mac, profile, "s1").is_some(), "{profile:?}");
+        assert!(read(&mac, profile, "s2").is_some(), "{profile:?}");
+    }
+    assert!(
+        read(&mac, leftover, "s1").is_none(),
+        "nothing is written there"
+    );
+}
+
+#[test]
 fn a_source_given_another_copys_title_keeps_all_its_own_account_bound_fields() {
     let mac = FakeMac::new();
     let mut ssh = entry("s1", "Old name");

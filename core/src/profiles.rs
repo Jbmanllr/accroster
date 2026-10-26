@@ -180,6 +180,8 @@ pub(crate) struct SignedInProfile {
     /// Its Organization as people call it (see
     /// [`LoginNames::organization_label`]); empty when unknown.
     pub organization_label: String,
+    /// Its Organization is its personal default: no other account is in it.
+    pub personal_organization: bool,
 }
 
 /// `state/profiles.json`.
@@ -1145,6 +1147,7 @@ impl ProfileRegistry {
                     key: identity.key.clone(),
                     name,
                     organization_label: identity.names.organization_label(),
+                    personal_organization: identity.names.personal_organization(),
                 })
             })
             .collect()
