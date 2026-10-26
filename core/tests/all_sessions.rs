@@ -742,6 +742,44 @@ fn a_session_in_a_worktree_counts_as_its_repositorys_project() {
 }
 
 #[test]
+fn sessions_in_claudes_own_folders_are_grouped_by_kind() {
+    let mac = FakeMac::new();
+    let claude = "/Users/tester/Library/Application Support/Claude";
+    let scratch = format!("{claude}/scratch-workspaces/{ACCOUNT_B}/{ORG_B}");
+    for (id, cwd, minutes) in [
+        (S1, format!("{scratch}/scratch-2026-10-15-ab12cd"), 5),
+        (S2, format!("{scratch}/scratch-2026-10-16-8161c4"), 6),
+        (
+            S3,
+            format!("{claude}/side-session-notes/local_7a41a97e-eb70-4129-b8b1-000000000000"),
+            7,
+        ),
+    ] {
+        let mut record = prompt(id, "question", &mac_time(minutes));
+        record["cwd"] = json!(cwd);
+        mac.write_transcript(&format!("project-{id}"), id, &[record]);
+    }
+    let mut core = mac.launch();
+    let rows = open(&mut core);
+
+    assert_eq!(row(&rows, S1).subtitle, "No folder · 5 min ago");
+    assert_eq!(row(&rows, S3).subtitle, "Side-session notes · 7 min ago");
+    let projects: Vec<(String, SessionFilter)> = core
+        .view()
+        .all_sessions
+        .sidebar
+        .into_iter()
+        .filter(|group| group.title.as_deref() == Some("Projects"))
+        .flat_map(|group| group.items)
+        .map(|item| (item.title, item.filter))
+        .collect();
+    let titles: Vec<&str> = projects.iter().map(|(title, _)| title.as_str()).collect();
+    assert_eq!(titles, ["No folder", "Side-session notes"]);
+    assert_eq!(filter(&mut core, projects[0].1.clone()), [S1, S2]);
+    assert_eq!(filter(&mut core, projects[1].1.clone()), [S3]);
+}
+
+#[test]
 fn a_session_leaves_all_sessions_only_when_every_entry_is_archived() {
     let mac = FakeMac::new();
     transcript(&mac, S1, "archived in A only", 5, &[]);
