@@ -14,8 +14,10 @@
 //! each file directly inside it; subfolders aren't copied.
 //!
 //! Each file keeps its last [`KEEP_LAST`] backups plus any younger than
-//! [`KEEP_YOUNGER_THAN`]; [`prune`] enforces that at launch. `.zshrc`
-//! backups are never pruned.
+//! [`KEEP_YOUNGER_THAN`]; [`prune`] enforces that at launch. A folder keeps
+//! only its last [`KEEP_LAST_FOLDERS`], whatever their age, pruned at launch
+//! and after each new folder backup: a Sidebar folder's copy can be hundreds
+//! of megabytes. `.zshrc` backups are never pruned.
 
 use std::fs;
 use std::io;
@@ -33,6 +35,9 @@ use crate::storage::{self, VersionedFile};
 pub(crate) const KEEP_LAST: usize = 5;
 /// Backups younger than this are kept whatever their number.
 pub(crate) const KEEP_YOUNGER_THAN: SignedDuration = SignedDuration::from_hours(30 * 24);
+/// How many backups of each folder are kept: the state before the last
+/// write, and one more in case that write is only noticed a sync later.
+pub(crate) const KEEP_LAST_FOLDERS: usize = 2;
 
 const STAMP_FORMAT: &str = "%Y%m%dT%H%M%S%.3fZ";
 const STAMP_PARSE_FORMAT: &str = "%Y%m%dT%H%M%S%.fZ";
@@ -100,6 +105,9 @@ pub(crate) fn back_up_folder(backups: &Path, folder: &Path, now: Timestamp) -> i
             fs::copy(entry.path(), copy.join(entry.file_name()))?;
         }
     }
+    if let Some(group) = copy.parent() {
+        prune_group(group, now)?;
+    }
     Ok(copy)
 }
 
@@ -112,23 +120,36 @@ pub(crate) fn prune(backups: &Path, now: Timestamp) -> io::Result<usize> {
         if !group.file_type()?.is_dir() || is_never_pruned(&group.file_name().to_string_lossy()) {
             continue;
         }
-        let mut copies: Vec<(Timestamp, PathBuf)> = fs::read_dir(group.path())?
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                let taken = taken_at(&path)?;
-                Some((taken, path))
-            })
-            .collect();
-        copies.sort_by_key(|a| std::cmp::Reverse(a.0));
-        for (taken, path) in copies.into_iter().skip(KEEP_LAST) {
-            if now.duration_since(taken) >= KEEP_YOUNGER_THAN {
-                if path.is_dir() {
-                    fs::remove_dir_all(path)?;
-                } else {
-                    fs::remove_file(path)?;
-                }
-                deleted += 1;
+        deleted += prune_group(&group.path(), now)?;
+    }
+    Ok(deleted)
+}
+
+/// Prunes one group by its keep rule: a folder's copies are folders.
+fn prune_group(group: &Path, now: Timestamp) -> io::Result<usize> {
+    let mut copies: Vec<(Timestamp, PathBuf)> = fs::read_dir(group)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let taken = taken_at(&path)?;
+            Some((taken, path))
+        })
+        .collect();
+    copies.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let of_folder = copies.first().is_some_and(|(_, path)| path.is_dir());
+    let keep = if of_folder {
+        KEEP_LAST_FOLDERS
+    } else {
+        KEEP_LAST
+    };
+    let mut deleted = 0;
+    for (taken, path) in copies.into_iter().skip(keep) {
+        if of_folder || now.duration_since(taken) >= KEEP_YOUNGER_THAN {
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
             }
+            deleted += 1;
         }
     }
     Ok(deleted)
