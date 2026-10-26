@@ -177,6 +177,8 @@ pub(crate) struct SignedInProfile {
     pub key: ProfileKey,
     /// Its Profile name (see [`names`]).
     pub name: String,
+    /// `organizationName`; empty when missing.
+    pub organization_name: String,
 }
 
 /// `state/profiles.json`.
@@ -1141,6 +1143,7 @@ impl ProfileRegistry {
                     id: profile.id.clone(),
                     key: identity.key.clone(),
                     name,
+                    organization_name: identity.names.organization_name.clone(),
                 })
             })
             .collect()

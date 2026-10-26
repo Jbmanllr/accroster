@@ -287,7 +287,8 @@ pub(crate) struct SidebarProfile {
     pub pair: ProfileKey,
     /// The nickname, else the Profile name, else "Unknown Login …".
     pub name: String,
-    /// It is a signed-in Profile in AccRoster.
+    /// Its account is a signed-in Profile in AccRoster (in this or another
+    /// Organization).
     pub signed_in: bool,
 }
 
