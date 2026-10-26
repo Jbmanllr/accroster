@@ -21,7 +21,7 @@ use crate::logging::{Field, Level};
 use crate::profiles::Context;
 use crate::runner::UsageRead;
 use crate::storage::{self, ReadError, VersionedFile};
-use crate::usage::{Limits, UsageReply};
+use crate::usage::{Limit, Limits, UsageReply};
 
 /// How often an Active Profile is read.
 const ACTIVE_CADENCE: SignedDuration = SignedDuration::from_mins(3);
@@ -417,7 +417,13 @@ impl LimitMonitor {
             if let Some(limits) = &reading.limits {
                 let tz = ctx.env.clock.time_zone();
                 let session = limits.session.as_ref();
-                view.bars.extend(limits.all().map(|(label, limit)| {
+                // A model's own limit at 0% says nothing until that model is
+                // used: Claude shows none then either.
+                let unused_model = |limit: &Limit| {
+                    limit.percent < 1.0 && limits.models.iter().any(|(_, m)| std::ptr::eq(m, limit))
+                };
+                let shown = limits.all().filter(|(_, limit)| !unused_model(limit));
+                view.bars.extend(shown.map(|(label, limit)| {
                     let reset = limit.resets_at.is_some_and(|at| at <= now);
                     let countdown = session.is_some_and(|session| std::ptr::eq(session, limit));
                     LimitBar {

@@ -257,6 +257,36 @@ fn a_reading_older_than_twice_its_cadence_is_dimmed_with_its_time() {
 }
 
 #[test]
+fn a_model_limit_is_shown_only_once_that_model_was_used() {
+    let reading = |fable: u32| {
+        serde_json::json!({
+            "limits": [
+                { "kind": "session", "percent": 78 },
+                { "kind": "weekly_all", "percent": 51 },
+                { "kind": "weekly_scoped", "percent": fable,
+                  "scope": { "model": { "display_name": "Fable" } } },
+            ],
+        })
+    };
+    let mac = mac_signing_in_as(&work(), reading(0));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    assert_eq!(
+        ignoring_reset_times(&rows(&core)[0].limits),
+        [bar("Session", 78), bar("Weekly", 51)],
+        "as Claude shows it: an unused model's limit says nothing"
+    );
+
+    let mac = mac_signing_in_as(&work(), reading(3));
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    assert_eq!(
+        ignoring_reset_times(&rows(&core)[0].limits),
+        [bar("Session", 78), bar("Weekly", 51), bar("Fable", 3)]
+    );
+}
+
+#[test]
 fn an_active_profiles_reading_is_stale_after_6_minutes() {
     let mac = mac_signing_in_as(&work(), limits_body());
     let mut core = mac.launch();
