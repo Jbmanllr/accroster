@@ -303,6 +303,41 @@ fn every_profile_gets_every_session_and_a_second_sync_has_nothing_to_do() {
 }
 
 #[test]
+fn a_sync_reads_again_only_the_entries_changed_since_the_last_run() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    put(&mac, WORK, "s2", &entry("s2", "Two"));
+    empty_folder(&mac, PERSO_TEAM);
+    let mut core = manual(&mac);
+
+    sync(&mut core);
+    sync(&mut core);
+    put(&mac, WORK, "s2", &entry("s2", "Renamed"));
+    sync(&mut core);
+
+    let log = mac
+        .read_file(format!("{APP_FOLDER}/logs/app.log"))
+        .unwrap_or_default();
+    let parsed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("sidebar synced "))
+        .filter_map(|line| line.split_whitespace().find(|f| f.starts_with("parsed=")))
+        .collect();
+    assert_eq!(
+        parsed,
+        ["parsed=2", "parsed=0", "parsed=1"],
+        "its own copies aren't read again either: {log}"
+    );
+    for profile in [PERSO, WORK, PERSO_TEAM] {
+        assert_eq!(
+            read(&mac, profile, "s2").unwrap()["title"],
+            "Renamed",
+            "{profile:?}"
+        );
+    }
+}
+
+#[test]
 fn ssh_and_no_folder_sessions_are_included_by_default_and_can_be_left_out() {
     let mac = FakeMac::new();
     let mut ssh = entry("ssh", "On the VPS");

@@ -31,21 +31,27 @@
 //!   a Safety pause. Unknown top-level fields don't: they are copied as they
 //!   are. Then each target folder is backed up, each exact file is read
 //!   again, and each copy is written as temp file then rename.
+//! - **Reading** ([`EntryCache`]): a run plans from a slim summary of each
+//!   entry, and parses only the files changed since the last run read or
+//!   wrote them. A copy's source is read in full only when the copy is
+//!   written, and only while it is still the file planned from.
 //! - **Watching** ([`Watch`]): while sync is on, the UI watches
 //!   `claude-code-sessions/`. Automatic mode runs a few seconds after the
 //!   last change to the desktop's Active Profile folder. An entry Claude
 //!   writes in any other folder while it runs, more than 30 s after the last
 //!   account switch, is the other trace of the dormant multi-account mode.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
-use std::io;
+use std::io::{self, Read as _};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use jiff::{SignedDuration, Timestamp};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::backups;
@@ -118,6 +124,11 @@ impl LeftOut {
         }
     }
 
+    /// Left out even with "Include SSH and No-folder Sessions" on.
+    fn always(self) -> bool {
+        matches!(self, LeftOut::Wsl | LeftOut::ScheduledTask)
+    }
+
     /// Its log field.
     pub(crate) fn log_key(self) -> &'static str {
         match self {
@@ -160,6 +171,8 @@ pub(crate) struct Report {
     /// Sessions never copied, by why (each counted once, whatever the
     /// number of sidebars holding it).
     pub left_out: BTreeMap<LeftOut, usize>,
+    /// Entries read and parsed: those new or changed since the last run.
+    pub parsed: usize,
 }
 
 /// `state/sidebar-sync.json`: sync's record as of its last run. Hashes only
@@ -211,22 +224,97 @@ struct Folder {
     key: String,
     path: PathBuf,
     /// Readable entries by file name.
-    copies: BTreeMap<String, Entry>,
+    copies: BTreeMap<String, Arc<Entry>>,
     /// Transcript ids of `deleted_<id>` tombstones.
     tombstones: BTreeSet<String>,
 }
 
+/// What sync holds of an entry: enough to plan every write without its
+/// body, which is read again only for the copies made from it.
 struct Entry {
-    /// [`fingerprint`] of the file as read: it is replaced only while it
-    /// still matches.
+    /// [`fingerprint`] of the file as read: it is replaced, or copied from,
+    /// only while it still matches.
     fingerprint: u64,
-    /// The body with its account-bound fields cleared ([`clear`]), so the
-    /// big ones (`remoteMcpServersConfig`) aren't held for every entry. A
-    /// write back into the entry's own folder takes them from the file again.
-    body: Map<String, Value>,
-    /// Sync's record of the file as read, account-bound fields included.
+    /// Sync's record of the file, account-bound fields included.
     record: CopyRecord,
+    /// `lastActivityAt`, which picks the copy every other field comes from.
+    last_activity: Option<i64>,
+    /// `cliSessionId`: the Transcript a tombstone names.
+    transcript: Option<String>,
+    /// The title fields and the archive state, as they are.
+    title: Map<String, Value>,
+    archive: Map<String, Value>,
+    /// [`rest_hash`] of the other fields.
+    rest: u64,
+    /// Why sync leaves it out while SSH and No-folder Sessions are left out.
+    left_out: Option<LeftOut>,
     modified: SystemTime,
+}
+
+impl Entry {
+    fn new(bytes: &[u8], body: &Map<String, Value>, modified: SystemTime) -> Entry {
+        Entry {
+            fingerprint: fingerprint(bytes),
+            record: copy_record(body),
+            last_activity: body.get("lastActivityAt").and_then(Value::as_i64),
+            transcript: body
+                .get("cliSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            title: pick(body, &TITLE_FIELDS),
+            archive: pick(body, &ARCHIVE_FIELDS),
+            rest: rest_hash(body),
+            left_out: left_out(body),
+            modified,
+        }
+    }
+}
+
+/// Every entry as sync last read or wrote it, by path, with the file's
+/// [`Stamp`] then; `None` for a file that isn't an entry sync copies. A
+/// run parses only the files whose stamp changed, so the steady state costs
+/// a `stat` per entry.
+#[derive(Default)]
+pub(crate) struct EntryCache(HashMap<PathBuf, (Stamp, Option<Arc<Entry>>)>);
+
+impl std::fmt::Debug for EntryCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "EntryCache({} files)", self.0.len())
+    }
+}
+
+impl EntryCache {
+    /// The body of the entry at `path`, if the file is still the one sync
+    /// last read or wrote there (else the next run sees what changed).
+    fn read_again(&self, path: &Path) -> Option<Map<String, Value>> {
+        let expected = self.0.get(path)?.1.as_ref()?.fingerprint;
+        let bytes = fs::read(path).ok()?;
+        (fingerprint(&bytes) == expected)
+            .then(|| parse_body(&bytes))
+            .flatten()
+    }
+}
+
+/// A file as `stat` sees it. Claude and sync replace an entry by renaming
+/// a new file over it, which changes the inode; the change time also
+/// catches an edit in place whose modification time was put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    inode: u64,
+    len: u64,
+    modified: SystemTime,
+    changed: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Option<Stamp> {
+        Some(Stamp {
+            inode: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
 }
 
 /// Everything under `claude-code-sessions/`, plus what the checks found.
@@ -234,6 +322,8 @@ struct Read {
     folders: Vec<Folder>,
     /// File names of entries sync never copies, with why.
     skipped: BTreeMap<String, LeftOut>,
+    /// Entries parsed, because they were new or changed.
+    parsed: usize,
 }
 
 /// How long the desktop's folder stays quiet before Automatic mode syncs.
@@ -393,7 +483,11 @@ fn read_body(path: &Path) -> Option<Map<String, Value>> {
     if !meta.is_file() || meta.len() > MAX_ENTRY_BYTES {
         return None;
     }
-    match serde_json::from_slice(&fs::read(path).ok()?).ok()? {
+    parse_body(&fs::read(path).ok()?)
+}
+
+fn parse_body(bytes: &[u8]) -> Option<Map<String, Value>> {
+    match serde_json::from_slice(bytes).ok()? {
         Value::Object(body) => Some(body),
         _ => None,
     }
@@ -441,15 +535,21 @@ pub(crate) enum Begun {
 /// "Sync now": reads every sidebar, checks it and plans every write.
 /// With `include_optional` ("Include SSH and No-folder Sessions", the
 /// default), SSH and No-folder Sessions are copied too; WSL and
-/// scheduled-task Sessions never are.
-pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_optional: bool) -> Begun {
+/// scheduled-task Sessions never are. `cache` holds the entries as of the
+/// last run; this one parses only those changed since.
+pub(crate) fn begin(
+    env: &Environment,
+    paths: &AppPaths,
+    include_optional: bool,
+    cache: &mut EntryCache,
+) -> Begun {
     let desktop_paths = DesktopPaths::new(&env.home);
     let desktop = desktop::desktop_account(&desktop_paths);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
         return Begun::Ended(Run::DesktopAccountUnknown);
     }
-    let read = read_all(&env.home, include_optional);
+    let read = read_all(&env.home, include_optional, cache);
     let record = load(paths);
     let active_key = active_key(&desktop_paths);
     let active = read
@@ -500,6 +600,7 @@ pub(crate) fn begin(env: &Environment, paths: &AppPaths, include_optional: bool)
     let report = Report {
         held_for_desktop: held,
         left_out: read.left_out(),
+        parsed: read.parsed,
         ..Report::default()
     };
     let mut sync = SyncRun {
@@ -525,8 +626,14 @@ impl SyncRun {
         (self.total - self.pending.len(), self.total)
     }
 
-    /// Writes the next sidebar; `Some` once the run ended.
-    pub(crate) fn step(&mut self, env: &Environment, paths: &AppPaths) -> Option<Run> {
+    /// Writes the next sidebar, noting each copy in `cache`; `Some` once the
+    /// run ended.
+    pub(crate) fn step(
+        &mut self,
+        env: &Environment,
+        paths: &AppPaths,
+        cache: &mut EntryCache,
+    ) -> Option<Run> {
         let Some((index, folder_writes)) = self.pending.pop_front() else {
             return Some(self.finish(paths));
         };
@@ -537,7 +644,7 @@ impl SyncRun {
         }
         let mut copies = copy_records(folder);
         let mut wrote_any = false;
-        for mut write in folder_writes {
+        for write in folder_writes {
             let file = folder.path.join(&write.name);
             // The exact file, read again right before it's replaced.
             let now_there = match fs::read(&file) {
@@ -561,15 +668,25 @@ impl SyncRun {
                 }
                 return Some(Run::FoldersChanged(1));
             }
-            if write.own_folder {
-                // The file just checked is the one the body was read from.
-                let Some(Ok(Value::Object(own))) = now_there.as_deref().map(serde_json::from_slice)
-                else {
-                    continue;
-                };
-                restore_bindings(&mut write.body, &own);
-            }
-            let Ok(bytes) = serde_json::to_vec(&write.body) else {
+            let body = if write.own_folder {
+                // The file just checked is the source: it keeps its own
+                // account-bound fields.
+                now_there.as_deref().and_then(parse_body)
+            } else {
+                let source = &self.read.folders[write.source];
+                cache
+                    .read_again(&source.path.join(&write.name))
+                    .map(|mut body| {
+                        clear(&mut body);
+                        body
+                    })
+            };
+            let Some(mut body) = body else {
+                continue;
+            };
+            take_fields(&mut body, &write.title, &TITLE_FIELDS);
+            take_fields(&mut body, &write.archive, &ARCHIVE_FIELDS);
+            let Ok(bytes) = serde_json::to_vec(&body) else {
                 continue;
             };
             let written = if write.add_only {
@@ -578,13 +695,11 @@ impl SyncRun {
                 storage::write_atomically(&file, &bytes)
             };
             if written.is_ok() {
-                // A copy is never newer than what it was made from, so the
-                // folder Claude wrote last still tells its Active Profile.
-                let _ = fs::File::options()
-                    .write(true)
-                    .open(&file)
-                    .and_then(|copy| copy.set_modified(write.modified));
-                copies.insert(write.name.clone(), copy_record(&write.body));
+                if let Some(stamp) = date_copy(&file, &bytes, write.modified) {
+                    let entry = Entry::new(&bytes, &body, stamp.modified);
+                    cache.0.insert(file, (stamp, Some(Arc::new(entry))));
+                }
+                copies.insert(write.name.clone(), copy_record(&body));
                 self.report.written += 1;
                 if write.add_only {
                     self.report.added_to_desktop += 1;
@@ -627,11 +742,26 @@ impl SyncRun {
     }
 }
 
+/// A copy is never newer than what it was made from, so the folder Claude
+/// wrote last still tells its Active Profile: dates the copy just written to
+/// `file` as `modified`, and returns its stamp. `None` when the file there
+/// is no longer the one sync wrote.
+fn date_copy(file: &Path, bytes: &[u8], modified: SystemTime) -> Option<Stamp> {
+    let mut copy = fs::File::options().read(true).write(true).open(file).ok()?;
+    let mut now_there = Vec::with_capacity(bytes.len());
+    copy.read_to_end(&mut now_there).ok()?;
+    if now_there != bytes {
+        return None;
+    }
+    let _ = copy.set_modified(modified);
+    Stamp::of(&copy.metadata().ok()?)
+}
+
 /// Resuming after a Safety pause: the user accepts the folders as they are
 /// now, so the next run compares against them.
-pub(crate) fn accept_current(env: &Environment, paths: &AppPaths) {
+pub(crate) fn accept_current(env: &Environment, paths: &AppPaths, cache: &mut EntryCache) {
     let desktop_paths = DesktopPaths::new(&env.home);
-    let read = read_all(&env.home, false);
+    let read = read_all(&env.home, false, cache);
     let mut record = load(paths);
     record.folders = read
         .folders
@@ -647,13 +777,17 @@ pub(crate) fn accept_current(env: &Environment, paths: &AppPaths) {
 struct Write {
     folder: usize,
     name: String,
-    body: Map<String, Value>,
+    /// The folder of the copy every field but the title and archive state
+    /// comes from.
+    source: usize,
+    /// The title fields and archive state it gets.
+    title: Map<String, Value>,
+    archive: Map<String, Value>,
     /// The newest modification time among the copies it was made from.
     modified: SystemTime,
     /// Into a folder Claude may be using: only if no file has the name.
     add_only: bool,
-    /// Into the folder `body` came from, which keeps its own account-bound
-    /// fields.
+    /// Into the source's folder, which keeps its own account-bound fields.
     own_folder: bool,
 }
 
@@ -684,7 +818,7 @@ fn plan(
                 let recorded = record.folders.get(&folder.key).and_then(|f| f.get(name));
                 Some(Copy {
                     folder: index,
-                    entry,
+                    entry: entry.as_ref(),
                     recorded,
                 })
             })
@@ -694,35 +828,40 @@ fn plan(
             .iter()
             .max_by_key(|copy| {
                 (
-                    copy.entry
-                        .body
-                        .get("lastActivityAt")
-                        .and_then(Value::as_i64),
+                    copy.entry.last_activity,
                     Some(copy.folder) == active,
                     copy.entry.modified,
                 )
             })
             .expect("a Session has a copy");
-        let title = winner(&copies, &TITLE_FIELDS, active, |g| &g.title, agreed);
-        let archive = winner(&copies, &ARCHIVE_FIELDS, active, |g| &g.archive, agreed);
+        let title = winner(&copies, active, |g| &g.title, agreed);
+        let archive = winner(&copies, active, |g| &g.archive, agreed);
         let modified = [source, title, archive]
             .iter()
             .map(|copy| copy.entry.modified)
             .max()
             .expect("three copies");
-        let mut body = source.entry.body.clone();
-        take_fields(&mut body, &title.entry.body, &TITLE_FIELDS);
-        take_fields(&mut body, &archive.entry.body, &ARCHIVE_FIELDS);
-        decided.insert(name.clone(), groups(&body));
-        let transcript = body.get("cliSessionId").and_then(Value::as_str);
+        decided.insert(
+            name.clone(),
+            Groups {
+                title: title.entry.record.groups.title.clone(),
+                archive: archive.entry.record.groups.archive.clone(),
+            },
+        );
+        // The account-bound fields alone differing (the desktop app rebuilds
+        // them in a copy once it's used) leave a copy as it is.
+        let holds = |entry: &Entry| {
+            entry.rest == source.entry.rest
+                && entry.title == title.entry.title
+                && entry.archive == archive.entry.archive
+        };
+        let transcript = source.entry.transcript.as_deref();
         for (index, folder) in read.folders.iter().enumerate() {
             let existing = folder.copies.get(name);
             if existing.is_none() && transcript.is_some_and(|id| folder.tombstones.contains(id)) {
                 continue;
             }
-            // Bodies are held cleared: a copy's account-bound fields stay
-            // cleared, the source folder's are restored as it is written.
-            if existing.is_some_and(|entry| same_but_cleared(&entry.body, &body)) {
+            if existing.is_some_and(|entry| holds(entry)) {
                 continue;
             }
             let add_only = add_only(folder);
@@ -733,7 +872,9 @@ fn plan(
             writes.push(Write {
                 folder: index,
                 name: name.clone(),
-                body: body.clone(),
+                source: source.folder,
+                title: title.entry.title.clone(),
+                archive: archive.entry.archive.clone(),
                 modified,
                 add_only,
                 own_folder: index == source.folder,
@@ -754,15 +895,15 @@ struct Copy<'a> {
 /// did, the one holding what sync decided last time, else the same order.
 fn winner<'a, 'b>(
     copies: &'b [Copy<'a>],
-    fields: &[&str],
     active: Option<usize>,
     group: impl Fn(&Groups) -> &String,
     agreed: Option<&Groups>,
 ) -> &'b Copy<'a> {
-    let value = |copy: &Copy<'_>| hash(&pick(&copy.entry.body, fields));
     let changed: Vec<&Copy<'a>> = copies
         .iter()
-        .filter(|copy| copy.recorded.map(|r| group(&r.groups)) != Some(&value(copy)))
+        .filter(|copy| {
+            copy.recorded.map(|r| group(&r.groups)) != Some(group(&copy.entry.record.groups))
+        })
         .collect();
     let preferred = |among: Vec<&'b Copy<'a>>| {
         among
@@ -773,7 +914,11 @@ fn winner<'a, 'b>(
     };
     match changed.len() {
         0 => agreed
-            .and_then(|agreed| copies.iter().find(|copy| value(copy) == *group(agreed)))
+            .and_then(|agreed| {
+                copies
+                    .iter()
+                    .find(|copy| group(&copy.entry.record.groups) == group(agreed))
+            })
             .or_else(|| preferred(copies.iter().collect())),
         1 => Some(changed[0]),
         _ => preferred(changed),
@@ -815,26 +960,27 @@ fn clear(body: &mut Map<String, Value>) {
     }
 }
 
-/// Puts back the account-bound fields [`clear`] emptied or dropped, as they
-/// are in `own`, the file `body` came from.
-fn restore_bindings(body: &mut Map<String, Value>, own: &Map<String, Value>) {
-    for field in CLEARED.iter().chain(&DROPPED) {
-        match own.get(*field) {
-            Some(value) => body.insert((*field).to_owned(), value.clone()),
-            None => body.remove(*field),
-        };
+/// A hash of every field but the title, the archive state and the
+/// account-bound ones: with the title and archive state, it tells whether a
+/// copy already holds the entry sync decided on.
+fn rest_hash(body: &Map<String, Value>) -> u64 {
+    struct Rest<'a>(&'a Map<String, Value>);
+    impl Serialize for Rest<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let rest = |key: &String| {
+                !CLEARED
+                    .iter()
+                    .chain(&DROPPED)
+                    .chain(&TITLE_FIELDS)
+                    .chain(&ARCHIVE_FIELDS)
+                    .any(|field| key == field)
+            };
+            serializer.collect_map(self.0.iter().filter(|(key, _)| rest(key)))
+        }
     }
-}
-
-/// Equal apart from the cleared fields, which the desktop app rebuilds in a
-/// copy once it's used: those differences alone are left as they are.
-fn same_but_cleared(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
-    // Maps iterate in key order, so equal maps yield equal sequences.
-    fn unbound(body: &Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
-        body.iter()
-            .filter(|(key, _)| !CLEARED.iter().chain(&DROPPED).any(|field| field == key))
-    }
-    unbound(a).eq(unbound(b))
+    let mut hasher = StdHash(DefaultHasher::new());
+    serde_json::to_writer(&mut hasher, &Rest(body)).expect("a JSON map always serializes");
+    hasher.0.finish()
 }
 
 fn groups(body: &Map<String, Value>) -> Groups {
@@ -875,6 +1021,20 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Feeds what is written to the standard hasher, for hashes never stored.
+struct StdHash(DefaultHasher);
+
+impl io::Write for StdHash {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Fnv(u64);
 
 impl Default for Fnv {
@@ -897,13 +1057,17 @@ impl io::Write for Fnv {
     }
 }
 
-/// Reads every `<account>/<org>/` folder (real folders with uuid names).
-fn read_all(home: &Path, include_optional: bool) -> Read {
+/// Reads every `<account>/<org>/` folder (real folders with uuid names),
+/// parsing only the entries changed since `cache`, which then holds every
+/// entry as read now.
+fn read_all(home: &Path, include_optional: bool, cache: &mut EntryCache) -> Read {
     let root = sidebar_root(home);
     let mut read = Read {
         folders: Vec::new(),
         skipped: BTreeMap::new(),
+        parsed: 0,
     };
+    let mut before = std::mem::take(&mut cache.0);
     for (account, account_path) in uuid_folders(&root) {
         for (org, path) in uuid_folders(&account_path) {
             let mut folder = Folder {
@@ -913,14 +1077,20 @@ fn read_all(home: &Path, include_optional: bool) -> Read {
                 copies: BTreeMap::new(),
                 tombstones: BTreeSet::new(),
             };
-            read_folder(&mut folder, &mut read, include_optional);
+            read_folder(&mut folder, &mut read, include_optional, &mut before, cache);
             read.folders.push(folder);
         }
     }
     read
 }
 
-fn read_folder(folder: &mut Folder, read: &mut Read, include_optional: bool) {
+fn read_folder(
+    folder: &mut Folder,
+    read: &mut Read,
+    include_optional: bool,
+    before: &mut HashMap<PathBuf, (Stamp, Option<Arc<Entry>>)>,
+    cache: &mut EntryCache,
+) {
     let Ok(entries) = fs::read_dir(&folder.path) else {
         return;
     };
@@ -942,41 +1112,43 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_optional: bool) {
         if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path()) else {
+        let Some(stamp) = Stamp::of(&meta) else {
             continue;
         };
-        let Ok(Value::Object(mut body)) = serde_json::from_slice(&bytes) else {
+        let path = entry.path();
+        let summary = match before.remove(&path) {
+            Some((seen, summary)) if seen == stamp => summary,
+            _ => {
+                let Ok(bytes) = fs::read(&path) else {
+                    continue;
+                };
+                read.parsed += 1;
+                parse_body(&bytes)
+                    // A copy under another name would be a second entry in Claude.
+                    .filter(|body| body.get("sessionId").and_then(Value::as_str) == Some(stem))
+                    .map(|body| Arc::new(Entry::new(&bytes, &body, stamp.modified)))
+            }
+        };
+        cache.0.insert(path, (stamp, summary.clone()));
+        let Some(summary) = summary else {
             continue;
         };
-        // A copy under another name would be a second entry in Claude.
-        if body.get("sessionId").and_then(Value::as_str) != Some(stem) {
-            continue;
-        }
-        if let Some(why) = left_out(&body, include_optional) {
+        if let Some(why) = summary
+            .left_out
+            .filter(|why| !include_optional || why.always())
+        {
             read.skipped.insert(name.clone(), why);
         }
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        let record = copy_record(&body);
-        clear(&mut body);
-        folder.copies.insert(
-            name,
-            Entry {
-                fingerprint: fingerprint(&bytes),
-                body,
-                record,
-                modified,
-            },
-        );
+        folder.copies.insert(name, summary);
     }
 }
 
 /// Why sync doesn't copy this entry, if it doesn't: WSL and scheduled-task
-/// Sessions, and SSH and No-folder ones unless `include_optional`. A
-/// No-folder Session's copy keeps pointing at its scratch workspace
+/// Sessions, and SSH and No-folder ones unless "Include SSH and No-folder
+/// Sessions" is on ([`LeftOut::always`]). A No-folder Session's copy keeps
+/// pointing at its scratch workspace
 /// (`scratch-workspaces/<account>/<org>/<id>`), which stays where it is.
-fn left_out(body: &Map<String, Value>, include_optional: bool) -> Option<LeftOut> {
+fn left_out(body: &Map<String, Value>) -> Option<LeftOut> {
     let has = |markers: &[&str]| {
         markers
             .iter()
@@ -991,8 +1163,6 @@ fn left_out(body: &Map<String, Value>, include_optional: bool) -> Option<LeftOut
         Some(LeftOut::Wsl)
     } else if has(&SCHEDULED_MARKERS) {
         Some(LeftOut::ScheduledTask)
-    } else if include_optional {
-        None
     } else if has(&SSH_MARKERS) {
         Some(LeftOut::Ssh)
     } else if scratch("cwd") || scratch("originCwd") {
