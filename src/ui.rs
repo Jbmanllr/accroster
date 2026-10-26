@@ -595,12 +595,23 @@ impl Ui {
             }
             button.setAppearsDisabled(view.menu_bar.dimmed);
         }
+        // Building the menu's rows takes tens of milliseconds on the main
+        // thread, and most updates (ticks) leave the menu as it is.
         if self.ivars().menu_open.get() {
-            if !self.update_open_menu(&view.menu.items) {
-                *self.ivars().pending_menu.borrow_mut() = Some(view.menu.items.clone());
-            }
+            let pending = if self.update_open_menu(&view.menu.items) {
+                None
+            } else {
+                Some(view.menu.items.clone())
+            };
+            *self.ivars().pending_menu.borrow_mut() = pending;
         } else {
-            self.set_menu(&view.menu.items);
+            // A menu left waiting from while it was open is older than this.
+            self.ivars().pending_menu.borrow_mut().take();
+            if *self.ivars().shown_menu.borrow() != view.menu.items
+                || self.ivars().status_item.menu(mtm).is_none()
+            {
+                self.set_menu(&view.menu.items);
+            }
         }
         *self.ivars().hidden.borrow_mut() = view
             .settings
@@ -641,6 +652,9 @@ impl Ui {
             return false;
         };
         let shown = self.ivars().shown_menu.borrow().clone();
+        if shown == items {
+            return true;
+        }
         if shown.len() != items.len() || menu.numberOfItems() as usize != items.len() {
             return false;
         }

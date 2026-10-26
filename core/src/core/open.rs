@@ -32,7 +32,7 @@ impl Core {
             })
             .collect();
         let desktop = self.env.os.desktop_app_version().map(|_| {
-            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+            let account = self.desktop_account();
             let pair = account
                 .as_ref()
                 .and_then(|account| match account.profile(&signed_in) {
@@ -74,7 +74,7 @@ impl Core {
             .cli_pointer()
             .filter(|pointer| folders.iter().any(|(_, dir)| *dir == pointer.as_path()));
         let desktop = || {
-            let account = desktop::desktop_account(&DesktopPaths::new(&self.env.home))?;
+            let account = self.desktop_account()?;
             let profile = account.profile(&self.profiles.signed_in())?.id.clone();
             let (_, dir) = folders.iter().find(|(id, _)| *id == profile)?;
             Some(dir.to_path_buf())

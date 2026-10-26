@@ -11,7 +11,7 @@ use crate::backups;
 use crate::checks;
 use crate::claude_code::{self, ClaudeLocator};
 use crate::cli_switcher;
-use crate::desktop::{self, DesktopBridge, DesktopPaths, Target};
+use crate::desktop::{DesktopAccount, DesktopBridge, DesktopPaths, NewestEntries, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
@@ -96,6 +96,8 @@ pub struct Core {
     claude: ClaudeLocator,
     /// Discovered pairs as of the last scan (launch, menu open).
     discovered: Vec<Evidence>,
+    /// What the last scan read, so the next reads only what changed.
+    discovery: discovered::Scanner,
     /// The All Sessions list and the Session index behind it.
     sessions: SessionIndex,
     /// Format check results and Safety pauses.
@@ -123,6 +125,9 @@ pub struct Core {
     uninstall_note: Option<String>,
     /// The app's folder is gone: nothing is read, written or started again.
     uninstalled: bool,
+    /// What finding the desktop's Organization last read: the menu and
+    /// [`Core::watched`] ask for it several times per input.
+    newest_entries: NewestEntries,
 }
 
 /// What the registry, the monitor and the bridge need from the core, as
@@ -204,6 +209,7 @@ impl Core {
             desktop: DesktopBridge::default(),
             claude: ClaudeLocator::default(),
             discovered: Vec::new(),
+            discovery: discovered::Scanner::default(),
             safety: Safety::load(&paths_for_safety),
             versions: ClaudeVersions::default(),
             links: Vec::new(),
@@ -217,6 +223,7 @@ impl Core {
             uninstalling: None,
             uninstall_note: None,
             uninstalled: false,
+            newest_entries: NewestEntries::default(),
         };
         core.log(
             Level::Info,
@@ -798,19 +805,24 @@ impl Core {
     /// client's Active Profile: the CLI's (its pointer) or the desktop app's.
     fn watched(&self) -> Vec<Watched> {
         let cli_active = cli_switcher::pointer(&self.paths);
-        let desktop_active =
-            desktop::desktop_account(&DesktopPaths::new(&self.env.home)).and_then(|account| {
-                let signed_in = self.profiles.signed_in();
-                account
-                    .profile(&signed_in)
-                    .map(|profile| profile.id.clone())
-            });
+        let desktop_active = self.desktop_account().and_then(|account| {
+            let signed_in = self.profiles.signed_in();
+            account
+                .profile(&signed_in)
+                .map(|profile| profile.id.clone())
+        });
         let mut watched = self.profiles.watched(|id, config_dir| {
             cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
         });
         // Two Claude Code runs never share a folder.
         watched.retain(|w| !self.openings.queued().any(|(dir, _)| dir == w.config_dir));
         watched
+    }
+
+    /// The desktop's account and Organization.
+    fn desktop_account(&self) -> Option<DesktopAccount> {
+        self.newest_entries
+            .desktop_account(&DesktopPaths::new(&self.env.home))
     }
 
     /// Everything the UI shows right now.
@@ -863,7 +875,7 @@ impl Core {
             items.push(MenuItem::Separator);
         }
         let signed_in = self.profiles.signed_in();
-        let desktop_account = desktop::desktop_account(&DesktopPaths::new(&self.env.home));
+        let desktop_account = self.desktop_account();
         let desktop_profile = desktop_account
             .as_ref()
             .and_then(|account| account.profile(&signed_in));
@@ -940,7 +952,7 @@ impl Core {
                 });
             }
         }
-        let shown = self.shown_discovered();
+        let shown = self.discovered_rows();
         let tz = self.env.clock.time_zone();
         let discovered_rows = shown
             .iter()
@@ -1183,7 +1195,7 @@ impl Core {
     /// Re-reads the Mac's evidence of Discovered Profiles. New pairs simply
     /// appear and emptied ones disappear.
     fn rescan_discovered(&mut self) {
-        let found = discovered::scan(&self.env.home);
+        let found = self.discovery.scan(&self.env.home);
         if found.len() != self.discovered.len() {
             self.log(
                 Level::Debug,
@@ -1195,6 +1207,24 @@ impl Core {
     }
 
     /// Discovered pairs without a signed-in Profile, with the user's choices.
+    /// The Discovered rows (shown or hidden): [`Core::shown_discovered`]
+    /// without the Sidebar folders of an account that has a signed-in
+    /// Profile. Those are the same Login in another Organization, and Sidebar
+    /// sync copies entries into them, so they look active. Today's
+    /// `~/.claude.json` login stays unless its exact pair is signed in.
+    fn discovered_rows(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
+        let signed_in = self.profiles.signed_in();
+        self.shown_discovered()
+            .into_iter()
+            .filter(|(evidence, _)| {
+                evidence.default_login().is_some()
+                    || !signed_in
+                        .iter()
+                        .any(|profile| profile.key.account_uuid == evidence.pair.account_uuid)
+            })
+            .collect()
+    }
+
     fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
         self.discovered
             .iter()

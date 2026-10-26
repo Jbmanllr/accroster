@@ -302,7 +302,8 @@ impl FakeMac {
     }
 
     /// A desktop Sidebar entry: `~/Library/Application Support/Claude/
-    /// claude-code-sessions/<account>/<org>/local_<id>.json`.
+    /// claude-code-sessions/<account>/<org>/local_<id>.json`, written the
+    /// way Claude writes it: temp file, then rename (so its folder changes).
     pub fn write_sidebar_entry(
         &self,
         account: &str,
@@ -310,10 +311,12 @@ impl FakeMac {
         local_id: &str,
         entry: &Value,
     ) -> PathBuf {
-        self.write_json(
-            format!("Library/Application Support/Claude/claude-code-sessions/{account}/{org}/local_{local_id}.json"),
-            entry,
-        )
+        let folder =
+            format!("Library/Application Support/Claude/claude-code-sessions/{account}/{org}");
+        let temp = self.write_json(format!("{folder}/.local_{local_id}.json.tmp"), entry);
+        let path = self.path(format!("{folder}/local_{local_id}.json"));
+        fs::rename(temp, &path).expect("rename fixture entry");
+        path
     }
 
     /// A live-process file `<config_dir>/sessions/<pid>.json`, where

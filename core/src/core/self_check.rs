@@ -279,6 +279,7 @@ impl Core {
             // The user accepts the sidebars as they are now.
             sidebar_sync::accept_current(&self.env, &self.paths);
             self.sync_note = None;
+            self.sync_result = None;
         }
     }
 

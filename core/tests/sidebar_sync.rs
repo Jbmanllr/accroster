@@ -750,6 +750,35 @@ fn a_pause_for_new_entry_fields_from_an_earlier_version_can_be_resumed() {
 }
 
 #[test]
+fn resuming_takes_the_paused_line_off_the_menu_at_once() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    drop(core);
+    std::fs::create_dir_all(mac.app_support().join("state")).unwrap();
+    std::fs::write(
+        mac.app_support().join("state/safety.json"),
+        json!({ "version": 1, "paused": [
+            { "feature": "sidebarSync", "reason": "Claude 3.7000.0 changed Sidebar entries" }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    core = mac.launch();
+    sync(&mut core);
+    assert!(status(&core).is_some_and(|line| line.contains("paused")));
+
+    core.command(resume_button(&core).expect("Resume is offered"));
+
+    assert!(
+        !status(&core).is_some_and(|line| line.contains("paused")),
+        "{:?}",
+        status(&core)
+    );
+}
+
+#[test]
 fn a_folder_claude_wasnt_using_that_changed_since_the_last_sync_pauses_sync() {
     let mac = FakeMac::new();
     put(&mac, WORK, "s1", &entry("s1", "One"));

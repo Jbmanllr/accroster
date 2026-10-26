@@ -4,9 +4,10 @@
 #
 # 1. Classifies the call into a reply key (auth-login, auth-status,
 #    auth-logout, get-usage, slash-usage, other).
-# 2. Records the call under calls/<n>/: args and env (NUL-separated), the
+# 2. Picks (consumes) its reply from replies/<key>/<seq>/.
+# 3. Records the call under calls/<n>/: args and env (NUL-separated), the
 #    stdin it read, the key and its pid.
-# 3. Answers from replies/<key>/<seq>/: copies files/ into $CLAUDE_CONFIG_DIR,
+# 4. Answers from that reply: copies files/ into $CLAUDE_CONFIG_DIR,
 #    prints stdout and stderr, exits with exit_code. Replies are consumed in
 #    order; the last one repeats until another is queued after it. With no
 #    reply, exits 97. A reply marked
@@ -42,22 +43,6 @@ if [ "$key" = other ]; then
   done
 fi
 
-mkdir -p "$state/calls"
-# Claim the next call number with mkdir, which fails if another stub running
-# at the same time took it first.
-n=$(( $(ls "$state/calls" | wc -l) + 1 ))
-until mkdir "$state/calls/$(printf '%04d' "$n")" 2>/dev/null; do
-  n=$((n + 1))
-done
-call="$state/calls/$(printf '%04d' "$n")"
-printf '%s\0' "$@" > "$call/args"
-/usr/bin/env -0 > "$call/env"
-printf '%s' "$stdin_line" > "$call/stdin"
-printf %s "$key" > "$call/key"
-# Written then renamed: a reader never sees an empty pid file.
-printf %s "$$" > "$call/pid.tmp"
-mv "$call/pid.tmp" "$call/pid"
-
 replies="$state/replies/$key"
 first=""
 count=0
@@ -75,31 +60,50 @@ if [ "$count" -gt 1 ] && [ -f "$replies/$first/answered" ]; then
   count=$((count - 1))
   first=$(ls "$replies" | sort -n | head -n 1)
 fi
-if [ -z "$first" ]; then
-  echo "stub claude: no canned reply for $key" >&2
-  exit 97
-fi
-reply="$replies/$first"
-[ "$count" -eq 1 ] && : > "$reply/answered"
-
-# A hanging reply waits, like a sign-in nobody finishes, until killed. exec
-# keeps the pid, so killing the recorded pid kills the wait. It is consumed
-# first, like any other reply, unless it is the last one.
-if [ -f "$reply/hang" ]; then
+reply=""
+if [ -n "$first" ]; then
+  reply="$replies/$first"
+  [ "$count" -eq 1 ] && : > "$reply/answered"
+  # Consumed before the call is recorded, unless it is the last one: once a
+  # test sees the call (or the app sees its answer), the next call gets the
+  # next reply, even if this one is killed right away.
   if [ "$count" -gt 1 ]; then
     mkdir -p "$state/used/$key"
     mv "$reply" "$state/used/$key/$first"
+    reply="$state/used/$key/$first"
   fi
+fi
+
+mkdir -p "$state/calls"
+# Claim the next call number with mkdir, which fails if another stub running
+# at the same time took it first.
+n=$(( $(ls "$state/calls" | wc -l) + 1 ))
+until mkdir "$state/calls/$(printf '%04d' "$n")" 2>/dev/null; do
+  n=$((n + 1))
+done
+call="$state/calls/$(printf '%04d' "$n")"
+printf '%s\0' "$@" > "$call/args"
+/usr/bin/env -0 > "$call/env"
+printf '%s' "$stdin_line" > "$call/stdin"
+printf %s "$key" > "$call/key"
+# Written then renamed: a reader never sees an empty pid file.
+printf %s "$$" > "$call/pid.tmp"
+mv "$call/pid.tmp" "$call/pid"
+
+if [ -z "$reply" ]; then
+  echo "stub claude: no canned reply for $key" >&2
+  exit 97
+fi
+
+# A hanging reply waits, like a sign-in nobody finishes, until killed. exec
+# keeps the pid, so killing the recorded pid kills the wait.
+if [ -f "$reply/hang" ]; then
   exec /bin/sleep 600
 fi
 
 # An honest `auth status --json`: answers from the folder's own
 # oauthAccount, as Claude Code does.
 if [ -f "$reply/from-folder" ]; then
-  if [ "$count" -gt 1 ]; then
-    mkdir -p "$state/used/$key"
-    mv "$reply" "$state/used/$key/$first"
-  fi
   f="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
   email=$(/usr/bin/plutil -extract oauthAccount.emailAddress raw -o - "$f" 2>/dev/null)
   org=$(/usr/bin/plutil -extract oauthAccount.organizationUuid raw -o - "$f" 2>/dev/null)
@@ -121,10 +125,4 @@ if [ -d "$reply/files" ]; then
 fi
 cat "$reply/stdout"
 cat "$reply/stderr" >&2
-code=$(cat "$reply/exit_code")
-
-if [ "$count" -gt 1 ]; then
-  mkdir -p "$state/used/$key"
-  mv "$reply" "$state/used/$key/$first"
-fi
-exit "$code"
+exit "$(cat "$reply/exit_code")"
