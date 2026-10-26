@@ -187,6 +187,13 @@ fn subagent_transcripts_and_links_are_not_followed() {
         format!(".claude/projects/{PROJECT}/{S1}/subagents/agent-1.jsonl"),
         format!("{}\n", prompt(S2, "a subagent", &mac_time(1))),
     );
+    // SSH Sessions keep their subagents' Transcripts next to their own.
+    let mut sidechain = prompt(S1, "a flat subagent", &mac_time(1));
+    sidechain["isSidechain"] = json!(true);
+    mac.write_file(
+        format!(".claude/projects/{PROJECT}/agent-a346758ef6bf6f93b.jsonl"),
+        format!("{sidechain}\n"),
+    );
     let elsewhere = mac.write_file(
         "elsewhere/linked.jsonl",
         format!("{}\n", prompt(S3, "linked", &mac_time(1))),
