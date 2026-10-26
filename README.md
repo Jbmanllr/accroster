@@ -60,7 +60,7 @@ On every run the shim silently unsets the variables that would put another accou
 
 ## Sidebar sync
 
-Turn on Sidebar sync in Settings to copy every Session's entry into every Profile's sidebar in the Claude desktop app, on "Sync now" or automatically. It copies, never deletes. While Claude runs, the sidebar it is using only gains the Sessions it lacks, and Claude shows them once it's reopened: the result line then offers **Reopen Claude**.
+Turn on Sidebar sync in Settings to copy every Session's entry into every Profile's sidebar in the Claude desktop app, on "Sync now" or automatically. It copies, never deletes. SSH and No-folder Sessions are included unless you turn off "Include SSH and No-folder Sessions"; a No-folder Session's copy keeps using the same scratch folder. WSL and scheduled-task Sessions are left out: Claude runs those on one account only. While Claude runs, the sidebar it is using only gains the Sessions it lacks, and Claude shows them once it's reopened: the result line then offers **Reopen Claude**.
 
 AccRoster quits and reopens Claude only when you click Reopen Claude, and only once Claude is idle. If a desktop Session is running a turn, it waits and names it (Cancel leaves Claude alone); if it can't tell, it asks first (Reopen anyway or Cancel). It asks Claude to quit the way ⌘Q does, never force-quits it, and opens it again once it has quit. Sync itself, Automatic sync included, never quits Claude.
 

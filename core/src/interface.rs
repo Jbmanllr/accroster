@@ -137,8 +137,8 @@ pub enum Command {
     /// "Sync now" in Settings: copy every Session's Sidebar entry into every
     /// other Profile's sidebar.
     SyncSidebarNow,
-    /// "Include SSH Sessions" in Settings (on by default).
-    SetIncludeSshSessions(bool),
+    /// "Include SSH and No-folder Sessions" in Settings (on by default).
+    SetIncludeSshAndNoFolderSessions(bool),
     /// "Reopen Claude", offered after a sync added Sessions to the sidebar
     /// Claude is using while it runs: waits until Claude is idle, then
     /// quits Claude and opens it again.
@@ -266,7 +266,9 @@ impl Command {
             Command::ResumeFeature(_) => "resume_feature",
             Command::SetSidebarSync(_) => "set_sidebar_sync",
             Command::SyncSidebarNow => "sync_sidebar_now",
-            Command::SetIncludeSshSessions(_) => "set_include_ssh_sessions",
+            Command::SetIncludeSshAndNoFolderSessions(_) => {
+                "set_include_ssh_and_no_folder_sessions"
+            }
             Command::ReopenDesktopApp => "reopen_desktop_app",
             Command::ConfirmReopenDesktopApp => "confirm_reopen_desktop_app",
             Command::CancelReopenDesktopApp => "cancel_reopen_desktop_app",
@@ -745,8 +747,8 @@ pub struct SidebarSyncView {
     /// "Reopen Claude", present while it is offered:
     /// [`Command::ReopenDesktopApp`].
     pub reopen: Option<Command>,
-    /// "Include SSH Sessions": [`Command::SetIncludeSshSessions`].
-    pub ssh_sessions: Toggle,
+    /// "Include SSH and No-folder Sessions": [`Command::SetIncludeSshAndNoFolderSessions`].
+    pub ssh_and_no_folder_sessions: Toggle,
 }
 
 /// One Profile in Settings > Profiles, in the user's order.

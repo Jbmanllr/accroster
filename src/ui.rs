@@ -359,10 +359,10 @@ define_class!(
             self.send(Command::Uninstall);
         }
 
-        /// "Include SSH Sessions".
+        /// "Include SSH and No-folder Sessions".
         #[unsafe(method(syncSshSessionsClicked:))]
         fn sync_ssh_sessions_clicked(&self, sender: &NSButton) {
-            self.send(Command::SetIncludeSshSessions(
+            self.send(Command::SetIncludeSshAndNoFolderSessions(
                 sender.state() == NSControlStateValueOn,
             ));
         }
@@ -1480,7 +1480,10 @@ impl Ui {
             sel!(sidebarSyncAutomaticClicked:),
         );
         layout.place(&sidebar_sync_automatic, NOTE_X, None, 4.0);
-        let sync_ssh_sessions = checkbox("Include SSH Sessions", sel!(syncSshSessionsClicked:));
+        let sync_ssh_sessions = checkbox(
+            "Include SSH and No-folder Sessions",
+            sel!(syncSshSessionsClicked:),
+        );
         layout.place(&sync_ssh_sessions, NOTE_X, None, 4.0);
         let sync_now = push_button("Sync now", sel!(syncNowClicked:));
         let reopen_claude = push_button("Reopen Claude", sel!(reopenClaudeClicked:));
@@ -2675,7 +2678,7 @@ fn render_settings(settings: &SettingsWindow, view: &SettingsView) {
     settings.reopen_claude.setHidden(sync.reopen.is_none());
     settings
         .sync_ssh_sessions
-        .setState(if sync.ssh_sessions.on {
+        .setState(if sync.ssh_and_no_folder_sessions.on {
             NSControlStateValueOn
         } else {
             NSControlStateValueOff

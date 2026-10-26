@@ -11,8 +11,8 @@ Sidebar sync copies each existing Sidebar entry (`local_*.json`) into every othe
 
 ## Consequences
 
-- A copy keeps the file name, `sessionId` and `cliSessionId`, and clears `bridgeSessionIds` and the connector snapshot (`remoteMcpServersConfig`, `enabledMcpTools`). Scratch, WSL and scheduled-task entries are skipped. SSH entries are copied unless the user turns off "Include SSH Sessions" (on by default); see the amendment below.
-- Skipping stays strict but is reported: each run's result says how many Sessions it left out and why ("left out 17 SSH and 21 scratch Sessions"), and a run writes one sidebar at a time so the menu and Settings show its progress.
+- A copy keeps the file name, `sessionId` and `cliSessionId`, and clears `bridgeSessionIds` and the connector snapshot (`remoteMcpServersConfig`, `enabledMcpTools`). WSL and scheduled-task entries are skipped. SSH and No-folder (scratch-workspace) entries are copied unless the user turns off "Include SSH and No-folder Sessions" (on by default); see the amendments below.
+- Skipping stays strict but is reported: each run's result says how many Sessions it left out and why, in plain words ("left out 2 scheduled-task Sessions (Claude runs those on one account only)"), and a run writes one sidebar at a time so the menu and Settings show its progress.
 - A `deleted_*` tombstone only stops sync re-adding that Session to that Profile.
 - Entries carry no per-field timestamps, so sync keeps its own record of each copy's title and archive state as of the last run; a copy that differs from the record changed and wins. If two changed, the active Profile's copy wins, else the newest file.
 - If the desktop app's dormant multi-account mode is ever enabled, inactive Profiles may be written in the background: sync detects it, stops and warns.
@@ -22,7 +22,11 @@ Sidebar sync copies each existing Sidebar entry (`local_*.json`) into every othe
 
 ## Amendment: SSH Sessions are included
 
-The owner's first real switch left out 17 desktop SSH Sessions (entries with `sshConfig`, `sshRemoteTranscriptPath` or `sshRemoteProcessId`), which made sync look broken. They are now copied by default, with the same field clearing, backups and conflict rules as local entries; Settings › Sidebar sync has an "Include SSH Sessions" checkbox to leave them out. A copy also drops `sshReattach`: it binds the Session's remote process to the login that started it, so a copy under another login must not claim it. How a copy behaves when opened under another login is not verified yet, so the app says nothing about it. WSL, scheduled-task and scratch Sessions stay skipped.
+The owner's first real switch left out 17 desktop SSH Sessions (entries with `sshConfig`, `sshRemoteTranscriptPath` or `sshRemoteProcessId`), which made sync look broken. They are now copied by default, with the same field clearing, backups and conflict rules as local entries; Settings › Sidebar sync has an "Include SSH Sessions" checkbox to leave them out. A copy also drops `sshReattach`: it binds the Session's remote process to the login that started it, so a copy under another login must not claim it. How a copy behaves when opened under another login is not verified yet, so the app says nothing about it. WSL and scheduled-task Sessions stay skipped; No-folder Sessions are included since the amendment below.
+
+## Amendment: No-folder Sessions are included
+
+The owner didn't understand why the result line left out "scratch" Sessions "(not synced: they belong to one desktop login)", and wanted them synced. Those are the desktop's "No folder" Sessions: their working folder is a scratch workspace Claude made under `~/Library/Application Support/Claude/scratch-workspaces/<account>/<org>/<id>`. They are now copied by default under the same rules as other entries (backup, field clearing, additions only into the sidebar Claude is using while it runs). The scratch workspace stays where it is and the copy keeps pointing at it. One Settings checkbox, "Include SSH and No-folder Sessions" (replacing "Include SSH Sessions", on by default), leaves both kinds out. The "belong to one desktop login" wording is gone: what is left out is said with its reason, "left out 2 scheduled-task Sessions (Claude runs those on one account only)" for WSL and scheduled-task Sessions, "(Include SSH and No-folder Sessions is off)" for the others.
 
 ## Amendment: Claude's own sidebar gains new entries while it runs
 

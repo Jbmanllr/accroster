@@ -608,13 +608,13 @@ impl Core {
                 self.sync_sidebar();
                 Vec::new()
             }
-            Command::SetIncludeSshSessions(on) => {
+            Command::SetIncludeSshAndNoFolderSessions(on) => {
                 let mut updated = self.settings.clone();
-                updated.leave_out_ssh_sessions = !on;
+                updated.leave_out_ssh_and_no_folder_sessions = !on;
                 if self.save_settings(updated) {
                     self.log(
                         Level::Info,
-                        "sidebar sync ssh sessions",
+                        "sidebar sync ssh and no-folder sessions",
                         &[("on", Field::Word(if on { "on" } else { "off" }))],
                     );
                 }
@@ -1065,10 +1065,10 @@ impl Core {
                         .then_some(Command::SyncSidebarNow),
                     note: self.sync_settings_note(),
                     reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
-                    ssh_sessions: Toggle {
-                        on: !self.settings.leave_out_ssh_sessions,
-                        command: Command::SetIncludeSshSessions(
-                            self.settings.leave_out_ssh_sessions,
+                    ssh_and_no_folder_sessions: Toggle {
+                        on: !self.settings.leave_out_ssh_and_no_folder_sessions,
+                        command: Command::SetIncludeSshAndNoFolderSessions(
+                            self.settings.leave_out_ssh_and_no_folder_sessions,
                         ),
                     },
                 },

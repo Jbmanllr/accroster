@@ -82,7 +82,7 @@ impl Core {
         match sidebar_sync::begin(
             &self.env,
             &self.paths,
-            !self.settings.leave_out_ssh_sessions,
+            !self.settings.leave_out_ssh_and_no_folder_sessions,
         ) {
             Begun::Ended(run) => {
                 self.sync_ended(&run);
@@ -410,30 +410,44 @@ fn sync_line(report: &sidebar_sync::Report, explained: bool) -> String {
             report.not_backed_up
         ));
     }
-    if !report.left_out.is_empty() {
-        note.push_str(&left_out_part(&report.left_out, explained));
+    if !explained {
+        if !report.left_out.is_empty() {
+            note.push_str(&left_out_part(report.left_out.iter(), None));
+        }
+        return note;
+    }
+    // Settings says why, one part per reason.
+    let mut reasons: Vec<&'static str> = report.left_out.keys().map(|kind| kind.why()).collect();
+    reasons.dedup();
+    for reason in reasons {
+        let kinds = report
+            .left_out
+            .iter()
+            .filter(|(kind, _)| kind.why() == reason);
+        note.push_str(&left_out_part(kinds, Some(reason)));
     }
     note
 }
 
-/// " · left out 17 SSH and 21 scratch Sessions (not synced: …)".
-fn left_out_part(left_out: &std::collections::BTreeMap<LeftOut, usize>, explained: bool) -> String {
+/// " · left out 17 SSH and 21 No-folder Sessions", then `(why)` when given.
+fn left_out_part<'a>(
+    left_out: impl Iterator<Item = (&'a LeftOut, &'a usize)>,
+    why: Option<&str>,
+) -> String {
+    let mut total = 0;
     let parts: Vec<String> = left_out
-        .iter()
-        .map(|(why, count)| format!("{} {}", thousands(*count), why.name()))
+        .map(|(kind, count)| {
+            total += count;
+            format!("{} {}", thousands(*count), kind.name())
+        })
         .collect();
     let listed = match parts.as_slice() {
         [only] => only.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
         [] => String::new(),
     };
-    let total: usize = left_out.values().sum();
     let sessions = if total == 1 { "Session" } else { "Sessions" };
-    let why = if explained {
-        " (not synced: they belong to one desktop login)"
-    } else {
-        ""
-    };
+    let why = why.map_or(String::new(), |why| format!(" ({why})"));
     format!(" · left out {listed} {sessions}{why}")
 }
 
