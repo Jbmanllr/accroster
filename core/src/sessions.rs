@@ -1000,17 +1000,45 @@ fn quoted(prompt: &str) -> String {
     format!("“{shown}”")
 }
 
-/// The project: the last folder of the Session's project folder.
+/// Folders the Claude desktop app makes for its own Sessions, each listed as
+/// one project: "No folder" Sessions' scratch workspaces, and the notes
+/// folders of side sessions.
+const CLAUDE_FOLDERS: [(&str, &str); 2] = [
+    (
+        "/Library/Application Support/Claude/scratch-workspaces",
+        "No folder",
+    ),
+    (
+        "/Library/Application Support/Claude/side-session-notes",
+        "Side-session notes",
+    ),
+];
+
+/// The project: the name of the Session's project folder.
 fn project(cwd: Option<&str>) -> &str {
-    cwd.map(project_folder)
-        .and_then(|folder| Path::new(folder).file_name())
-        .and_then(|name| name.to_str())
+    let Some(folder) = cwd.map(project_folder) else {
+        return "unknown folder";
+    };
+    CLAUDE_FOLDERS
+        .iter()
+        .find(|(marker, _)| folder.ends_with(marker))
+        .map(|(_, name)| *name)
+        .or_else(|| Path::new(folder).file_name()?.to_str())
         .unwrap_or("unknown folder")
 }
 
-/// The folder a working directory belongs to: the repository for a Claude
-/// worktree (`<repo>/.claude/worktrees/<name>/…`), else the directory itself.
+/// The folder a working directory belongs to: one of [`CLAUDE_FOLDERS`],
+/// the repository for a Claude worktree (`<repo>/.claude/worktrees/<name>/…`),
+/// else the directory itself.
 fn project_folder(cwd: &str) -> &str {
+    for (marker, _) in CLAUDE_FOLDERS {
+        if let Some(at) = cwd.find(marker) {
+            let end = at + marker.len();
+            if cwd[end..].starts_with('/') {
+                return &cwd[..end];
+            }
+        }
+    }
     cwd.split_once("/.claude/worktrees/")
         .map_or(cwd, |(repository, _)| repository)
 }
