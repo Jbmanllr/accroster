@@ -13,7 +13,7 @@ use accroster_core::watcher::{self, FolderWatch};
 use crate::notifications;
 use accroster_core::{
     AllSessionsView, Badge, CheckStatus, Command, Core, DiagnosticsView, DiscoveredRow, Effect,
-    Event, LimitBar, MOST_HEADROOM, MenuItem, ProfileRow, ProfileSettings, RunningDot,
+    Event, LimitBar, MOST_HEADROOM, MenuBarView, MenuItem, ProfileRow, ProfileSettings, RunningDot,
     SafetyFeature, SessionDetail, SessionFilter, SessionRow, SettingsView, SidebarGroup,
     SidebarSyncMode, StatusTone, View,
 };
@@ -95,6 +95,8 @@ pub struct Ivars {
     status_item: Retained<NSStatusItem>,
     /// Keeps the network path monitor alive.
     network: OnceCell<NetworkMonitor>,
+    /// What the status item shows now: it is redrawn only when that changes.
+    shown_menu_bar: RefCell<Option<MenuBarView>>,
     /// The commands of the menu's clickable items (submenus included), by tag.
     actions: RefCell<Vec<Command>>,
     settings: OnceCell<SettingsWindow>,
@@ -503,6 +505,7 @@ impl Ui {
             core: OnceCell::new(),
             status_item,
             network: OnceCell::new(),
+            shown_menu_bar: RefCell::new(None),
             actions: RefCell::new(Vec::new()),
             settings: OnceCell::new(),
             diagnostics: OnceCell::new(),
@@ -589,7 +592,10 @@ impl Ui {
     fn render(&self, view: &View) {
         let mtm = self.mtm();
         let item = &self.ivars().status_item;
-        if let Some(button) = item.button(mtm) {
+        let mut shown_menu_bar = self.ivars().shown_menu_bar.borrow_mut();
+        if shown_menu_bar.as_ref() != Some(&view.menu_bar)
+            && let Some(button) = item.button(mtm)
+        {
             match &view.menu_bar.label {
                 Some(label) => {
                     button.setImage(None);
@@ -601,7 +607,9 @@ impl Ui {
                 }
             }
             button.setAppearsDisabled(view.menu_bar.dimmed);
+            *shown_menu_bar = Some(view.menu_bar.clone());
         }
+        drop(shown_menu_bar);
         // Building the menu's rows takes tens of milliseconds on the main
         // thread, and most updates (ticks) leave the menu as it is.
         if self.ivars().menu_open.get() {

@@ -659,6 +659,30 @@ fn a_rename_or_an_archive_in_any_copy_carries_over_to_the_others() {
 }
 
 #[test]
+fn a_source_given_another_copys_title_keeps_all_its_own_account_bound_fields() {
+    let mac = FakeMac::new();
+    let mut ssh = entry("s1", "Old name");
+    ssh["sshConfig"] = json!({"sshHost": "vps"});
+    ssh["sshReattach"] = json!({"pid": 4242, "token": "bound-to-perso"});
+    put(&mac, PERSO, "s1", &ssh);
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    sync(&mut core);
+
+    // Renamed in Work; used since in Perso, which stays the source.
+    let mut renamed = read(&mac, WORK, "s1").unwrap();
+    renamed["title"] = json!("New name");
+    put(&mac, WORK, "s1", &renamed);
+    ssh["lastActivityAt"] = json!(1_761_500_000_000_i64);
+    put(&mac, PERSO, "s1", &ssh);
+    sync(&mut core);
+
+    let mut expected = ssh;
+    expected["title"] = json!("New name");
+    assert_eq!(read(&mac, PERSO, "s1"), Some(expected));
+}
+
+#[test]
 fn when_two_copies_were_renamed_the_desktops_active_profile_wins() {
     let mac = FakeMac::new();
     put(&mac, PERSO, "s1", &entry("s1", "Old name"));
