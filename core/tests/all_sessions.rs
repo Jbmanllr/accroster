@@ -873,6 +873,46 @@ fn search_narrows_the_filtered_list() {
 }
 
 #[test]
+fn a_profiles_sidebar_in_another_organization_is_named_after_the_profile() {
+    let mac = FakeMac::new();
+    let perso = FixtureLogin::perso();
+    let team = FixtureLogin::new(ACCOUNT_A, ORG_A, "team@example.com", "Acme");
+    mac.write_json(format!("{PROFILES}/p1/.claude.json"), &perso.claude_json());
+    mac.write_json(format!("{PROFILES}/p2/.claude.json"), &team.claude_json());
+    transcript(&mac, S1, "app", 5, &[]);
+    // Perso is a member of Acme, and of an Organization no Profile is in.
+    for org in [ORG_A, ORG_B] {
+        mac.write_sidebar_entry(
+            &perso.account_uuid,
+            org,
+            "x1",
+            &entry(S1, "Title", "user", 1),
+        );
+    }
+    let mut core = mac.launch();
+    open(&mut core);
+
+    let names: Vec<String> = core
+        .view()
+        .all_sessions
+        .sidebar
+        .into_iter()
+        .filter(|group| group.title.as_deref() == Some("Sidebars"))
+        .flat_map(|group| group.items)
+        .map(|item| item.title)
+        .filter(|title| title.starts_with("me@example.com"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "me@example.com",
+            "me@example.com · Acme",
+            "me@example.com · another Organization",
+        ]
+    );
+}
+
+#[test]
 fn the_sidebar_lists_projects_and_every_profiles_sidebar() {
     let mac = FakeMac::new();
     let perso = FixtureLogin::perso();
