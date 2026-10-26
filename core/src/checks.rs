@@ -6,12 +6,13 @@
 //! data (limits, identities, the Session index, Sidebar sync) still check
 //! every field they read and degrade per item.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::claude_json;
 use crate::interface::{ClaudeVersions, SafetyFeature};
@@ -302,15 +303,20 @@ pub(crate) fn sidebar_entries(home: &Path) -> Finding {
             if meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
                 continue;
             }
-            let Some(Value::Object(body)) = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            else {
+            let Ok(bytes) = fs::read(entry.path()) else {
+                continue;
+            };
+            // Only the field names and `sessionId` are looked at: the values
+            // are checked as JSON but not built.
+            let Ok(body) = serde_json::from_slice::<BTreeMap<String, &RawValue>>(&bytes) else {
                 continue;
             };
             read += 1;
             let stem = name.trim_end_matches(".json");
-            if body.get("sessionId").and_then(Value::as_str) != Some(stem) {
+            let session_id = body
+                .get("sessionId")
+                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+            if session_id.as_deref() != Some(stem) {
                 mismatched += 1;
             }
             for key in body.keys() {

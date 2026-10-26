@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -216,8 +217,15 @@ struct Folder {
 }
 
 struct Entry {
-    bytes: Vec<u8>,
+    /// [`fingerprint`] of the file as read: it is replaced only while it
+    /// still matches.
+    fingerprint: u64,
+    /// The body with its account-bound fields cleared ([`clear`]), so the
+    /// big ones (`remoteMcpServersConfig`) aren't held for every entry. A
+    /// write back into the entry's own folder takes them from the file again.
     body: Map<String, Value>,
+    /// Sync's record of the file as read, account-bound fields included.
+    record: CopyRecord,
     modified: SystemTime,
 }
 
@@ -323,7 +331,7 @@ impl Watch {
                 .get(&key)
                 .and_then(|copies| copies.get(&name))
                 .map(|copy| &copy.content);
-            if recorded == Some(&hash(&Value::Object(body))) {
+            if recorded == Some(&hash(&body)) {
                 // Sync wrote it, or nothing changed.
                 continue;
             }
@@ -529,7 +537,7 @@ impl SyncRun {
         }
         let mut copies = copy_records(folder);
         let mut wrote_any = false;
-        for write in folder_writes {
+        for mut write in folder_writes {
             let file = folder.path.join(&write.name);
             // The exact file, read again right before it's replaced.
             let now_there = match fs::read(&file) {
@@ -541,8 +549,11 @@ impl SyncRun {
                 // Claude saved its own entry meanwhile: it stays.
                 continue;
             }
-            let expected = folder.copies.get(&write.name).map(|entry| &entry.bytes);
-            if now_there.as_ref() != expected {
+            let expected = folder
+                .copies
+                .get(&write.name)
+                .map(|entry| entry.fingerprint);
+            if now_there.as_deref().map(fingerprint) != expected {
                 if wrote_any {
                     self.written.insert(folder.key.clone());
                     self.record.folders.insert(folder.key.clone(), copies);
@@ -550,7 +561,15 @@ impl SyncRun {
                 }
                 return Some(Run::FoldersChanged(1));
             }
-            let Ok(bytes) = serde_json::to_vec(&Value::Object(write.body.clone())) else {
+            if write.own_folder {
+                // The file just checked is the one the body was read from.
+                let Some(Ok(Value::Object(own))) = now_there.as_deref().map(serde_json::from_slice)
+                else {
+                    continue;
+                };
+                restore_bindings(&mut write.body, &own);
+            }
+            let Ok(bytes) = serde_json::to_vec(&write.body) else {
                 continue;
             };
             let written = if write.add_only {
@@ -633,6 +652,9 @@ struct Write {
     modified: SystemTime,
     /// Into a folder Claude may be using: only if no file has the name.
     add_only: bool,
+    /// Into the folder `body` came from, which keeps its own account-bound
+    /// fields.
+    own_folder: bool,
 }
 
 /// Decides every Session's entry and which folders need it written, and
@@ -698,11 +720,9 @@ fn plan(
             if existing.is_none() && transcript.is_some_and(|id| folder.tombstones.contains(id)) {
                 continue;
             }
-            let mut wanted = body.clone();
-            if index != source.folder {
-                clear(&mut wanted);
-            }
-            if existing.is_some_and(|entry| same_but_cleared(&entry.body, &wanted)) {
+            // Bodies are held cleared: a copy's account-bound fields stay
+            // cleared, the source folder's are restored as it is written.
+            if existing.is_some_and(|entry| same_but_cleared(&entry.body, &body)) {
                 continue;
             }
             let add_only = add_only(folder);
@@ -713,9 +733,10 @@ fn plan(
             writes.push(Write {
                 folder: index,
                 name: name.clone(),
-                body: wanted,
+                body: body.clone(),
                 modified,
                 add_only,
+                own_folder: index == source.folder,
             });
         }
     }
@@ -738,7 +759,7 @@ fn winner<'a, 'b>(
     group: impl Fn(&Groups) -> &String,
     agreed: Option<&Groups>,
 ) -> &'b Copy<'a> {
-    let value = |copy: &Copy<'_>| hash(&Value::Object(pick(&copy.entry.body, fields)));
+    let value = |copy: &Copy<'_>| hash(&pick(&copy.entry.body, fields));
     let changed: Vec<&Copy<'a>> = copies
         .iter()
         .filter(|copy| copy.recorded.map(|r| group(&r.groups)) != Some(&value(copy)))
@@ -794,29 +815,38 @@ fn clear(body: &mut Map<String, Value>) {
     }
 }
 
+/// Puts back the account-bound fields [`clear`] emptied or dropped, as they
+/// are in `own`, the file `body` came from.
+fn restore_bindings(body: &mut Map<String, Value>, own: &Map<String, Value>) {
+    for field in CLEARED.iter().chain(&DROPPED) {
+        match own.get(*field) {
+            Some(value) => body.insert((*field).to_owned(), value.clone()),
+            None => body.remove(*field),
+        };
+    }
+}
+
 /// Equal apart from the cleared fields, which the desktop app rebuilds in a
 /// copy once it's used: those differences alone are left as they are.
 fn same_but_cleared(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
-    let strip = |body: &Map<String, Value>| {
-        let mut body = body.clone();
-        for field in CLEARED.iter().chain(&DROPPED) {
-            body.remove(*field);
-        }
-        body
-    };
-    strip(a) == strip(b)
+    // Maps iterate in key order, so equal maps yield equal sequences.
+    fn unbound(body: &Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
+        body.iter()
+            .filter(|(key, _)| !CLEARED.iter().chain(&DROPPED).any(|field| field == key))
+    }
+    unbound(a).eq(unbound(b))
 }
 
 fn groups(body: &Map<String, Value>) -> Groups {
     Groups {
-        title: hash(&Value::Object(pick(body, &TITLE_FIELDS))),
-        archive: hash(&Value::Object(pick(body, &ARCHIVE_FIELDS))),
+        title: hash(&pick(body, &TITLE_FIELDS)),
+        archive: hash(&pick(body, &ARCHIVE_FIELDS)),
     }
 }
 
 fn copy_record(body: &Map<String, Value>) -> CopyRecord {
     CopyRecord {
-        content: hash(&Value::Object(body.clone())),
+        content: hash(body),
         groups: groups(body),
     }
 }
@@ -825,19 +855,46 @@ fn copy_records(folder: &Folder) -> BTreeMap<String, CopyRecord> {
     folder
         .copies
         .iter()
-        .map(|(name, entry)| (name.clone(), copy_record(&entry.body)))
+        .map(|(name, entry)| (name.clone(), entry.record.clone()))
         .collect()
 }
 
-/// A 64-bit FNV-1a hash of the value's JSON (keys sorted), in hex.
-fn hash(value: &Value) -> String {
-    let text = value.to_string();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
+/// A 64-bit FNV-1a hash of the body's compact JSON (keys sorted), in hex,
+/// hashed as it is written out rather than from a copy of the text.
+fn hash(body: &Map<String, Value>) -> String {
+    let mut hasher = Fnv::default();
+    serde_json::to_writer(&mut hasher, body).expect("a JSON map always serializes");
+    format!("{:016x}", hasher.0)
+}
+
+/// A file's bytes, hashed to tell within one run whether it changed. Never
+/// stored, so it uses the fast standard hasher rather than FNV.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
     }
-    format!("{hash:016x}")
+}
+
+impl io::Write for Fnv {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Reads every `<account>/<org>/` folder (real folders with uuid names).
@@ -888,7 +945,7 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_optional: bool) {
         let Ok(bytes) = fs::read(entry.path()) else {
             continue;
         };
-        let Ok(Value::Object(body)) = serde_json::from_slice(&bytes) else {
+        let Ok(Value::Object(mut body)) = serde_json::from_slice(&bytes) else {
             continue;
         };
         // A copy under another name would be a second entry in Claude.
@@ -901,11 +958,14 @@ fn read_folder(folder: &mut Folder, read: &mut Read, include_optional: bool) {
         let Ok(modified) = meta.modified() else {
             continue;
         };
+        let record = copy_record(&body);
+        clear(&mut body);
         folder.copies.insert(
             name,
             Entry {
-                bytes,
+                fingerprint: fingerprint(&bytes),
                 body,
+                record,
                 modified,
             },
         );

@@ -417,11 +417,12 @@ fn process_paths() -> Option<Vec<(u32, String)>> {
     let size = i32::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
     let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
     pids.truncate(usize::try_from(written).ok().filter(|n| *n > 0)?);
+    // One buffer for every path: a scan sees hundreds of processes.
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let processes = pids
         .into_iter()
         .filter(|&pid| pid > 0)
         .filter_map(|pid| {
-            let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
             // SAFETY: `proc_pidpath` writes at most `buffer.len()` bytes and
             // returns the path's length.
             let len =
