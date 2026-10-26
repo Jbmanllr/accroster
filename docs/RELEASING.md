@@ -2,8 +2,6 @@
 
 For the maintainer. A release is a notarized `AccRoster-<version>.dmg` on the repository's GitHub Releases page, built by `scripts/release.sh` and published by pushing a `vX.Y.Z` tag. Users never see any of this; their steps are in the README's [Install](../README.md#install).
 
-> **Status.** `scripts/release.sh` and the dry run (`release-dry-run` in `.github/workflows/ci.yml`) exist. The release workflow, `.github/workflows/release.yml`, is not written yet (ticket #56). Anything below marked **(intended)** is the planned flow, and the secret names are the ones the workflow will read. Update this page when the workflow lands.
-
 ## One-time setup
 
 Only the owner can do this. You need a Mac, admin rights on the repository and USD 99 a year for Apple. Do the steps in order.
@@ -30,9 +28,9 @@ Only the owner can do this. You need a Mac, admin rights on the repository and U
 5. **Delete the local `.p12` and `.p8`** once they are in GitHub. Keep the certificate in your keychain if you want to sign locally.
 6. **Ship the first release.** Cut it as below, then run the [first-release checklist](#first-release-checklist).
 
-### How the secrets reach the script (intended)
+### How the secrets reach the script
 
-The workflow decodes `DEVELOPER_ID_P12_BASE64` into a temporary keychain on the runner and `NOTARY_KEY_P8_BASE64` into a temporary file, then runs the script with the names the script reads:
+The release workflow, `.github/workflows/release.yml`, decodes `DEVELOPER_ID_P12_BASE64` into a temporary keychain on the runner and `NOTARY_KEY_P8_BASE64` into a temporary file, then runs the script with the names the script reads:
 
 | Environment variable | Set from |
 |---|---|
@@ -54,7 +52,7 @@ The temporary keychain must be on the user keychain search list, because the scr
    git push origin v0.2.0
    ```
 
-4. **(intended)** The Release workflow starts. It runs the same format, lint and test gate as CI, waits for your approval if you set a required reviewer, runs `scripts/release.sh --developer-id --version v0.2.0`, writes `AccRoster-0.2.0.sha256` with `shasum -a 256`, and creates the GitHub Release with generated notes, the dmg and the checksum file. The script writes no checksum itself.
+4. The Release workflow starts. It fails at once if the tag and `Cargo.toml` disagree, runs the same format, lint and test gate as CI, waits for your approval if you set a required reviewer, runs `scripts/release.sh --developer-id --version v0.2.0`, writes `AccRoster-0.2.0.dmg.sha256` with `shasum -a 256`, and creates the GitHub Release with generated notes, the dmg and the checksum file. The script writes no checksum itself.
 5. Open the Releases page and check the dmg is there. For the first release, run the checklist below.
 
 Before it builds anything, the script exits non-zero if the tag and `Cargo.toml` disagree (`version mismatch: releasing X but Cargo.toml says Y`) or if a variable above is missing.
@@ -76,7 +74,7 @@ A cold run takes about ten minutes, for two release builds. The Developer ID mod
 
 ## Recover from a failed release
 
-A failed run publishes nothing **(intended)**, so users never see a half release. Read the failing step in the Actions log first. The usual causes:
+A failed run publishes nothing, because the publish step runs last, so users never see a half release. Read the failing step in the Actions log first. The usual causes:
 
 | Message | Cause and fix |
 |---|---|
