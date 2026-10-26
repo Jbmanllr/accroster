@@ -144,9 +144,9 @@ const SIDEBAR_FOLDER_FILES: [&str; 4] = [
 
 /// Every top-level Sidebar entry field the app knows (the 2026-10-25 census
 /// plus names read in the desktop app's code). Sidebar sync copies whole
-/// entries, so a field outside this list may be bound to an account and
-/// stops sync (ADR 0004): a desktop update can add one, and the app learns it
-/// in a release. Diagnostics names it so it can be reported.
+/// entries, a field outside this list included (ADR 0004): a desktop update
+/// can add one, and Diagnostics names it as a note so the app learns it in a
+/// release.
 pub(crate) const SIDEBAR_ENTRY_FIELDS: &[&str] = &[
     "adoptedFromOtherSurface",
     "alwaysAllowedReasons",
@@ -202,6 +202,7 @@ pub(crate) const SIDEBAR_ENTRY_FIELDS: &[&str] = &[
     "model",
     "notifySessionId",
     "originCwd",
+    "peerInbound",
     "peerMessaged",
     "peerReceipts",
     "pendingSystemReminder",
@@ -270,7 +271,8 @@ const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ENTRIES: usize = 5000;
 
 /// Sidebar entries: the folder layout `<account>/<org>/` with known file
-/// names, `sessionId` equal to the file name, and no unknown top-level field.
+/// names and `sessionId` equal to the file name. Unknown top-level fields
+/// are a note on a pass, never a failure.
 pub(crate) fn sidebar_entries(home: &Path) -> Finding {
     let root = home.join(SIDEBAR_ROOT);
     let mut read = 0usize;
@@ -322,12 +324,6 @@ pub(crate) fn sidebar_entries(home: &Path) -> Finding {
         return Finding::never_seen();
     }
     let mut problems = Vec::new();
-    if !unknown_fields.is_empty() {
-        problems.push(format!(
-            "unknown fields: {}",
-            unknown_fields.into_iter().collect::<Vec<_>>().join(", ")
-        ));
-    }
     if mismatched > 0 {
         problems.push(format!(
             "sessionId differs from the file name in {mismatched}"
@@ -336,10 +332,19 @@ pub(crate) fn sidebar_entries(home: &Path) -> Finding {
     if unknown_files > 0 {
         problems.push(format!("{unknown_files} unknown files in Sidebar folders"));
     }
-    if problems.is_empty() {
-        Finding::pass().with_detail(format!("{read} entries read"))
+    let mut detail = if problems.is_empty() {
+        format!("{read} entries read")
     } else {
-        Finding::fail(problems.join("; "))
+        problems.join("; ")
+    };
+    if !unknown_fields.is_empty() {
+        detail.push_str(" · new fields seen: ");
+        detail.push_str(&unknown_fields.into_iter().collect::<Vec<_>>().join(", "));
+    }
+    if problems.is_empty() {
+        Finding::pass().with_detail(detail)
+    } else {
+        Finding::fail(detail)
     }
 }
 

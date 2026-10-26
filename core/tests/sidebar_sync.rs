@@ -1,6 +1,6 @@
 //! Sidebar sync (ADR 0003): "Sync now" copies every Session's Sidebar entry
-//! into every other Profile's desktop sidebar. While Claude runs it writes
-//! only to Profiles Claude isn't using, it never deletes, and it carries
+//! into every other Profile's desktop sidebar. While Claude runs, its own
+//! account's sidebars only gain entries they lack, it never deletes, and it carries
 //! title and archive changes over from the copy that changed.
 
 mod common;
@@ -430,39 +430,87 @@ fn scratch_wsl_and_scheduled_task_entries_and_cli_only_sessions_are_not_copied()
 // ----- Where sync writes ---------------------------------------------------------------
 
 #[test]
-fn while_claude_runs_no_write_lands_in_any_folder_of_the_desktops_account() {
+fn while_claude_runs_its_accounts_sidebars_only_gain_the_sessions_they_lack() {
     let mac = FakeMac::new();
     put(&mac, WORK, "s1", &entry("s1", "From Work"));
+    put(&mac, PERSO, "s2", &entry("s2", "Old title"));
+    let mut used = entry("s2", "Old title");
+    used["lastActivityAt"] = json!(1_761_500_000_000_i64);
+    put(&mac, WORK, "s2", &used);
     empty_folder(&mac, PERSO_TEAM);
     desktop_uses(&mac, PERSO);
     mac.os.set_desktop_app_running(true);
     let mut core = manual(&mac);
-    let perso_before: Vec<_> = sidebars(&mac)
+    let perso_entries_before: Vec<_> = sidebars(&mac)
         .into_iter()
-        .filter(|(path, _)| path.starts_with(format!("{SIDEBAR}/{}", PERSO.0)))
+        .filter(|(path, _)| path.starts_with(folder(PERSO)))
         .collect();
 
     sync(&mut core);
 
-    let perso_after: Vec<_> = sidebars(&mac)
+    let added = read(&mac, PERSO, "s1").expect("a Session Claude's sidebar lacked is added");
+    assert_eq!(added, without_cleared(entry("s1", "From Work")));
+    assert!(read(&mac, PERSO_TEAM, "s1").is_some());
+    assert!(read(&mac, PERSO_TEAM, "s2").is_some());
+    let perso_entries_after: Vec<_> = sidebars(&mac)
         .into_iter()
-        .filter(|(path, _)| path.starts_with(format!("{SIDEBAR}/{}", PERSO.0)))
+        .filter(|(path, _)| path.starts_with(folder(PERSO)))
+        .filter(|(path, _)| !path.ends_with("local_s1.json"))
         .collect();
-    assert_eq!(perso_after, perso_before);
-    assert!(
-        read(&mac, WORK, "desktop-marker").is_some(),
-        "the other Profile still gets Perso's Sessions"
+    assert_eq!(
+        perso_entries_after, perso_entries_before,
+        "entries already in a sidebar Claude uses are never replaced"
     );
     assert_eq!(
         note(&core),
-        "Synced 1 entry into 1 sidebar · the Profile Claude is using syncs once Claude is quit"
+        "Synced 5 entries into 3 sidebars · 4 added to the sidebar Claude is using: \
+         Claude shows them once it's reopened · 1 changed entry there syncs once Claude is quit"
     );
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(
+            "Synced 5 entries into 3 sidebars · 4 added to Claude's sidebar, shown once it's reopened"
+        )
+    );
+
+    // AccRoster's own additions are no trace of Claude writing elsewhere.
+    mac.clock.advance(seconds(60));
+    changed(
+        &mut core,
+        &[
+            mac.path(entry_path(PERSO_TEAM, "s1")),
+            mac.path(entry_path(PERSO, "s1")),
+        ],
+    );
+    assert!(!is_paused(&core));
 
     mac.os.set_desktop_app_running(false);
     sync(&mut core);
 
-    assert!(read(&mac, PERSO, "s1").is_some());
-    assert!(read(&mac, PERSO_TEAM, "s1").is_some());
+    assert!(!is_paused(&core));
+    assert_eq!(
+        read(&mac, PERSO, "s2").unwrap()["lastActivityAt"],
+        1_761_500_000_000_i64
+    );
+}
+
+#[test]
+fn an_entry_claude_creates_while_sync_adds_it_is_kept() {
+    let mac = FakeMac::new();
+    put(&mac, WORK, "s1", &entry("s1", "From Work"));
+    desktop_uses(&mac, PERSO);
+    mac.os.set_desktop_app_running(true);
+    let mut core = manual(&mac);
+    let command = core.view().settings.sidebar_sync.sync_now.unwrap();
+    core.command(command);
+    // Claude opens the Session and saves its own entry before sync's write.
+    let claudes = entry("s1", "Claude's own");
+    put(&mac, PERSO, "s1", &claudes);
+
+    settle(&mut core);
+
+    assert_eq!(read(&mac, PERSO, "s1"), Some(claudes));
+    assert!(!is_paused(&core));
 }
 
 #[test]
@@ -648,26 +696,19 @@ fn the_copy_with_the_newest_activity_carries_the_current_transcript() {
 // ----- Safety pauses -------------------------------------------------------------------
 
 #[test]
-fn an_unknown_top_level_field_pauses_sync_before_any_write_until_resumed() {
+fn an_unknown_top_level_field_is_copied_as_is_and_noted_without_pausing_sync() {
     let mac = FakeMac::new();
     mac.os.set_desktop_app_version(Some("3.7000.0"));
     let mut core = manual(&mac);
     let mut newer = entry("s1", "One");
-    newer["accountBoundThing"] = json!("x");
+    newer["brandNewField"] = json!({"kept": true});
     put(&mac, PERSO, "s1", &newer);
     empty_folder(&mac, WORK);
-    let before = sidebars(&mac);
 
     sync(&mut core);
 
-    assert_eq!(sidebars(&mac), before, "nothing was written");
-    assert!(is_paused(&core));
-    assert!(
-        warnings(&core)
-            .contains(&"Claude 3.7000.0 changed Sidebar entries · Sidebar sync paused".to_owned()),
-        "{:?}",
-        warnings(&core)
-    );
+    assert!(!is_paused(&core));
+    assert_eq!(read(&mac, WORK, "s1"), Some(without_cleared(newer)));
     let check = core
         .view()
         .diagnostics
@@ -675,35 +716,37 @@ fn an_unknown_top_level_field_pauses_sync_before_any_write_until_resumed() {
         .into_iter()
         .find(|check| check.name == "Sidebar entries")
         .unwrap();
-    assert_eq!(check.status, CheckStatus::Fail);
-    assert!(check.detail.unwrap().contains("accountBoundThing"));
-    assert_eq!(resume_button(&core), None, "not while the field is there");
-
-    put(&mac, PERSO, "s1", &entry("s1", "One"));
-    sync(&mut core);
+    assert_eq!(check.status, CheckStatus::Pass);
     assert_eq!(
-        sidebars(&mac).len(),
-        before.len(),
-        "still paused: Resume is a click"
+        check.detail.as_deref(),
+        Some("1 entries read · new fields seen: brandNewField")
     );
-
-    core.command(Command::OpenDiagnostics);
-    core.command(resume_button(&core).expect("Resume once the check passes"));
-    sync(&mut core);
-    assert!(!is_paused(&core));
-    assert!(read(&mac, WORK, "s1").is_some());
 }
 
 #[test]
-fn with_sync_off_an_unknown_field_pauses_nothing() {
+fn a_pause_for_new_entry_fields_from_an_earlier_version_can_be_resumed() {
     let mac = FakeMac::new();
-    let mut newer = entry("s1", "One");
-    newer["accountBoundThing"] = json!("x");
-    put(&mac, PERSO, "s1", &newer);
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    drop(core);
+    std::fs::create_dir_all(mac.app_support().join("state")).unwrap();
+    std::fs::write(
+        mac.app_support().join("state/safety.json"),
+        json!({ "version": 1, "paused": [
+            { "feature": "sidebarSync", "reason": "Claude 3.7000.0 changed Sidebar entries" }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    core = mac.launch();
+    assert!(is_paused(&core));
 
-    let core = mac.launch();
+    core.command(resume_button(&core).expect("Resume is offered: new fields no longer block"));
+    sync(&mut core);
 
     assert!(!is_paused(&core));
+    assert!(read(&mac, WORK, "s1").is_some());
 }
 
 #[test]
