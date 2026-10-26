@@ -1,5 +1,6 @@
 //! Backups are pruned at launch: each file keeps its last 5 backups plus any
-//! under 30 days old; `.zshrc` backups are never pruned.
+//! under 30 days old, a Sidebar folder only its last 2; `.zshrc` backups are
+//! never pruned.
 
 use accroster_fake_mac::FakeMac;
 use jiff::{SignedDuration, Timestamp};
@@ -68,4 +69,23 @@ fn zshrc_backups_are_never_pruned() {
     let _core = mac.launch();
 
     assert_eq!(kept(&mac, ".zshrc-5e6f7a8b"), names(&days));
+}
+
+fn backed_up_folder(mac: &FakeMac, group: &str, days: &[i64]) {
+    for day in days {
+        mac.write_file(
+            format!("{BACKUPS}/{group}/{}/local_x.json", taken_days_ago(*day)),
+            "{}",
+        );
+    }
+}
+
+#[test]
+fn launch_keeps_only_a_sidebar_folders_last_two_backups_whatever_their_age() {
+    let mac = FakeMac::new();
+    backed_up_folder(&mac, "0e000f92-abcd-a7d62cfd", &[1, 2, 3, 4]);
+
+    let _core = mac.launch();
+
+    assert_eq!(kept(&mac, "0e000f92-abcd-a7d62cfd"), names(&[1, 2]));
 }

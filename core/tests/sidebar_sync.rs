@@ -977,7 +977,7 @@ fn a_folder_changed_after_an_account_switch_is_not_a_pause() {
 }
 
 #[test]
-fn old_folder_backups_are_pruned_at_launch_keeping_the_last_five() {
+fn a_sidebar_folder_keeps_only_its_last_two_backups() {
     let mac = FakeMac::new();
     empty_folder(&mac, WORK);
     let mut core = manual(&mac);
@@ -998,13 +998,13 @@ fn old_folder_backups_are_pruned_at_launch_keeping_the_last_five() {
             .filter(|name| name.ends_with(".bak"))
             .count()
     };
-    assert_eq!(copies(&mac), 7);
+    assert_eq!(copies(&mac), 2, "pruned as each sync backs the folder up");
 
     mac.clock.advance(jiff::SignedDuration::from_hours(31 * 24));
     drop(core);
     mac.launch();
 
-    assert_eq!(copies(&mac), 5);
+    assert_eq!(copies(&mac), 2);
 }
 
 // ----- Automatic mode ------------------------------------------------------------------
