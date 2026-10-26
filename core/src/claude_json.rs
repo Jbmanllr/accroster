@@ -71,6 +71,17 @@ impl LoginNames {
             .join(" · ")
     }
 
+    /// The Organization as people call it: its name when that tells, else
+    /// the person's (`Ada Lovelace's Organization`) for the personal default.
+    pub fn organization_label(&self) -> String {
+        let person = self.full_name.as_deref().or(self.display_name.as_deref());
+        match (self.telling_organization(), person) {
+            (Some(organization), _) => organization.to_owned(),
+            (None, Some(person)) => format!("{person}'s Organization"),
+            (None, None) => self.organization_name.clone(),
+        }
+    }
+
     /// `email · Organization`, for the hover line.
     pub fn email_and_organization(&self) -> String {
         format!("{} · {}", self.email, self.organization_name)
