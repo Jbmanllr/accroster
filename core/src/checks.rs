@@ -137,9 +137,10 @@ const SIDEBAR_ROOT: &str = "Library/Application Support/Claude/claude-code-sessi
 
 /// Files and folders an org folder holds besides `local_*.json` and
 /// `deleted_*`.
-const SIDEBAR_FOLDER_FILES: [&str; 4] = [
+const SIDEBAR_FOLDER_FILES: [&str; 5] = [
     "archived-sessions.idx",
     "scheduled-tasks.json",
+    "account-plugins-sent.json",
     "waiting-input",
     "backlog",
 ];

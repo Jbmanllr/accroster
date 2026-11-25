@@ -15,6 +15,10 @@ use crate::profiles::CrossCheckAnswer;
 use crate::safety::{self, CheckId, Finding};
 use crate::sidebar_sync;
 
+/// How a Sidebar sync pause from the Sidebar entries check ends: "Claude
+/// 3.6556.2 changed Sidebar entries". Saved pauses keep this wording.
+const ENTRIES_CHANGED: &str = "changed Sidebar entries";
+
 /// What the last link check found in one Profile folder.
 pub(super) struct ProfileLinks {
     id: String,
@@ -283,6 +287,14 @@ impl Core {
         }
     }
 
+    /// Whether Sidebar sync's pause came from the Sidebar entries check, the
+    /// one pause Sync now resumes once that check passes again.
+    pub(super) fn sidebar_entries_paused_sync(&self) -> bool {
+        self.safety
+            .paused_reason(SafetyFeature::SidebarSync)
+            .is_some_and(|reason| reason.ends_with(ENTRIES_CHANGED))
+    }
+
     /// The Sidebar entries check. A failure pauses Sidebar sync only while
     /// sync is on: with it off, nothing would be written anyway.
     pub(super) fn check_sidebar_entries(&mut self) {
@@ -295,7 +307,7 @@ impl Core {
         );
         if finding.status == CheckStatus::Fail && self.settings.sidebar_sync != SidebarSyncMode::Off
         {
-            let reason = format!("{} changed Sidebar entries", desktop_name(&self.versions));
+            let reason = format!("{} {ENTRIES_CHANGED}", desktop_name(&self.versions));
             finding = finding.blocking(SafetyFeature::SidebarSync, reason);
         }
         self.safety.record(CheckId::SidebarEntries, finding);
