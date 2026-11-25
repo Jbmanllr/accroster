@@ -956,6 +956,29 @@ fn an_unknown_file_in_a_sidebar_folder_pauses_sidebar_sync() {
 }
 
 #[test]
+fn sync_now_resumes_a_sidebar_sync_pause_once_its_cause_is_gone() {
+    let mac = FakeMac::new();
+    sidebar_folder_with(&mac, &["something-new.json"]);
+    let mut core = mac.launch();
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+    core.command(Command::SyncSidebarNow);
+    assert!(
+        is_paused(&core, SafetyFeature::SidebarSync),
+        "Sync now keeps the pause while its cause is there"
+    );
+
+    let account = FixtureLogin::perso();
+    std::fs::remove_file(mac.path(format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}/something-new.json",
+        account.account_uuid, account.organization_uuid
+    )))
+    .expect("remove the unknown file");
+    core.command(Command::SyncSidebarNow);
+
+    assert!(!is_paused(&core, SafetyFeature::SidebarSync));
+}
+
+#[test]
 fn live_process_files_missing_a_field_fail_the_check() {
     let mac = FakeMac::new();
     mac.write_live_process(

@@ -928,10 +928,11 @@ fn resuming_takes_the_paused_line_off_the_menu_at_once() {
     let mut core = manual(&mac);
     drop(core);
     std::fs::create_dir_all(mac.app_support().join("state")).unwrap();
+    // A pause Sync now leaves alone: only the user's Resume lifts it.
     std::fs::write(
         mac.app_support().join("state/safety.json"),
         json!({ "version": 1, "paused": [
-            { "feature": "sidebarSync", "reason": "Claude 3.7000.0 changed Sidebar entries" }
+            { "feature": "sidebarSync", "reason": "Claude wrote to a Profile it isn't using" }
         ] })
         .to_string(),
     )
