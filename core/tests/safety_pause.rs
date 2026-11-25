@@ -4,7 +4,9 @@
 
 mod common;
 
-use accroster_core::{CheckRow, CheckStatus, Command, Core, Effect, Event, SafetyFeature};
+use accroster_core::{
+    CheckRow, CheckStatus, Command, Core, Effect, Event, SafetyFeature, SidebarSyncMode,
+};
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
 use serde_json::json;
@@ -892,6 +894,65 @@ fn a_sidebar_entry_named_unlike_its_session_id_fails_the_check() {
         check.detail.as_deref(),
         Some("sessionId differs from the file name in 1")
     );
+}
+
+/// A Sidebar folder holding one good entry, with `others` written next to it.
+fn sidebar_folder_with(mac: &FakeMac, others: &[&str]) {
+    let account = FixtureLogin::perso();
+    mac.write_sidebar_entry(
+        &account.account_uuid,
+        &account.organization_uuid,
+        "0f1e",
+        &json!({ "sessionId": "local_0f1e", "title": "t" }),
+    );
+    let folder = format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}",
+        account.account_uuid, account.organization_uuid
+    );
+    for name in others {
+        mac.write_json(format!("{folder}/{name}"), &json!([]));
+    }
+}
+
+#[test]
+fn the_files_claude_keeps_beside_sidebar_entries_dont_pause_sidebar_sync() {
+    let mac = FakeMac::new();
+    sidebar_folder_with(
+        &mac,
+        &[
+            "archived-sessions.idx",
+            "scheduled-tasks.json",
+            "account-plugins-sent.json",
+            "backlog/local_x.json",
+            "waiting-input/local_y.json",
+        ],
+    );
+    let mut core = mac.launch();
+
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+
+    assert_eq!(
+        diagnostics_check(&core, "Sidebar entries").status,
+        CheckStatus::Pass
+    );
+    assert!(!is_paused(&core, SafetyFeature::SidebarSync));
+}
+
+#[test]
+fn an_unknown_file_in_a_sidebar_folder_pauses_sidebar_sync() {
+    let mac = FakeMac::new();
+    sidebar_folder_with(&mac, &["something-new.json"]);
+    let mut core = mac.launch();
+
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+
+    let check = diagnostics_check(&core, "Sidebar entries");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert_eq!(
+        check.detail.as_deref(),
+        Some("1 unknown files in Sidebar folders")
+    );
+    assert!(is_paused(&core, SafetyFeature::SidebarSync));
 }
 
 #[test]
