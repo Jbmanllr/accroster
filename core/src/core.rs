@@ -990,6 +990,45 @@ impl Core {
         if items.len() > before {
             items.push(MenuItem::Separator);
         }
+        items.extend(self.fixed_menu_items());
+        let hidden_discovered = shown
+            .iter()
+            .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
+            .map(|(evidence, choice)| HiddenDiscovered {
+                title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
+                restore: Command::UnhideDiscovered(evidence.pair.clone()),
+            })
+            .collect();
+        View {
+            menu_bar: MenuBarView {
+                label: cli.label,
+                dimmed: menu_bar_dimmed,
+            },
+            menu: MenuView { items },
+            settings: self.settings_view(login_item, profile_settings, hidden_discovered),
+            about: AboutView {
+                name: "AccRoster".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                tagline: TAGLINE.into(),
+                disclaimer: DISCLAIMER.into(),
+            },
+            all_sessions: self.all_sessions(),
+            // Offered once: only until answered, and only while it's ours to
+            // offer (not already on, not turned off in System Settings).
+            first_run: (self.settings.launch_at_login.is_none()
+                && login_item == LoginItemStatus::NotRegistered)
+                .then_some(FirstRunView {
+                    launch_at_login: true,
+                }),
+            diagnostics: self.diagnostics(),
+        }
+    }
+
+    /// The menu's last items, the same whatever the Profiles are: Recent
+    /// Sessions, All Sessions…, Add Profile… (or the sign-in under way),
+    /// Settings…, Diagnostics…, About and Quit.
+    fn fixed_menu_items(&self) -> Vec<MenuItem> {
+        let mut items = Vec::new();
         let recent: Vec<MenuItem> = self
             .sessions
             .recent(RECENT_SESSIONS)
@@ -1039,74 +1078,56 @@ impl Core {
                 command: Command::Quit,
             },
         ]);
-        View {
-            menu_bar: MenuBarView {
-                label: cli.label,
-                dimmed: menu_bar_dimmed,
+        items
+    }
+
+    /// The Settings window. `profiles` and `hidden_discovered` come from
+    /// [`Core::view`], which lists the Profiles once for the menu and for
+    /// Settings.
+    fn settings_view(
+        &self,
+        login_item: LoginItemStatus,
+        profiles: Vec<ProfileSettings>,
+        hidden_discovered: Vec<HiddenDiscovered>,
+    ) -> SettingsView {
+        SettingsView {
+            verbose_logging: self.verbose_logging(),
+            verbose_logging_note: "Turns itself off after 24 hours.".into(),
+            launch_at_login: launch_at_login_view(login_item),
+            cli_switching: CliSwitchingView {
+                on: cli_switcher::is_on(&self.paths),
+                line: cli_switcher::path_line(&self.paths),
+                note: self.cli_switching_note(),
             },
-            menu: MenuView { items },
-            settings: SettingsView {
-                verbose_logging: self.verbose_logging(),
-                verbose_logging_note: "Turns itself off after 24 hours.".into(),
-                launch_at_login: launch_at_login_view(login_item),
-                cli_switching: CliSwitchingView {
-                    on: cli_switcher::is_on(&self.paths),
-                    line: cli_switcher::path_line(&self.paths),
-                    note: self.cli_switching_note(),
-                },
-                sidebar_sync: SidebarSyncView {
-                    mode: self.settings.sidebar_sync,
-                    sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
-                        .then_some(Command::SyncSidebarNow),
-                    note: self.sync_settings_note(),
-                    reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
-                    ssh_and_no_folder_sessions: Toggle {
-                        on: !self.settings.leave_out_ssh_and_no_folder_sessions,
-                        command: Command::SetIncludeSshAndNoFolderSessions(
-                            self.settings.leave_out_ssh_and_no_folder_sessions,
-                        ),
-                    },
-                },
-                profiles: profile_settings,
-                hidden_discovered: shown
-                    .iter()
-                    .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
-                    .map(|(evidence, choice)| HiddenDiscovered {
-                        title: evidence
-                            .hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
-                        restore: Command::UnhideDiscovered(evidence.pair.clone()),
-                    })
-                    .collect(),
-                notifications: NotificationsView {
-                    thresholds: self.settings.thresholds.values().to_vec(),
-                    reset_notification: self.settings.reset_notification,
-                },
-                uninstall: match &self.uninstalling {
-                    Some(_) => UninstallView {
-                        note: Some("Uninstalling · signing every Profile out…".into()),
-                        retry: None,
-                    },
-                    None => UninstallView {
-                        note: self.uninstall_note.clone(),
-                        retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
-                    },
+            sidebar_sync: SidebarSyncView {
+                mode: self.settings.sidebar_sync,
+                sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
+                    .then_some(Command::SyncSidebarNow),
+                note: self.sync_settings_note(),
+                reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
+                ssh_and_no_folder_sessions: Toggle {
+                    on: !self.settings.leave_out_ssh_and_no_folder_sessions,
+                    command: Command::SetIncludeSshAndNoFolderSessions(
+                        self.settings.leave_out_ssh_and_no_folder_sessions,
+                    ),
                 },
             },
-            about: AboutView {
-                name: "AccRoster".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                tagline: TAGLINE.into(),
-                disclaimer: DISCLAIMER.into(),
+            profiles,
+            hidden_discovered,
+            notifications: NotificationsView {
+                thresholds: self.settings.thresholds.values().to_vec(),
+                reset_notification: self.settings.reset_notification,
             },
-            all_sessions: self.all_sessions(),
-            // Offered once: only until answered, and only while it's ours to
-            // offer (not already on, not turned off in System Settings).
-            first_run: (self.settings.launch_at_login.is_none()
-                && login_item == LoginItemStatus::NotRegistered)
-                .then_some(FirstRunView {
-                    launch_at_login: true,
-                }),
-            diagnostics: self.diagnostics(),
+            uninstall: match &self.uninstalling {
+                Some(_) => UninstallView {
+                    note: Some("Uninstalling · signing every Profile out…".into()),
+                    retry: None,
+                },
+                None => UninstallView {
+                    note: self.uninstall_note.clone(),
+                    retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                },
+            },
         }
     }
 
