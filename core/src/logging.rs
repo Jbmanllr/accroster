@@ -25,6 +25,8 @@ use std::sync::LazyLock;
 use jiff::Timestamp;
 use regex::Regex;
 
+use crate::claude_files;
+
 /// `app.log` rotates once a write would take it past this size.
 pub(crate) const ROTATE_AT_BYTES: u64 = 1024 * 1024;
 /// How many rotated files (`app.log.1` …) are kept.
@@ -145,8 +147,8 @@ fn render_path(home: &Path, path: &Path) -> String {
                 continue;
             }
             Component::Normal(part) => {
-                let hashed = previous[0] == Some(".claude".as_ref())
-                    && previous[1] == Some("projects".as_ref());
+                let hashed = previous[0] == Some(claude_files::CLAUDE_HOME.as_ref())
+                    && previous[1] == Some(claude_files::PROJECTS.as_ref());
                 previous = [previous[1], Some(part)];
                 if hashed {
                     format!("<project {}>", short_hash(&part.to_string_lossy()))

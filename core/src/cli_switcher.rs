@@ -22,6 +22,7 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::backups;
+use crate::claude_files::{self, ClaudePaths};
 use crate::interface::{Badge, Command, MenuItem};
 use crate::profiles::Listed;
 use crate::storage::{self, AppPaths};
@@ -506,11 +507,11 @@ pub(crate) fn ensure_links(profile_dir: &Path, claude_home: &Path) -> io::Result
 /// nothing if the Profile already has a `.claude.json`. A missing or
 /// unreadable `~/.claude.json` seeds an empty object.
 pub(crate) fn seed_claude_json(profile_dir: &Path, home: &Path) -> io::Result<()> {
-    let target = profile_dir.join(".claude.json");
+    let target = claude_files::config_file(profile_dir);
     if fs::symlink_metadata(&target).is_ok() {
         return Ok(());
     }
-    let source: Value = fs::read(home.join(".claude.json"))
+    let source: Value = fs::read(ClaudePaths::new(home).default_config_file())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);

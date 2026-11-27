@@ -7,6 +7,7 @@ use std::path::Path;
 use super::Core;
 use super::sidebar::desktop_name;
 use crate::checks;
+use crate::claude_files::ClaudePaths;
 use crate::cli_switcher;
 use crate::desktop;
 use crate::interface::{CheckStatus, MenuItem, SafetyFeature, SidebarSyncMode};
@@ -117,7 +118,7 @@ impl Core {
         }
         let home = self.env.home.clone();
         self.check_sidebar_entries();
-        let mut session_dirs = vec![home.join(".claude")];
+        let mut session_dirs = vec![ClaudePaths::new(&home).claude_home()];
         session_dirs.extend(
             self.profiles
                 .folders()
@@ -163,7 +164,7 @@ impl Core {
     /// Checks every Profile folder's links: a replaced shared-Transcript link
     /// pauses Profile links; other replaced links are only reported.
     pub(super) fn check_links(&mut self) {
-        let claude_home = self.env.home.join(".claude");
+        let claude_home = ClaudePaths::new(&self.env.home).claude_home();
         self.links = self
             .profiles
             .folders()

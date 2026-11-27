@@ -8,6 +8,7 @@
 mod backups;
 mod checks;
 mod claude_code;
+mod claude_files;
 mod claude_json;
 mod cli_switcher;
 mod core;

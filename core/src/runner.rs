@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
+use crate::claude_files::ClaudePaths;
 use crate::env::{Environment, RunningProcess, SpawnOutput, SpawnRequest};
 use crate::storage::AppPaths;
 use crate::usage::{self, UsageReply};
@@ -422,7 +423,7 @@ impl<'a> Runner<'a> {
         stdin: Option<Vec<u8>>,
     ) -> io::Result<SpawnRequest> {
         if config_dir.parent() != Some(self.paths.profiles().as_path())
-            || config_dir == self.env.home.join(".claude")
+            || config_dir == ClaudePaths::new(&self.env.home).claude_home()
         {
             return Err(io::Error::other("Claude Code only runs in Profile folders"));
         }

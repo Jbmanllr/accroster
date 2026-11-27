@@ -59,13 +59,11 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::backups;
-use crate::desktop::{self, DesktopPaths};
+use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
+use crate::desktop;
 use crate::env::Environment;
 use crate::interface::Effect;
 use crate::storage::{self, AppPaths, VersionedFile};
-
-/// The desktop app's loader skips larger entries; so does sync.
-const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Fields a copy clears: they tie an entry to one account's connectors and
 /// remote-control bridge. The desktop app rebuilds them.
@@ -362,9 +360,9 @@ impl Watch {
     /// Starts the watch while sync is `on` and the sidebars' folder exists
     /// (checked again on every input until it does); stops it when off.
     pub(crate) fn reconcile(&mut self, env: &Environment, on: bool) -> Option<Effect> {
-        let root = sidebar_root(&env.home);
+        let root = ClaudePaths::new(&env.home).sidebar_root();
         if on && !self.watching && root.is_dir() {
-            let desktop_paths = DesktopPaths::new(&env.home);
+            let desktop_paths = ClaudePaths::new(&env.home);
             *self = Watch {
                 watching: true,
                 desktop: active_key(&desktop_paths),
@@ -387,7 +385,7 @@ impl Watch {
         if !self.watching {
             return;
         }
-        let desktop_paths = DesktopPaths::new(&env.home);
+        let desktop_paths = ClaudePaths::new(&env.home);
         let desktop = active_key(&desktop_paths);
         let signed_in = desktop::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
         if desktop != self.desktop || signed_in {
@@ -414,7 +412,7 @@ impl Watch {
         }
         self.notice_switch(env);
         let now = env.clock.now();
-        let root = sidebar_root(&env.home);
+        let root = ClaudePaths::new(&env.home).sidebar_root();
         let record = load(paths);
         let mut elsewhere = 0;
         for path in changed {
@@ -481,8 +479,8 @@ fn entry_location(root: &Path, path: &Path) -> Option<(String, String)> {
     let [account, org, name] = parts.as_slice() else {
         return None;
     };
-    let entry = name.starts_with("local_") && name.ends_with(".json");
-    (desktop::is_uuid(account) && desktop::is_uuid(org) && entry)
+    let entry = claude_files::sidebar_entry_id(name).is_some();
+    (claude_files::is_uuid(account) && claude_files::is_uuid(org) && entry)
         .then(|| (format!("{account}/{org}"), (*name).to_owned()))
 }
 
@@ -501,12 +499,8 @@ fn parse_body(bytes: &[u8]) -> Option<Map<String, Value>> {
     }
 }
 
-fn sidebar_root(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/Claude/claude-code-sessions")
-}
-
 /// The desktop's Active Profile folder as `<account>/<org>`.
-fn active_key(desktop_paths: &DesktopPaths) -> Option<String> {
+fn active_key(desktop_paths: &ClaudePaths) -> Option<String> {
     let account = desktop::desktop_account(desktop_paths)?;
     let org = account.organization_uuid?;
     Some(format!("{}/{org}", account.account_uuid))
@@ -555,7 +549,7 @@ pub(crate) fn begin(
     personal: &BTreeMap<String, String>,
     cache: &mut EntryCache,
 ) -> Begun {
-    let desktop_paths = DesktopPaths::new(&env.home);
+    let desktop_paths = ClaudePaths::new(&env.home);
     let desktop = desktop::desktop_account(&desktop_paths);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
@@ -810,7 +804,7 @@ fn date_copy(file: &Path, bytes: &[u8], modified: SystemTime) -> Option<Stamp> {
 /// Resuming after a Safety pause: the user accepts the folders as they are
 /// now, so the next run compares against them.
 pub(crate) fn accept_current(env: &Environment, paths: &AppPaths, cache: &mut EntryCache) {
-    let desktop_paths = DesktopPaths::new(&env.home);
+    let desktop_paths = ClaudePaths::new(&env.home);
     let read = read_all(&env.home, false, cache);
     let mut record = load(paths);
     record.folders = read
@@ -1115,25 +1109,23 @@ impl io::Write for Fnv {
 /// parsing only the entries changed since `cache`, which then holds every
 /// entry as read now.
 fn read_all(home: &Path, include_optional: bool, cache: &mut EntryCache) -> Read {
-    let root = sidebar_root(home);
+    let root = ClaudePaths::new(home).sidebar_root();
     let mut read = Read {
         folders: Vec::new(),
         skipped: BTreeMap::new(),
         parsed: 0,
     };
     let mut before = std::mem::take(&mut cache.0);
-    for (account, account_path) in uuid_folders(&root) {
-        for (org, path) in uuid_folders(&account_path) {
-            let mut folder = Folder {
-                key: format!("{account}/{org}"),
-                account: account.clone(),
-                path,
-                copies: BTreeMap::new(),
-                tombstones: BTreeSet::new(),
-            };
-            read_folder(&mut folder, &mut read, include_optional, &mut before, cache);
-            read.folders.push(folder);
-        }
+    for found in claude_files::sidebar_folders(&root) {
+        let mut folder = Folder {
+            key: format!("{}/{}", found.account, found.organization),
+            account: found.account,
+            path: found.path,
+            copies: BTreeMap::new(),
+            tombstones: BTreeSet::new(),
+        };
+        read_folder(&mut folder, &mut read, include_optional, &mut before, cache);
+        read.folders.push(folder);
     }
     read
 }
@@ -1152,14 +1144,11 @@ fn read_folder(
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if let Some(id) = name.strip_prefix("deleted_") {
+        if let Some(id) = name.strip_prefix(claude_files::TOMBSTONE_PREFIX) {
             folder.tombstones.insert(id.to_owned());
             continue;
         }
-        let Some(stem) = name
-            .strip_suffix(".json")
-            .filter(|stem| stem.starts_with("local_"))
-        else {
+        let Some(stem) = claude_files::sidebar_entry_id(&name) else {
             continue;
         };
         let Ok(meta) = entry.metadata() else { continue };
@@ -1211,7 +1200,7 @@ fn left_out(body: &Map<String, Value>) -> Option<LeftOut> {
     let scratch = |field: &str| {
         body.get(field)
             .and_then(Value::as_str)
-            .is_some_and(|cwd| cwd.contains("/scratch-workspaces/"))
+            .is_some_and(claude_files::is_scratch_workspace)
     };
     if has(&WSL_MARKERS) {
         Some(LeftOut::Wsl)
@@ -1235,23 +1224,6 @@ impl Read {
         }
         counts
     }
-}
-
-/// Real subfolders whose names are uuids, sorted.
-fn uuid_folders(dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut found: Vec<(String, PathBuf)> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let uuid = name.len() == 36 && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-            uuid.then(|| (name, entry.path()))
-        })
-        .collect();
-    found.sort();
-    found
 }
 
 fn load(paths: &AppPaths) -> Record {

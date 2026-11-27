@@ -21,6 +21,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::claude_files::{self, ClaudePaths};
 use crate::env::Environment;
 use crate::logging::{Field, Level, Logger};
 use crate::runner::{Finished, Job, Runner};
@@ -176,9 +177,9 @@ fn search(env: &Environment, paths: &AppPaths, shell: &ShellLookup) -> Option<(P
     if let Some(found) = inherited.and_then(|path| in_folders(&mut std::env::split_paths(&path))) {
         return Some((found, Source::Path));
     }
-    let mut usual = [".local/bin", ".claude/local"]
+    let mut usual = ClaudePaths::new(&env.home)
+        .usual_program_folders()
         .into_iter()
-        .map(|folder| env.home.join(folder))
         .chain(env.os.program_folders());
     if let Some(found) = in_folders(&mut usual) {
         return Some((found, Source::UsualFolder));
@@ -232,8 +233,8 @@ impl Skip {
 /// Terminal's.
 fn is_bundled(resolved: &Path) -> bool {
     let text = resolved.to_string_lossy();
-    text.contains("/Library/Application Support/Claude/claude-code/")
-        || text.starts_with("/Applications/Claude.app/")
+    text.contains(claude_files::BUNDLED_CLAUDE_CODE)
+        || Path::new(&*text).starts_with(claude_files::DESKTOP_APP)
 }
 
 fn is_executable(path: &Path) -> bool {

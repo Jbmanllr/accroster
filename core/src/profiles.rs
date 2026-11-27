@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
+use crate::claude_files::{self, ClaudePaths};
 use crate::claude_json::{self, LoginNames};
 use crate::cli_switcher;
 use crate::env::{Environment, RunningProcess};
@@ -78,7 +79,7 @@ impl Identity {
     /// `oauthAccount` of `<config_dir>/.claude.json`, or `None` when the
     /// folder holds no sign-in.
     fn read(config_dir: &Path) -> Option<Identity> {
-        let account = claude_json::read_account(&config_dir.join(".claude.json"))?;
+        let account = claude_json::read_account(&claude_files::config_file(config_dir))?;
         Some(Identity {
             key: account.key,
             names: account.names,
@@ -1321,7 +1322,7 @@ impl ProfileRegistry {
         let expected = profile.identity.clone();
         let config_dir = profile.config_dir.clone();
         self.notice = None;
-        let previous_account = fs::read(config_dir.join(".claude.json"))
+        let previous_account = fs::read(claude_files::config_file(&config_dir))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|body| body.get("oauthAccount").cloned());
@@ -1523,7 +1524,7 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
         );
         return;
     }
-    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
+    match cli_switcher::ensure_links(config_dir, &ClaudePaths::new(&ctx.env.home).claude_home()) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(
@@ -1598,7 +1599,7 @@ fn restore_account(
     let result = if ctx.is_paused(SafetyFeature::Seeding) {
         Err(NotRestored::Paused)
     } else {
-        write_account(ctx, &config_dir.join(".claude.json"), account)
+        write_account(ctx, &claude_files::config_file(config_dir), account)
     };
     if let Err(not_restored) = &result {
         let reason = match not_restored {

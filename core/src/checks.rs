@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
 use crate::claude_json;
 use crate::interface::{ClaudeVersions, SafetyFeature};
 use crate::profiles::{Account, CrossCheckAnswer};
@@ -30,7 +31,7 @@ pub(crate) fn accounts(folders: &[&Path], claude_code: &str) -> (Finding, Findin
     let mut caches_seen = 0;
     let mut bad_caches = BTreeSet::new();
     for folder in folders {
-        let Some(body) = claude_json::read(&folder.join(".claude.json")) else {
+        let Some(body) = claude_json::read(&claude_files::config_file(folder)) else {
             continue;
         };
         if let Some(account) = claude_json::oauth_account(&body) {
@@ -132,10 +133,7 @@ fn profiles(count: usize) -> String {
     }
 }
 
-/// The desktop app's Sidebar folders, as the self-check sees them.
-const SIDEBAR_ROOT: &str = "Library/Application Support/Claude/claude-code-sessions";
-
-/// Files and folders an org folder holds besides `local_*.json` and
+/// Files and folders a Sidebar folder holds besides `local_*.json` and
 /// `deleted_*`.
 const SIDEBAR_FOLDER_FILES: [&str; 5] = [
     "archived-sessions.idx",
@@ -395,9 +393,6 @@ pub(crate) const SIDEBAR_ENTRY_FIELDS: &[&str] = &[
     "wslConfig",
 ];
 
-/// Entries over this size are skipped, as the desktop app's loader does.
-const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
-
 /// At most this many Sidebar entries are read per self-check.
 const MAX_ENTRIES: usize = 5000;
 
@@ -446,7 +441,7 @@ impl Shape {
 /// since `shapes`, which then holds every entry looked at now; also returns
 /// how many it parsed.
 pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding, usize) {
-    let root = home.join(SIDEBAR_ROOT);
+    let root = ClaudePaths::new(home).sidebar_root();
     let mut read = 0usize;
     let mut parsed = 0usize;
     let mut unknown_fields = BTreeSet::new();
@@ -459,16 +454,15 @@ pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding
     {
         for entry in fs::read_dir(&org).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let is_entry = name.starts_with("local_") && name.ends_with(".json");
-            if !is_entry {
-                if !name.starts_with("deleted_")
+            let Some(stem) = claude_files::sidebar_entry_id(&name) else {
+                if !name.starts_with(claude_files::TOMBSTONE_PREFIX)
                     && !name.starts_with('.')
                     && !SIDEBAR_FOLDER_FILES.contains(&name.as_str())
                 {
                     unknown_files += 1;
                 }
                 continue;
-            }
+            };
             if read >= MAX_ENTRIES {
                 continue;
             }
@@ -487,7 +481,7 @@ pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding
                         continue;
                     };
                     parsed += 1;
-                    Shape::of(&bytes, name.trim_end_matches(".json"))
+                    Shape::of(&bytes, stem)
                 }
             };
             if let Some(shape) = &shape {
@@ -535,16 +529,13 @@ pub(crate) fn live_processes(config_dirs: &[PathBuf]) -> Finding {
     let mut read = 0usize;
     let mut bad = BTreeSet::new();
     for dir in config_dirs {
-        for entry in fs::read_dir(dir.join("sessions"))
+        for entry in fs::read_dir(claude_files::live_process_folder(dir))
             .into_iter()
             .flatten()
             .flatten()
         {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(stem) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+            if !claude_files::is_live_process_file(&name) {
                 continue;
             }
             let Some(body) = fs::read(entry.path())
@@ -581,7 +572,7 @@ const TRANSCRIPT_BYTES: u64 = 1024 * 1024;
 /// the first `user` record's content and `entrypoint`, in the newest
 /// top-level Transcripts (links not followed, subagents skipped).
 pub(crate) fn transcript_records(home: &Path) -> Finding {
-    let projects = home.join(".claude/projects");
+    let projects = ClaudePaths::new(home).projects();
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = subfolders(&projects)
         .iter()
         .flat_map(|project| fs::read_dir(project).into_iter().flatten().flatten())

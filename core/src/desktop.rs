@@ -35,6 +35,7 @@ use std::time::SystemTime;
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
+use crate::claude_files::{self, ClaudePaths};
 use crate::env::Environment;
 use crate::interface::{ClaudeVersions, Command, Effect, MenuItem, ProfileKey, StatusTone};
 use crate::logging::{Field, Level};
@@ -45,43 +46,6 @@ const CONFIRM_TIMEOUT: SignedDuration = SignedDuration::from_mins(30);
 
 /// What `main.log` says when Claude finishes signing in.
 const SIGNED_IN_LINE: &str = "Login-state transition (loggedOut: true → false";
-
-/// Where the desktop app keeps the files the bridge reads, all under `~`.
-pub(crate) struct DesktopPaths {
-    /// `~/Library/Application Support/Claude`.
-    user_data: PathBuf,
-    /// `~/Library/Logs/Claude`.
-    logs: PathBuf,
-    /// `~/.claude`.
-    claude_home: PathBuf,
-}
-
-impl DesktopPaths {
-    pub(crate) fn new(home: &Path) -> DesktopPaths {
-        DesktopPaths {
-            user_data: home.join("Library/Application Support/Claude"),
-            logs: home.join("Library/Logs/Claude"),
-            claude_home: home.join(".claude"),
-        }
-    }
-
-    fn config(&self) -> PathBuf {
-        self.user_data.join("config.json")
-    }
-
-    fn sidebar_root(&self) -> PathBuf {
-        self.user_data.join("claude-code-sessions")
-    }
-
-    /// `~/.claude/sessions`, where the desktop's children write.
-    fn live_processes(&self) -> PathBuf {
-        self.claude_home.join("sessions")
-    }
-
-    fn main_log(&self) -> PathBuf {
-        self.logs.join("main.log")
-    }
-}
 
 /// The desktop's account, as far as its files tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,15 +103,17 @@ struct DesktopConfig {
 /// `lastKnownAccountUuid` in the desktop's `config.json`: the one reader of
 /// it. `None` when the file is missing or unreadable, or the value isn't a
 /// uuid.
-pub(crate) fn last_known_account(paths: &DesktopPaths) -> Option<String> {
-    let bytes = fs::read(paths.config()).ok()?;
+pub(crate) fn last_known_account(paths: &ClaudePaths) -> Option<String> {
+    let bytes = fs::read(paths.desktop_config()).ok()?;
     let config: DesktopConfig = serde_json::from_slice(&bytes).ok()?;
-    config.last_known_account_uuid.filter(|id| is_uuid(id))
+    config
+        .last_known_account_uuid
+        .filter(|id| claude_files::is_uuid(id))
 }
 
 /// The desktop's account, or `None` when its `config.json` is missing,
 /// unreadable or names no account.
-pub(crate) fn desktop_account(paths: &DesktopPaths) -> Option<DesktopAccount> {
+pub(crate) fn desktop_account(paths: &ClaudePaths) -> Option<DesktopAccount> {
     NewestEntries::default().desktop_account(paths)
 }
 
@@ -162,7 +128,7 @@ pub(crate) struct NewestEntries(RefCell<HashMap<PathBuf, (SystemTime, Option<Sys
 impl NewestEntries {
     /// [`desktop_account`], listing only the folders that changed since the
     /// last call.
-    pub(crate) fn desktop_account(&self, paths: &DesktopPaths) -> Option<DesktopAccount> {
+    pub(crate) fn desktop_account(&self, paths: &ClaudePaths) -> Option<DesktopAccount> {
         let account_uuid = last_known_account(paths)?;
         let organization_uuid =
             newest_org_folder(&paths.sidebar_root().join(&account_uuid), |folder| {
@@ -198,14 +164,9 @@ fn newest_org_folder(
     account_dir: &Path,
     newest: impl Fn(&Path) -> Option<SystemTime>,
 ) -> Option<String> {
-    fs::read_dir(account_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|org| {
-            let name = org.file_name().into_string().ok().filter(|n| is_uuid(n))?;
-            let newest = newest(&org.path())?;
-            Some((newest, name))
-        })
+    claude_files::uuid_folders(account_dir)
+        .into_iter()
+        .filter_map(|(name, folder)| Some((newest(&folder)?, name)))
         .max()
         .map(|(_, name)| name)
 }
@@ -220,39 +181,25 @@ fn newest_entry(folder: &Path) -> Option<SystemTime> {
 
 /// Every `local_*.json` in a folder, with its modification time.
 fn sidebar_entries(folder: &Path) -> Vec<(String, SystemTime)> {
-    let Ok(entries) = fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            if !(name.starts_with("local_") && name.ends_with(".json")) {
-                return None;
-            }
-            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
-            Some((name, meta.modified().ok()?))
-        })
+    claude_files::sidebar_entry_files(folder)
+        .into_iter()
+        .filter_map(|(name, meta)| Some((name, meta.modified().ok()?)))
         .collect()
 }
 
-/// A folder name the desktop app could have made from a uuid (also keeps
-/// path separators and `..` out of joined paths).
-pub(crate) fn is_uuid(text: &str) -> bool {
-    text.len() == 36 && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 /// `main.log`'s length now, if it exists.
-pub(crate) fn main_log_length(paths: &DesktopPaths) -> Option<u64> {
-    fs::metadata(paths.main_log()).ok().map(|meta| meta.len())
+pub(crate) fn main_log_length(paths: &ClaudePaths) -> Option<u64> {
+    fs::metadata(paths.desktop_main_log())
+        .ok()
+        .map(|meta| meta.len())
 }
 
 /// Whether Claude signed in to an account since `main.log` was `length`
 /// long (a shorter log was rotated: it counts as a sign-in, to be safe).
-pub(crate) fn signed_in_since(paths: &DesktopPaths, length: u64) -> bool {
+pub(crate) fn signed_in_since(paths: &ClaudePaths, length: u64) -> bool {
     match main_log_length(paths) {
         Some(now) if now < length => true,
-        _ => log_signed_in_since(&paths.main_log(), length),
+        _ => log_signed_in_since(&paths.desktop_main_log(), length),
     }
 }
 
@@ -261,22 +208,21 @@ pub(crate) fn signed_in_since(paths: &DesktopPaths, length: u64) -> bool {
 /// The installed Claude versions, from links, folder names and the app's
 /// `Info.plist`; nothing is spawned.
 pub(crate) fn versions(env: &Environment) -> ClaudeVersions {
-    let home = &env.home;
-    let claude_code = fs::read_link(home.join(".local/bin/claude"))
+    let paths = ClaudePaths::new(&env.home);
+    let claude_code = fs::read_link(paths.installed_claude())
         .ok()
         .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
         .filter(|name| version_key(name).is_some());
-    let mut desktop_claude_code: Vec<String> =
-        fs::read_dir(home.join("Library/Application Support/Claude/claude-code"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.path().is_dir())
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|name| version_key(name).is_some())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let mut desktop_claude_code: Vec<String> = fs::read_dir(paths.bundled_claude_code())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| version_key(name).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
     desktop_claude_code.sort_by_key(|name| version_key(name));
     ClaudeVersions {
         claude_code,
@@ -317,7 +263,7 @@ struct LiveProcess {
 }
 
 /// Checks whether switching accounts now would cut a desktop turn.
-pub(crate) fn guard(env: &Environment, paths: &DesktopPaths) -> Guard {
+pub(crate) fn guard(env: &Environment, paths: &ClaudePaths) -> Guard {
     let mut live: Vec<LiveProcess> = live_desktop_processes(env, paths);
     live.sort_by_key(|process| process.pid);
     let mut busy: Vec<String> = Vec::new();
@@ -349,21 +295,20 @@ pub(crate) fn guard(env: &Environment, paths: &DesktopPaths) -> Guard {
 /// The live-process files of running desktop children. Stale files (dead pid,
 /// or a pid reused by a process that started at another time) are skipped,
 /// as are files of other clients. Only `<digits>.json` names are opened.
-fn live_desktop_processes(env: &Environment, paths: &DesktopPaths) -> Vec<LiveProcess> {
-    let Ok(entries) = fs::read_dir(paths.live_processes()) else {
+fn live_desktop_processes(env: &Environment, paths: &ClaudePaths) -> Vec<LiveProcess> {
+    let Ok(entries) = fs::read_dir(claude_files::live_process_folder(&paths.claude_home())) else {
         return Vec::new();
     };
     entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".json")?;
-            if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+            if !claude_files::is_live_process_file(&name) {
                 return None;
             }
             let bytes = fs::read(entry.path()).ok()?;
             let process: LiveProcess = serde_json::from_slice(&bytes).ok()?;
-            if process.entrypoint.as_deref() != Some("claude-desktop") {
+            if process.entrypoint.as_deref() != Some(claude_files::DESKTOP_ENTRYPOINT) {
                 return None;
             }
             let facts = env.os.process(process.pid)?;
@@ -398,7 +343,7 @@ pub(crate) fn parse_proc_start(text: &str) -> Option<Timestamp> {
 
 /// A busy Session's name for the menu: its Sidebar entry's title, else the
 /// name Claude Code recorded, quoted. Shown, never logged.
-fn session_title(paths: &DesktopPaths, process: &LiveProcess) -> String {
+fn session_title(paths: &ClaudePaths, process: &LiveProcess) -> String {
     let from_entry = process
         .host_session_id
         .as_deref()
@@ -411,31 +356,23 @@ fn session_title(paths: &DesktopPaths, process: &LiveProcess) -> String {
 }
 
 /// The `title` of `<id>.json` in any account/Organization folder.
-fn sidebar_title(paths: &DesktopPaths, id: &str) -> Option<String> {
+fn sidebar_title(paths: &ClaudePaths, id: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Entry {
         title: Option<String>,
     }
     let file = format!("{id}.json");
-    for account in fs::read_dir(paths.sidebar_root()).ok()?.flatten() {
-        let Ok(orgs) = fs::read_dir(account.path()) else {
-            continue;
-        };
-        for org in orgs.flatten() {
-            let Ok(bytes) = fs::read(org.path().join(&file)) else {
-                continue;
-            };
-            if let Ok(Entry { title: Some(title) }) = serde_json::from_slice(&bytes) {
-                return Some(title);
-            }
-        }
-    }
-    None
+    claude_files::sidebar_folders(&paths.sidebar_root())
+        .into_iter()
+        .find_map(|folder| {
+            let bytes = fs::read(folder.path.join(&file)).ok()?;
+            serde_json::from_slice::<Entry>(&bytes).ok()?.title
+        })
 }
 
 /// `local_<id>` as the desktop app names Sidebar entries.
 fn is_sidebar_id(id: &str) -> bool {
-    id.strip_prefix("local_").is_some_and(|rest| {
+    claude_files::sidebar_entry_suffix(id).is_some_and(|rest| {
         !rest.is_empty()
             && rest
                 .bytes()
@@ -473,34 +410,18 @@ type Folder = ProfileKey;
 /// Every Sidebar entry's modification time, by folder.
 type Snapshot = BTreeMap<Folder, BTreeMap<String, SystemTime>>;
 
-fn snapshot(paths: &DesktopPaths) -> Snapshot {
-    let mut folders = Snapshot::new();
-    let Ok(accounts) = fs::read_dir(paths.sidebar_root()) else {
-        return folders;
-    };
-    let uuid_name =
-        |entry: &fs::DirEntry| entry.file_name().into_string().ok().filter(|n| is_uuid(n));
-    for account in accounts.flatten() {
-        let Some(account_uuid) = uuid_name(&account) else {
-            continue;
-        };
-        let Ok(orgs) = fs::read_dir(account.path()) else {
-            continue;
-        };
-        for org in orgs.flatten() {
-            let Some(org_uuid) = uuid_name(&org) else {
-                continue;
+fn snapshot(paths: &ClaudePaths) -> Snapshot {
+    claude_files::sidebar_folders(&paths.sidebar_root())
+        .into_iter()
+        .map(|folder| {
+            let entries = sidebar_entries(&folder.path).into_iter().collect();
+            let key = ProfileKey {
+                account_uuid: folder.account,
+                organization_uuid: folder.organization,
             };
-            folders.insert(
-                ProfileKey {
-                    account_uuid: account_uuid.clone(),
-                    organization_uuid: org_uuid,
-                },
-                sidebar_entries(&org.path()).into_iter().collect(),
-            );
-        }
-    }
-    folders
+            (key, entries)
+        })
+        .collect()
 }
 
 enum Step {
@@ -571,7 +492,7 @@ impl DesktopBridge {
     /// (spec step 2), then calls [`DesktopBridge::guide`].
     pub(crate) fn start(&mut self, ctx: &Context, target: Target) -> Option<Target> {
         self.outcome = None;
-        let paths = DesktopPaths::new(&ctx.env.home);
+        let paths = ClaudePaths::new(&ctx.env.home);
         match guard(ctx.env, &paths) {
             Guard::Busy(sessions) => {
                 self.block(ctx, target, sessions);
@@ -691,7 +612,7 @@ impl DesktopBridge {
         ctx: &Context,
         profiles: &[SignedInProfile],
     ) -> (Vec<Effect>, Option<Target>) {
-        let paths = DesktopPaths::new(&ctx.env.home);
+        let paths = ClaudePaths::new(&ctx.env.home);
         let now = ctx.env.clock.now();
         match &mut self.step {
             Some(Step::Checking { target, since }) => {
@@ -853,7 +774,7 @@ impl DesktopBridge {
     /// the result. Claude is never quit: the user signs out and in. The
     /// snapshot it confirms from is taken here, after any pre-switch sync.
     pub(crate) fn guide(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
-        let paths = DesktopPaths::new(&ctx.env.home);
+        let paths = ClaudePaths::new(&ctx.env.home);
         let previous = desktop_account(&paths).and_then(|account| {
             account
                 .organization_uuid
@@ -862,7 +783,7 @@ impl DesktopBridge {
                     organization_uuid,
                 })
         });
-        let log_offset = fs::metadata(paths.main_log()).map_or(0, |meta| meta.len());
+        let log_offset = fs::metadata(paths.desktop_main_log()).map_or(0, |meta| meta.len());
         log(
             ctx,
             Level::Info,
@@ -976,7 +897,7 @@ enum Outcome {
 /// `main.log` plus `lastKnownAccountUuid` can still tell a different account,
 /// and confirm the target when its account has no other Organization folder.
 fn confirmation(
-    paths: &DesktopPaths,
+    paths: &ClaudePaths,
     target: &Target,
     previous: Option<&Folder>,
     before: &Snapshot,
@@ -1006,7 +927,7 @@ fn confirmation(
             organization_uuid: Some(folder.organization_uuid.clone()),
         }));
     }
-    if !log_signed_in_since(&paths.main_log(), log_offset) {
+    if !log_signed_in_since(&paths.desktop_main_log(), log_offset) {
         return None;
     }
     let account = desktop_account(paths)?;
@@ -1112,7 +1033,7 @@ impl Reopen {
             return Vec::new();
         }
         log(ctx, Level::Info, "desktop reopen requested", &[]);
-        let paths = DesktopPaths::new(&ctx.env.home);
+        let paths = ClaudePaths::new(&ctx.env.home);
         self.guarded(ctx, guard(ctx.env, &paths))
     }
 
@@ -1196,7 +1117,7 @@ impl Reopen {
             }
             Some(ReopenStep::Unsure { .. }) => (Vec::new(), None),
             Some(ReopenStep::Waiting { .. }) => {
-                let paths = DesktopPaths::new(&ctx.env.home);
+                let paths = ClaudePaths::new(&ctx.env.home);
                 (self.guarded(ctx, guard(ctx.env, &paths)), None)
             }
             Some(ReopenStep::Quitting { since }) => {

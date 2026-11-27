@@ -11,8 +11,9 @@ use jiff::SignedDuration;
 use crate::backups;
 use crate::checks;
 use crate::claude_code::{self, ClaudeLocator};
+use crate::claude_files::ClaudePaths;
 use crate::cli_switcher;
-use crate::desktop::{DesktopAccount, DesktopBridge, DesktopPaths, NewestEntries, Reopen, Target};
+use crate::desktop::{DesktopAccount, DesktopBridge, NewestEntries, Reopen, Target};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
@@ -860,7 +861,7 @@ impl Core {
     /// The desktop's account and Organization.
     fn desktop_account(&self) -> Option<DesktopAccount> {
         self.newest_entries
-            .desktop_account(&DesktopPaths::new(&self.env.home))
+            .desktop_account(&ClaudePaths::new(&self.env.home))
     }
 
     /// Everything the UI shows right now.
