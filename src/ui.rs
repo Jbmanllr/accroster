@@ -28,16 +28,16 @@ use objc2_app_kit::NSAlertStyle;
 use objc2_app_kit::{
     NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
     NSAboutPanelOptionCredits, NSAlert, NSAlertFirstButtonReturn, NSApplication,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton,
-    NSColor, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEvent, NSFont, NSFontAttributeName, NSFontWeightBold,
-    NSFontWeightRegular, NSForegroundColorAttributeName, NSImage, NSLayoutAttribute,
-    NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle, NSLineBreakMode,
-    NSMenu, NSMenuDelegate, NSMenuItem, NSMutableParagraphStyle, NSOutlineView,
+    NSApplicationActivationOptions, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath,
+    NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSFontAttributeName,
+    NSFontWeightBold, NSFontWeightRegular, NSForegroundColorAttributeName, NSImage,
+    NSLayoutAttribute, NSLayoutConstraintOrientation, NSLevelIndicator, NSLevelIndicatorStyle,
+    NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSMutableParagraphStyle, NSOutlineView,
     NSOutlineViewDataSource, NSOutlineViewDelegate, NSParagraphStyleAttributeName, NSPasteboard,
-    NSPasteboardTypeString, NSResponder, NSScrollView, NSSearchField, NSStackView, NSStatusBar,
-    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextAlignment, NSTextField, NSTitlePosition,
+    NSPasteboardTypeString, NSResponder, NSRunningApplication, NSScrollView, NSSearchField,
+    NSStackView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTableViewStyle, NSTextAlignment, NSTextField, NSTitlePosition,
     NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView, NSWindow,
     NSWindowDelegate, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillSleepNotification,
@@ -756,8 +756,7 @@ impl Ui {
             (Some(offer), false) => {
                 let first_run = self.make_first_run_window(offer.launch_at_login);
                 first_run.window.center();
-                first_run.window.makeKeyAndOrderFront(None);
-                NSApplication::sharedApplication(self.mtm()).activate();
+                show_in_front(&first_run.window);
                 *open = Some(first_run);
             }
             (None, true) => {
@@ -886,8 +885,7 @@ impl Ui {
                 render_settings(settings, &view.settings);
                 self.render_profile_settings(settings, &view.settings.profiles);
                 settings.window.center();
-                settings.window.makeKeyAndOrderFront(None);
-                app.activate();
+                show_in_front(&settings.window);
             }
             Effect::ShowDiagnostics => {
                 let diagnostics = self
@@ -896,8 +894,7 @@ impl Ui {
                     .get_or_init(|| self.make_diagnostics_window());
                 self.render_diagnostics(diagnostics, &view.diagnostics);
                 diagnostics.window.center();
-                diagnostics.window.makeKeyAndOrderFront(None);
-                app.activate();
+                show_in_front(&diagnostics.window);
             }
             Effect::ShowAbout => {
                 let about = &view.about;
@@ -934,7 +931,7 @@ impl Ui {
                         &[&*name, &*version, &*credits],
                     )
                 };
-                app.activate();
+                come_forward(&app);
                 unsafe { app.orderFrontStandardAboutPanelWithOptions(&options) };
             }
             Effect::RevealInFinder(path) => {
@@ -956,8 +953,7 @@ impl Ui {
                 if !window.window.isVisible() {
                     window.window.center();
                 }
-                window.window.makeKeyAndOrderFront(None);
-                app.activate();
+                show_in_front(&window.window);
             }
             Effect::WatchSessionFiles(folders) => {
                 let Some(core) = self.ivars().core.get().cloned() else {
@@ -1026,7 +1022,7 @@ impl Ui {
                     .addButtonWithTitle(ns_string!("Uninstall"))
                     .setHasDestructiveAction(true);
                 alert.addButtonWithTitle(ns_string!("Cancel"));
-                app.activate();
+                come_forward(&app);
                 if alert.runModal() == NSAlertFirstButtonReturn {
                     self.send(confirm);
                 }
@@ -1060,7 +1056,7 @@ impl Ui {
                     .addButtonWithTitle(ns_string!("Remove"))
                     .setHasDestructiveAction(true);
                 alert.addButtonWithTitle(ns_string!("Cancel"));
-                app.activate();
+                come_forward(&app);
                 if alert.runModal() == NSAlertFirstButtonReturn {
                     self.send(confirm);
                 }
@@ -2382,6 +2378,28 @@ fn discovered_row_content(mtm: MainThreadMarker, row: &DiscoveredRow) -> Retaine
     body.into_super()
 }
 
+/// Makes AccRoster the active app, whichever app is. A menu bar app isn't
+/// active when its menu is clicked, and macOS can refuse the cooperative
+/// `activate()`, which leaves a new window or alert behind the active
+/// app's windows.
+fn come_forward(app: &NSApplication) {
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    #[allow(deprecated)]
+    NSRunningApplication::currentApplication().activateWithOptions(
+        NSApplicationActivationOptions::ActivateAllWindows
+            | NSApplicationActivationOptions::ActivateIgnoringOtherApps,
+    );
+}
+
+/// Shows `window` in front of every app's windows and makes it key.
+fn show_in_front(window: &NSWindow) {
+    come_forward(&NSApplication::sharedApplication(window.mtm()));
+    window.makeKeyAndOrderFront(None);
+    // In front even when macOS didn't activate the app.
+    window.orderFrontRegardless();
+}
+
 /// Asks for a nickname; `None` on Cancel. An empty answer clears it.
 fn ask_nickname(mtm: MainThreadMarker, name: &str, current: Option<&str>) -> Option<String> {
     let alert = NSAlert::new(mtm);
@@ -2396,7 +2414,7 @@ fn ask_nickname(mtm: MainThreadMarker, name: &str, current: Option<&str>) -> Opt
     ));
     alert.setAccessoryView(Some(&field));
     alert.window().setInitialFirstResponder(Some(&field));
-    NSApplication::sharedApplication(mtm).activate();
+    come_forward(&NSApplication::sharedApplication(mtm));
     (alert.runModal() == NSAlertFirstButtonReturn).then(|| field.stringValue().to_string())
 }
 
@@ -2652,6 +2670,7 @@ fn trash_app(mtm: MainThreadMarker) {
             "Everything else is removed, but the app couldn't be moved to the Trash: {}",
             error.localizedDescription()
         )));
+        come_forward(&NSApplication::sharedApplication(mtm));
         alert.runModal();
     }
 }
@@ -2772,7 +2791,7 @@ pub fn show_fatal_error(mtm: MainThreadMarker, message: &str) {
     let alert = objc2_app_kit::NSAlert::new(mtm);
     alert.setMessageText(ns_string!("AccRoster couldn't start"));
     alert.setInformativeText(&NSString::from_str(message));
-    NSApplication::sharedApplication(mtm).activate();
+    come_forward(&NSApplication::sharedApplication(mtm));
     alert.runModal();
 }
 
