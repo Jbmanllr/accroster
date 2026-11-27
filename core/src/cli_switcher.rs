@@ -1,29 +1,25 @@
-//! The CLI switcher (ADR 0002).
+//! The CLI switcher (ADR 0002): the `claude` shim in the app's `bin/`, put
+//! first on `PATH` by a marked block at the end of `~/.zshrc`, and the
+//! pointer `bin/cli-active-profile` naming the CLI's Active Profile folder.
+//! A switch rewrites only the pointer; running Sessions read their
+//! environment once at launch, so no switch reaches them.
 //!
-//! - **Shell half:** the `claude` shim in the app's `bin/`, put first on
-//!   `PATH` by a marked block at the end of `~/.zshrc`, and the pointer
-//!   `bin/cli-active-profile` naming the CLI's Active Profile folder. A
-//!   switch rewrites only the pointer; running Sessions read their
-//!   environment once at launch, so no switch reaches them.
-//! - **Profile-folder half:** the links from each Profile folder back to
-//!   `~/.claude`, and the one-time `.claude.json` seed. Links give every
-//!   Profile the same Transcripts, `--resume` data and user configuration.
-//!   Everything else (`.claude.json`, `history.jsonl`, caches, logs,
-//!   `sessions/`, …) stays per Profile.
+//! What makes a Profile folder usable by that `claude` (its links back to
+//! `~/.claude` and its `.claude.json` seed) is [`crate::profile_folder`].
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
-use serde_json::{Map, Value};
 
 use crate::backups;
 use crate::interface::{Badge, Command, MenuItem};
 use crate::profiles::Listed;
+use crate::shell;
 use crate::storage::{self, AppPaths};
 
 /// The variables the shim unsets on every launch, even when an inherited
@@ -53,19 +49,13 @@ pub(crate) fn is_on(paths: &AppPaths) -> bool {
 
 /// The `PATH` line of the `.zshrc` block, exactly as written.
 pub(crate) fn path_line(paths: &AppPaths) -> String {
-    format!(
-        "export PATH={}:\"$PATH\"",
-        sh_quote(paths.bin().as_os_str().as_bytes())
-    )
+    format!("export PATH={}:\"$PATH\"", shell::quote_path(&paths.bin()))
 }
 
 /// The line "Copy shell override" copies: one terminal on `config_dir`
 /// without changing the CLI's Active Profile.
 pub(crate) fn shell_override(config_dir: &Path) -> String {
-    format!(
-        "export CLAUDE_CONFIG_DIR={}",
-        sh_quote(config_dir.as_os_str().as_bytes())
-    )
+    format!("export CLAUDE_CONFIG_DIR={}", shell::quote_path(config_dir))
 }
 
 /// The folder the pointer names, byte for byte, or `None` without a pointer.
@@ -127,7 +117,12 @@ fn ask_next_cli_on_removal(listed: &mut [Listed<'_>], active: usize) {
 
 /// Back to Default: deletes the pointer, so new CLI runs use `~/.claude`.
 pub(crate) fn clear_pointer(paths: &AppPaths) -> io::Result<()> {
-    match fs::remove_file(paths.bin().join(POINTER)) {
+    remove_if_present(&paths.bin().join(POINTER))
+}
+
+/// Deletes a file; one already gone is done.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
     }
@@ -183,7 +178,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -
         row.submenu.splice(0..0, items);
         if is_active {
             row.badges.insert(0, Badge::Cli);
-            let tightest = row.limits.iter().map(|bar| bar.percent).max();
+            let tightest = row.tightest_limit();
             active = Some((profile.short_label.clone(), tightest));
         }
     }
@@ -275,12 +270,8 @@ pub(crate) fn turn_off(paths: &AppPaths, home: &Path, now: Timestamp) -> io::Res
             outcome = TurnedOff::EditedBlock(lines);
         }
     }
-    for name in [SHIM, POINTER] {
-        match fs::remove_file(paths.bin().join(name)) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-    }
+    remove_if_present(&paths.bin().join(SHIM))?;
+    clear_pointer(paths)?;
     Ok(outcome)
 }
 
@@ -339,7 +330,7 @@ fn edited_block(contents: &str) -> Option<Vec<String>> {
 /// 4. Walks `PATH`, skipping its own folder and empty entries, and `exec`s
 ///    the first other `claude`.
 fn shim_script(paths: &AppPaths) -> String {
-    let bin = sh_quote(paths.bin().as_os_str().as_bytes());
+    let bin = shell::quote_path(&paths.bin());
     let cleared = CLEARED_VARS.join(" ");
     format!(
         r#"#!/bin/sh
@@ -375,14 +366,6 @@ exit 127
     )
 }
 
-/// `bytes` as one single-quoted `sh` word.
-fn sh_quote(bytes: &[u8]) -> String {
-    format!(
-        "'{}'",
-        String::from_utf8_lossy(bytes).replace('\'', r"'\''")
-    )
-}
-
 /// A text file's contents, or `None` if it doesn't exist.
 fn read_text(path: &Path) -> io::Result<Option<String>> {
     match fs::read(path) {
@@ -401,143 +384,4 @@ fn write_target(path: &Path) -> io::Result<PathBuf> {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path),
         _ => Ok(path.to_path_buf()),
     }
-}
-
-/// Folders linked to `~/.claude/<name>`; a missing target is created.
-const LINKED_DIRS: [&str; 11] = [
-    "projects",
-    "file-history",
-    "tasks",
-    "plans",
-    "session-env",
-    "skills",
-    "agents",
-    "commands",
-    "hooks",
-    "output-styles",
-    "plugins",
-];
-
-/// Files linked to `~/.claude/<name>`, only when the target exists.
-const LINKED_FILES: [&str; 3] = ["settings.json", "CLAUDE.md", "keybindings.json"];
-
-/// Per-project keys of `~/.claude.json` that carry trust and MCP approvals.
-const SEEDED_PROJECT_KEYS: [&str; 9] = [
-    "hasTrustDialogAccepted",
-    "allowedTools",
-    "enabledMcpjsonServers",
-    "disabledMcpjsonServers",
-    "disabledMcpServers",
-    "mcpServers",
-    "hasClaudeMdExternalIncludesApproved",
-    "hasClaudeMdExternalIncludesWarningShown",
-    "remoteTrustGrant",
-];
-
-/// A link that couldn't be made because something else sits in its place.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlockedLink {
-    pub path: PathBuf,
-}
-
-/// The links that share Transcripts and resume data. One replaced pauses
-/// Profile links for every Profile (ADR 0004).
-pub(crate) const TRANSCRIPT_LINKS: [&str; 3] = ["projects", "file-history", "session-env"];
-
-/// The links of `profile_dir` whose place holds something else: a regular
-/// file or folder, or a link to anywhere but `claude_home/<name>`. A missing
-/// link isn't replaced (it is made again); a file link counts only while its
-/// target exists.
-pub(crate) fn replaced_links(profile_dir: &Path, claude_home: &Path) -> Vec<&'static str> {
-    let file_links = LINKED_FILES
-        .into_iter()
-        .filter(|name| claude_home.join(name).exists());
-    LINKED_DIRS
-        .into_iter()
-        .chain(file_links)
-        .filter(|name| {
-            let path = profile_dir.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    fs::read_link(&path).ok() != Some(claude_home.join(name))
-                }
-                Ok(_) => true,
-                Err(_) => false,
-            }
-        })
-        .collect()
-}
-
-/// Makes every missing link from `profile_dir` to `claude_home` (the caller
-/// checks that Profile links aren't under a Safety pause). Never replaces what is already there: a
-/// regular file or folder in a link's place is reported, not overwritten. A
-/// link that exists is left as it is.
-pub(crate) fn ensure_links(profile_dir: &Path, claude_home: &Path) -> io::Result<Vec<BlockedLink>> {
-    let mut blocked = Vec::new();
-    let mut link = |name: &str| -> io::Result<()> {
-        let path = profile_dir.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => Ok(()),
-            Ok(_) => {
-                blocked.push(BlockedLink { path });
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                symlink(claude_home.join(name), &path)
-            }
-            Err(error) => Err(error),
-        }
-    };
-    for name in LINKED_DIRS {
-        fs::create_dir_all(claude_home.join(name))?;
-        link(name)?;
-    }
-    for name in LINKED_FILES {
-        if claude_home.join(name).exists() {
-            link(name)?;
-        }
-    }
-    Ok(blocked)
-}
-
-/// Writes `profile_dir/.claude.json` from `~/.claude.json`, once: user-scope
-/// `mcpServers`, per-project trust and MCP approvals, `theme` and
-/// `hasCompletedOnboarding`. Never `oauthAccount`, ids or caches. Does
-/// nothing if the Profile already has a `.claude.json`. A missing or
-/// unreadable `~/.claude.json` seeds an empty object.
-pub(crate) fn seed_claude_json(profile_dir: &Path, home: &Path) -> io::Result<()> {
-    let target = profile_dir.join(".claude.json");
-    if fs::symlink_metadata(&target).is_ok() {
-        return Ok(());
-    }
-    let source: Value = fs::read(home.join(".claude.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(Value::Null);
-    let mut seed = Map::new();
-    for key in ["mcpServers", "theme", "hasCompletedOnboarding"] {
-        if let Some(value) = source.get(key) {
-            seed.insert(key.into(), value.clone());
-        }
-    }
-    if let Some(projects) = source.get("projects").and_then(Value::as_object) {
-        let seeded: Map<String, Value> = projects
-            .iter()
-            .filter_map(|(path, project)| {
-                let kept: Map<String, Value> = project
-                    .as_object()?
-                    .iter()
-                    .filter(|(key, _)| SEEDED_PROJECT_KEYS.contains(&key.as_str()))
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                (!kept.is_empty()).then(|| (path.clone(), Value::Object(kept)))
-            })
-            .collect();
-        if !seeded.is_empty() {
-            seed.insert("projects".into(), Value::Object(seeded));
-        }
-    }
-    let mut bytes = serde_json::to_vec_pretty(&Value::Object(seed)).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-    storage::write_atomically(&target, &bytes)
 }

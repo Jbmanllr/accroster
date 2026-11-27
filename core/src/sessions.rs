@@ -29,12 +29,14 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::desktop::{self, DesktopAccount, DesktopPaths, NewestEntries};
+use crate::claude_files::{self, ClaudePaths, DESKTOP_ENTRYPOINT};
+use crate::desktop_account::{DesktopAccount, NewestEntries};
 use crate::env::Environment;
 use crate::interface::{
     AllSessionsView, ProfileKey, RunningDot, SessionDetail, SessionFilter, SessionRow,
     SidebarGroup, SidebarItem, SidebarPresence,
 };
+use crate::live_processes::{self, LiveProcess};
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// Transcripts read per [`SessionIndex::step`].
@@ -45,12 +47,6 @@ const PROMPT_KEPT: usize = 500;
 
 /// The longest first prompt shown as a title, in characters.
 const PROMPT_SHOWN: usize = 48;
-
-/// Sidebar entries over this size are skipped, as the desktop app does.
-const ENTRY_MAX_BYTES: u64 = 10 * 1024 * 1024;
-
-/// The desktop app's entrypoint in live-process files and Transcripts.
-const DESKTOP_ENTRYPOINT: &str = "claude-desktop";
 
 /// What one Transcript contributes, as of `offset` bytes read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +233,7 @@ impl EntryFile {
             || self
                 .cwd
                 .as_deref()
-                .is_some_and(|cwd| cwd.contains("/scratch-workspaces/"))
+                .is_some_and(claude_files::is_scratch_workspace)
     }
 }
 
@@ -256,17 +252,6 @@ struct SidebarEntry {
     archived: bool,
     last_activity_at: i64,
     cwd: Option<String>,
-}
-
-/// A live-process file's fields.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LiveFile {
-    pid: u32,
-    session_id: Option<String>,
-    proc_start: Option<String>,
-    entrypoint: Option<String>,
-    status: Option<String>,
 }
 
 /// A file's size and mtime (ns): when either changes, it is read again.
@@ -310,7 +295,7 @@ pub(crate) struct SessionIndex {
     entries: Cached<SidebarEntry>,
     /// Each Sidebar folder's mtime when its entries were last stat'ed.
     entry_folders: BTreeMap<PathBuf, u64>,
-    live: Cached<LiveFile>,
+    live: Cached<LiveProcess>,
     running: HashMap<String, Running>,
     /// The desktop's account and Organization, for title precedence and
     /// "desktop now".
@@ -388,15 +373,19 @@ impl SessionIndex {
         paths: &AppPaths,
         changed: &[PathBuf],
     ) {
-        let projects = projects_root(&env.home);
-        let sidebar = sidebar_root(&env.home);
-        let live_roots = [env.home.join(".claude").join("sessions"), paths.profiles()];
+        let claude = ClaudePaths::new(&env.home);
+        let projects = claude.projects();
+        let sidebar = claude.sidebar_root();
+        let live_roots = [
+            claude_files::live_process_folder(&claude.claude_home()),
+            paths.profiles(),
+        ];
         let mut transcripts = Vec::new();
         let (mut all_transcripts, mut entries, mut live) = (false, false, false);
         for path in changed {
             if let Ok(inside) = path.strip_prefix(&projects) {
-                if inside.components().count() == 2 && is_jsonl(path) {
-                    if !is_subagent(path) {
+                if inside.components().count() == 2 && claude_files::is_transcript_name(path) {
+                    if !claude_files::is_subagent_transcript(path) {
                         transcripts.push(path.clone());
                     }
                 } else {
@@ -556,7 +545,7 @@ impl SessionIndex {
                         account_uuid: account.clone(),
                         organization_uuid: org.clone(),
                     },
-                    entry_id: name.strip_suffix(".json")?.to_owned(),
+                    entry_id: claude_files::sidebar_entry_id(name)?.to_owned(),
                     cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
                     title: entry.title.filter(|title| !title.trim().is_empty()),
                     user_title: entry.title_source.is_some_and(|source| source != "auto"),
@@ -569,16 +558,14 @@ impl SessionIndex {
         self.entry_folders = listed;
         self.desktop = self
             .newest_entries
-            .desktop_account(&DesktopPaths::new(&self.home));
+            .desktop_account(&ClaudePaths::new(&self.home));
     }
 
     /// Re-reads the live-process files that changed, then which of their
     /// processes still run.
     fn restat_live(&mut self, env: &Environment, paths: &AppPaths) {
         let files = live_files(&env.home, paths);
-        refresh_cached(&mut self.live, files, |path, _| {
-            serde_json::from_slice::<LiveFile>(&fs::read(path).ok()?).ok()
-        });
+        refresh_cached(&mut self.live, files, |path, _| LiveProcess::read(path));
         self.running = running(
             env,
             self.live.values().filter_map(|(_, live)| live.as_ref()),
@@ -981,14 +968,14 @@ fn refresh_cached<T>(
 /// The folders FSEvents watches while the window is open: `projects/`,
 /// every `sessions/` and `claude-code-sessions/`, those that exist.
 fn watched_folders(home: &Path, paths: &AppPaths) -> Vec<PathBuf> {
-    let mut folders = vec![projects_root(home), home.join(".claude").join("sessions")];
+    let claude = ClaudePaths::new(home);
+    let mut folders = vec![claude.projects()];
     folders.extend(
-        real_children(&paths.profiles())
-            .into_iter()
-            .filter(|(_, kind)| kind.is_dir())
-            .map(|(profile, _)| profile.join("sessions")),
+        config_folders(home, paths)
+            .iter()
+            .map(|config_dir| claude_files::live_process_folder(config_dir)),
     );
-    folders.push(sidebar_root(home));
+    folders.push(claude.sidebar_root());
     folders.retain(|folder| folder.is_dir());
     folders
 }
@@ -1010,12 +997,9 @@ fn quoted(prompt: &str) -> String {
 /// one project: "No folder" Sessions' scratch workspaces, and the notes
 /// folders of side sessions.
 const CLAUDE_FOLDERS: [(&str, &str); 2] = [
+    (claude_files::SCRATCH_WORKSPACES_FOLDER, "No folder"),
     (
-        "/Library/Application Support/Claude/scratch-workspaces",
-        "No folder",
-    ),
-    (
-        "/Library/Application Support/Claude/side-session-notes",
+        claude_files::SIDE_SESSION_NOTES_FOLDER,
         "Side-session notes",
     ),
 ];
@@ -1063,55 +1047,28 @@ fn age(now: Timestamp, at_ms: i64) -> String {
     }
 }
 
-fn projects_root(home: &Path) -> PathBuf {
-    home.join(".claude").join("projects")
-}
-
-fn is_jsonl(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "jsonl")
-}
-
-/// A subagent's Transcript kept next to its Session's own (`agent-<id>.jsonl`,
-/// as SSH Sessions do): part of that Session, not a Session itself.
-fn is_subagent(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("agent-"))
-}
-
 /// The size and mtime of a regular file that isn't a link.
 fn regular_file_stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() {
-        return None;
-    }
+    meta.file_type().is_file().then(|| stamp_of(&meta))
+}
+
+/// A file's [`Stamp`], from its metadata.
+fn stamp_of(meta: &fs::Metadata) -> Stamp {
     let mtime = meta
         .modified()
         .ok()
         .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_nanos() as u64);
-    Some((meta.len(), mtime))
+    (meta.len(), mtime)
 }
 
-/// Every top-level `~/.claude/projects/<project>/<id>.jsonl`, with its size
-/// and mtime. Links (folders or files) aren't followed, and subagent
-/// Transcripts, one folder deeper or named `agent-*`, are skipped.
+/// Every Session's Transcript, with its size and mtime.
 fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
-    let mut found = BTreeMap::new();
-    for (project, kind) in real_children(&projects_root(home)) {
-        if !kind.is_dir() {
-            continue;
-        }
-        for (path, kind) in real_children(&project) {
-            if !kind.is_file() || !is_jsonl(&path) || is_subagent(&path) {
-                continue;
-            }
-            if let Some(stamp) = regular_file_stamp(&path) {
-                found.insert(path, stamp);
-            }
-        }
-    }
-    found
+    claude_files::transcript_files(&ClaudePaths::new(home).projects())
+        .into_iter()
+        .map(|(path, meta)| (path, stamp_of(&meta)))
+        .collect()
 }
 
 /// A folder's children with their own type (links stay links).
@@ -1126,45 +1083,27 @@ fn real_children(dir: &Path) -> Vec<(PathBuf, fs::FileType)> {
         .collect()
 }
 
-fn sidebar_root(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/Claude/claude-code-sessions")
-}
-
 /// Every `claude-code-sessions/<account>/<org>/` folder, with its account,
 /// Organization and mtime. The mtime is taken before the folder is listed:
 /// a write during the listing changes it, so the next rescan lists again.
 fn entry_folders(home: &Path) -> Vec<(PathBuf, String, String, u64)> {
-    let mut found = Vec::new();
-    for (account_dir, kind) in real_children(&sidebar_root(home)) {
-        if !kind.is_dir() {
-            continue;
-        }
-        let account = file_name(&account_dir);
-        for (org_dir, kind) in real_children(&account_dir) {
-            if !kind.is_dir() {
-                continue;
-            }
-            if let Some(modified) = modified_ns(&org_dir) {
-                let org = file_name(&org_dir);
-                found.push((org_dir, account.clone(), org, modified));
-            }
-        }
-    }
-    found
+    claude_files::sidebar_folders(&ClaudePaths::new(home).sidebar_root())
+        .into_iter()
+        .filter_map(|folder| {
+            let modified = modified_ns(&folder.path)?;
+            Some((folder.path, folder.account, folder.organization, modified))
+        })
+        .collect()
 }
 
 /// Every `local_*.json` in one Sidebar folder, with its stamp and `[account,
 /// org, file name]`.
 fn entry_files(dir: &Path, account: &str, org: &str) -> Vec<(PathBuf, Stamp, Vec<String>)> {
-    real_children(dir)
+    claude_files::sidebar_entry_files(dir)
         .into_iter()
-        .filter_map(|(path, _)| {
-            let name = file_name(&path);
-            if !name.starts_with("local_") || !name.ends_with(".json") {
-                return None;
-            }
-            let stamp = regular_file_stamp(&path)?;
-            Some((path, stamp, vec![account.to_owned(), org.to_owned(), name]))
+        .map(|(name, meta)| {
+            let inside = vec![account.to_owned(), org.to_owned(), name.clone()];
+            (dir.join(name), stamp_of(&meta), inside)
         })
         .collect()
 }
@@ -1205,40 +1144,34 @@ fn modified_ns(path: &Path) -> Option<u64> {
 /// not skipped.
 fn read_entry(path: &Path) -> Option<EntryFile> {
     let size = fs::metadata(path).ok()?.len();
-    if size == 0 || size > ENTRY_MAX_BYTES {
+    if size == 0 || size > claude_files::MAX_ENTRY_BYTES {
         return None;
     }
     let entry: EntryFile = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     (!entry.skipped()).then_some(entry)
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-/// Every `<digits>.json` in `~/.claude/sessions/` and every Profile's
-/// `sessions/` (never the `.key` files beside them).
+/// Every live-process file, in `~/.claude` and in every Profile folder.
 fn live_files(home: &Path, paths: &AppPaths) -> Vec<(PathBuf, Stamp, Vec<String>)> {
-    let mut folders = vec![home.join(".claude").join("sessions")];
-    folders.extend(
-        real_children(&paths.profiles())
-            .into_iter()
-            .filter(|(_, kind)| kind.is_dir())
-            .map(|(profile, _)| profile.join("sessions")),
-    );
-    folders
+    config_folders(home, paths)
         .iter()
-        .flat_map(|folder| real_children(folder))
-        .filter_map(|(path, _)| {
-            let name = file_name(&path);
-            let is_pid_file = name
-                .strip_suffix(".json")
-                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()));
-            let stamp = regular_file_stamp(&path).filter(|_| is_pid_file)?;
+        .flat_map(|config_dir| live_processes::files(config_dir))
+        .filter_map(|path| {
+            let stamp = regular_file_stamp(&path)?;
             Some((path, stamp, Vec::new()))
         })
+        .collect()
+}
+
+/// Every config folder a Claude Code process may run in: `~/.claude` and
+/// every Profile folder.
+fn config_folders(home: &Path, paths: &AppPaths) -> Vec<PathBuf> {
+    let profiles = real_children(&paths.profiles())
+        .into_iter()
+        .filter(|(_, kind)| kind.is_dir())
+        .map(|(profile, _)| profile);
+    std::iter::once(ClaudePaths::new(home).claude_home())
+        .chain(profiles)
         .collect()
 }
 
@@ -1272,33 +1205,25 @@ pub(crate) struct EntryFacts {
     pub last_activity_at: i64,
 }
 
-/// Running dots by Transcript id, from live-process files. A file whose pid
-/// is dead, or whose pid now belongs to a process started at another time,
-/// is stale and ignored.
+/// Running dots by Transcript id, from live-process files; stale files are
+/// ignored.
 fn running<'a>(
     env: &Environment,
-    lives: impl Iterator<Item = &'a LiveFile>,
+    lives: impl Iterator<Item = &'a LiveProcess>,
 ) -> HashMap<String, Running> {
     let mut dots = HashMap::new();
     for live in lives {
         let Some(session_id) = live.session_id.clone() else {
             continue;
         };
-        let alive = env.os.process(live.pid).is_some_and(|facts| {
-            live.proc_start
-                .as_deref()
-                .and_then(desktop::parse_proc_start)
-                .is_some_and(|started| started.as_second() == facts.started_at.as_second())
-        });
-        if !alive {
+        if !live.is_running(env.os.as_ref()) {
             continue;
         }
-        let dot = if live.entrypoint.as_deref() != Some(DESKTOP_ENTRYPOINT) {
+        let dot = if !live.is_desktop() {
             RunningDot::Terminal
-        } else if live.status.as_deref() == Some("idle") {
+        } else if live.is_idle() {
             continue;
         } else {
-            // Busy, waiting, or a status we don't know: fail closed.
             RunningDot::Desktop
         };
         let running = Running { dot, pid: live.pid };

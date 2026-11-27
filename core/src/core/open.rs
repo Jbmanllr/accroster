@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use super::Core;
-use crate::desktop::{self, DesktopPaths, Target};
+use crate::claude_files::ClaudePaths;
+use crate::desktop::{self, Target};
 use crate::interface::{Command, Effect};
 use crate::logging::{Field, Level};
 use crate::opening::{self, Clients, DefaultOpen, DesktopClient, InClaude, NamedProfile};
@@ -49,7 +50,7 @@ impl Core {
         });
         let desktop_turn_running = desktop.is_some()
             && matches!(
-                desktop::guard(&self.env, &DesktopPaths::new(&self.env.home)),
+                desktop::guard(&self.env, &ClaudePaths::new(&self.env.home)),
                 desktop::Guard::Busy(_)
             );
         Clients {

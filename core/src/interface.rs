@@ -17,6 +17,11 @@
 //! everything else in the UI layer stays a renderer.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// How often the driver sends [`Event::Tick`] unless the core asks for one
+/// sooner ([`crate::core::Core::tick_interval`]).
+pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A user intent, sent by the UI layer when something is clicked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,8 +304,8 @@ impl Command {
 /// Something that happened outside the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
-    /// the core reads the actual time from its [`crate::Clock`].
+    /// Time passed. The driver sends one every [`TICK_INTERVAL`]; the core
+    /// reads the actual time from its [`crate::env::Clock`].
     Tick,
     /// The status item's menu is about to open.
     MenuOpened,
@@ -652,6 +657,14 @@ pub struct ProfileRow {
     pub offers: Vec<String>,
     /// The hover submenu.
     pub submenu: Vec<MenuItem>,
+}
+
+impl ProfileRow {
+    /// The row's tightest limit: its highest bar, unknown limit kinds
+    /// included.
+    pub(crate) fn tightest_limit(&self) -> Option<u32> {
+        self.limits.iter().map(|bar| bar.percent).max()
+    }
 }
 
 /// The most-headroom marker's text. It can move to another row while the

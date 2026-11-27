@@ -7,10 +7,11 @@ use std::path::Path;
 use super::Core;
 use super::sidebar::desktop_name;
 use crate::checks;
-use crate::cli_switcher;
-use crate::desktop;
+use crate::claude_code;
+use crate::claude_files::ClaudePaths;
 use crate::interface::{CheckStatus, MenuItem, SafetyFeature, SidebarSyncMode};
 use crate::logging::{Field, Level};
+use crate::profile_folder;
 use crate::profiles::CrossCheckAnswer;
 use crate::safety::{self, CheckId, Finding};
 use crate::sidebar_sync;
@@ -82,7 +83,7 @@ impl Core {
         for name in links
             .replaced
             .iter()
-            .filter(|name| !cli_switcher::TRANSCRIPT_LINKS.contains(name))
+            .filter(|name| !profile_folder::TRANSCRIPT_LINKS.contains(name))
         {
             row.submenu.push(MenuItem::Detail(format!(
                 "{name} link replaced · not shared"
@@ -93,7 +94,10 @@ impl Core {
     /// Runs the full self-check when a Claude version changed since the last
     /// one. Returns whether it ran.
     pub(super) fn self_check_if_versions_changed(&mut self) -> bool {
-        if !self.safety.versions_changed(&desktop::versions(&self.env)) {
+        if !self
+            .safety
+            .versions_changed(&claude_code::installed_versions(&self.env))
+        {
             return false;
         }
         self.log(Level::Info, "claude versions changed", &[]);
@@ -106,7 +110,7 @@ impl Core {
     /// `auth` (recorded once its answers are in); then pauses whatever a
     /// failed check blocks.
     pub(super) fn self_check(&mut self, auth: AuthCheck) {
-        let versions = desktop::versions(&self.env);
+        let versions = claude_code::installed_versions(&self.env);
         let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
         self.versions = versions;
         self.safety.check_settings_env(&self.env, false);
@@ -117,7 +121,7 @@ impl Core {
         }
         let home = self.env.home.clone();
         self.check_sidebar_entries();
-        let mut session_dirs = vec![home.join(".claude")];
+        let mut session_dirs = vec![ClaudePaths::new(&home).claude_home()];
         session_dirs.extend(
             self.profiles
                 .folders()
@@ -163,17 +167,15 @@ impl Core {
     /// Checks every Profile folder's links: a replaced shared-Transcript link
     /// pauses Profile links; other replaced links are only reported.
     pub(super) fn check_links(&mut self) {
-        let claude_home = self.env.home.join(".claude");
+        let claude_home = ClaudePaths::new(&self.env.home).claude_home();
         self.links = self
             .profiles
             .folders()
             .into_iter()
             .map(|(id, dir)| ProfileLinks {
                 id: id.to_owned(),
-                replaced: cli_switcher::replaced_links(dir, &claude_home),
-                transcripts_shared: cli_switcher::TRANSCRIPT_LINKS.iter().all(|name| {
-                    std::fs::read_link(dir.join(name)).ok() == Some(claude_home.join(name))
-                }),
+                replaced: profile_folder::replaced_links(dir, &claude_home),
+                transcripts_shared: profile_folder::transcripts_shared(dir, &claude_home),
             })
             .collect();
         if self.links.is_empty() {
@@ -187,7 +189,7 @@ impl Core {
                     .replaced
                     .iter()
                     .copied()
-                    .filter(|name| cli_switcher::TRANSCRIPT_LINKS.contains(name) == transcript)
+                    .filter(|name| profile_folder::TRANSCRIPT_LINKS.contains(name) == transcript)
                     .collect();
                 if !hit.is_empty() {
                     profiles += 1;
@@ -244,7 +246,7 @@ impl Core {
     pub(super) fn resume(&mut self, feature: SafetyFeature) {
         match feature {
             SafetyFeature::CliSwitching => {
-                self.versions = desktop::versions(&self.env);
+                self.versions = claude_code::installed_versions(&self.env);
                 self.safety.check_settings_env(&self.env, false);
                 self.check_accounts();
                 if self.check_config_dir_honoured() {

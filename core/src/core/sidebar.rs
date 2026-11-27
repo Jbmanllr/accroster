@@ -79,7 +79,7 @@ impl Core {
             self.show_result(StatusTone::Failed);
             return Some(Run::Paused);
         }
-        let personal = self.personal_organizations();
+        let personal = self.profiles.personal_organizations();
         match sidebar_sync::begin(
             &self.env,
             &self.paths,

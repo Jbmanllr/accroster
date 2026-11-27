@@ -14,11 +14,12 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::claude_files;
+use crate::context::Context;
 use crate::env::RunningProcess;
 use crate::interface::LimitBar;
 use crate::limit_offers;
 use crate::logging::{Field, Level};
-use crate::profiles::Context;
 use crate::runner::UsageRead;
 use crate::storage::{self, ReadError, VersionedFile};
 use crate::usage::{Limit, Limits, UsageReply};
@@ -675,7 +676,7 @@ impl LimitMonitor {
 /// fetched (it answers from that cache within 60 s, and from up to an hour
 /// old one after an error).
 fn cached_fetch_time(config_dir: &Path, account_uuid: &str) -> Option<Timestamp> {
-    let bytes = fs::read(config_dir.join(".claude.json")).ok()?;
+    let bytes = fs::read(claude_files::config_file(config_dir)).ok()?;
     let body: Value = serde_json::from_slice(&bytes).ok()?;
     let cache = body.get("cachedUsageUtilization")?;
     if cache.get("accountUuid")?.as_str()? != account_uuid {

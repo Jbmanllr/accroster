@@ -17,21 +17,20 @@
 //! shim skips itself). Spawns run the found file and get its folder first on
 //! their `PATH`, so Claude Code finds `node`, `git` and the rest next to it.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::env::Environment;
+use crate::claude_files::{self, ClaudePaths};
+use crate::env::{Environment, is_executable};
+use crate::interface::ClaudeVersions;
 use crate::logging::{Field, Level, Logger};
-use crate::runner::{Finished, Job, Runner};
+use crate::runner::{self, Finished, Job, Runner};
 use crate::storage::{self, AppPaths};
 
 /// What the menu says while no `claude` can be found.
 pub(crate) const MISSING: &str =
     "Can't find Claude Code (claude). Install it, or open AccRoster from a terminal once.";
-
-/// Marks the login shell's `PATH` line in whatever its startup files print.
-pub(crate) const PATH_MARKER: &str = "accroster-login-path=";
 
 /// Where the found `claude` is, or why there is none yet.
 #[derive(Default)]
@@ -105,7 +104,7 @@ impl ClaudeLocator {
         if let ShellLookup::Asking(job) = &mut self.shell {
             let answer = match job.poll(env.clock.now()) {
                 None => None,
-                Some(Finished::Exited(output)) => Some(login_path(&output.stdout)),
+                Some(Finished::Exited(output)) => Some(runner::login_shell_path(&output.stdout)),
                 Some(finished) => {
                     log(
                         Level::Info,
@@ -176,9 +175,9 @@ fn search(env: &Environment, paths: &AppPaths, shell: &ShellLookup) -> Option<(P
     if let Some(found) = inherited.and_then(|path| in_folders(&mut std::env::split_paths(&path))) {
         return Some((found, Source::Path));
     }
-    let mut usual = [".local/bin", ".claude/local"]
+    let mut usual = ClaudePaths::new(&env.home)
+        .usual_program_folders()
         .into_iter()
-        .map(|folder| env.home.join(folder))
         .chain(env.os.program_folders());
     if let Some(found) = in_folders(&mut usual) {
         return Some((found, Source::UsualFolder));
@@ -232,27 +231,8 @@ impl Skip {
 /// Terminal's.
 fn is_bundled(resolved: &Path) -> bool {
     let text = resolved.to_string_lossy();
-    text.contains("/Library/Application Support/Claude/claude-code/")
-        || text.starts_with("/Applications/Claude.app/")
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// The `PATH` in the login shell's output: the marked line, whatever its
-/// startup files printed around it.
-fn login_path(stdout: &[u8]) -> Option<OsString> {
-    use std::os::unix::ffi::OsStrExt;
-    stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(PATH_MARKER.as_bytes()))
-        .next_back()
-        .filter(|path| !path.is_empty())
-        .map(|path| OsStr::from_bytes(path).to_owned())
+    text.contains(claude_files::BUNDLED_CLAUDE_CODE)
+        || Path::new(&*text).starts_with(claude_files::DESKTOP_APP)
 }
 
 fn remembered_file(paths: &AppPaths) -> PathBuf {
@@ -271,4 +251,35 @@ fn remember(paths: &AppPaths, program: &Path) {
         // Only a convenience for the next launch from Finder.
         let _ = storage::write_atomically(&remembered_file(paths), program.as_os_str().as_bytes());
     }
+}
+
+/// The installed Claude versions, from links, folder names and the app's
+/// `Info.plist`; nothing is spawned.
+pub(crate) fn installed_versions(env: &Environment) -> ClaudeVersions {
+    let paths = ClaudePaths::new(&env.home);
+    let claude_code = fs::read_link(paths.installed_claude())
+        .ok()
+        .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
+        .filter(|name| version_key(name).is_some());
+    let mut desktop_claude_code: Vec<String> = fs::read_dir(paths.bundled_claude_code())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| version_key(name).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    desktop_claude_code.sort_by_key(|name| version_key(name));
+    ClaudeVersions {
+        claude_code,
+        desktop_claude_code,
+        desktop: env.os.desktop_app_version(),
+    }
+}
+
+/// `2.1.310` as numbers, for ordering; `None` for anything else.
+fn version_key(name: &str) -> Option<Vec<u64>> {
+    name.split('.').map(|part| part.parse().ok()).collect()
 }

@@ -7,6 +7,7 @@
 //! Profile folders decide which Profiles exist; the file only records each
 //! one's path.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,53 +17,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::backups;
-use crate::claude_json::{self, LoginNames};
-use crate::cli_switcher;
-use crate::env::{Environment, RunningProcess};
+use crate::claude_files::{self, ClaudePaths};
+use crate::claude_json;
+use crate::context::Context;
+use crate::env::RunningProcess;
 use crate::interface::{
     Command, Effect, MenuItem, NicknameTarget, ProfileKey, ProfileRow, SafetyFeature,
 };
-use crate::logging::{Field, Level, Logger};
+use crate::logging::{Field, Level};
 use crate::monitor::{Completed, LimitsView, Watched};
-use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs, Runner};
+use crate::names::{self, LoginNames};
+use crate::profile_folder;
+use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs};
 use crate::settings::Settings;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
 
 /// A sign-in still running after this long is killed.
 pub(crate) const SIGN_IN_TIMEOUT: SignedDuration = SignedDuration::from_mins(10);
-
-/// What the registry needs from the core for one call.
-pub(crate) struct Context<'a> {
-    pub env: &'a Environment,
-    pub paths: &'a AppPaths,
-    pub logger: &'a Logger,
-    pub verbose: bool,
-    /// The write features under a Safety pause: nothing they write is
-    /// written.
-    pub paused: Vec<SafetyFeature>,
-    /// The `claude` spawns run; `None` while none is found.
-    pub claude: Option<&'a std::path::Path>,
-}
-
-impl Context<'_> {
-    pub(crate) fn is_paused(&self, feature: SafetyFeature) -> bool {
-        self.paused.contains(&feature)
-    }
-
-    pub(crate) fn log(
-        &self,
-        level: Level,
-        message: &'static str,
-        fields: &[(&'static str, Field<'_>)],
-    ) {
-        self.logger
-            .write(self.env.clock.now(), self.verbose, level, message, fields);
-    }
-
-    pub(crate) fn runner(&self) -> Runner<'_> {
-        Runner::new(self.env, self.paths, self.claude)
-    }
-}
 
 /// A Login acting within an Organization, from `oauthAccount` in a Profile
 /// folder's `.claude.json`.
@@ -78,7 +49,7 @@ impl Identity {
     /// `oauthAccount` of `<config_dir>/.claude.json`, or `None` when the
     /// folder holds no sign-in.
     fn read(config_dir: &Path) -> Option<Identity> {
-        let account = claude_json::read_account(&config_dir.join(".claude.json"))?;
+        let account = claude_json::read_account(&claude_files::config_file(config_dir))?;
         Some(Identity {
             key: account.key,
             names: account.names,
@@ -92,65 +63,22 @@ impl Identity {
     }
 }
 
-/// Each Profile's short name, in `profiles`' order: its nickname, else the
-/// shortest of [`LoginNames::short_labels`] no other Profile shares (two
-/// Profiles named `Lucie` become `Lucie · Work Inc` and `Lucie · Research
-/// Lab`).
+/// Each Profile's Short label, in `profiles`' order.
 fn short_labels(profiles: &[&Profile], settings: &Settings) -> Vec<String> {
-    unique(
-        profiles
-            .iter()
-            .map(|profile| match settings.nicknames.get(&profile.id) {
-                Some(nickname) => vec![nickname.clone()],
-                None => match &profile.identity {
-                    Some(identity) => identity.names.short_labels(),
-                    None => vec!["Signed out".to_owned()],
-                },
-            })
-            .collect(),
-    )
+    names::short_labels(profiles.iter().map(|profile| {
+        let nickname = settings.nicknames.get(&profile.id).map(String::as_str);
+        let login = profile.identity.as_ref().map(|identity| &identity.names);
+        (nickname, login)
+    }))
 }
 
-/// Each Profile's name, in `profiles`' order: [`LoginNames::name`], with the
-/// Organization added when two Profiles would otherwise share it.
-fn names(profiles: &[&Profile]) -> Vec<String> {
-    unique(
+/// Each Profile's Profile name, in `profiles`' order.
+fn profile_names(profiles: &[&Profile]) -> Vec<String> {
+    names::profile_names(
         profiles
             .iter()
-            .map(|profile| match &profile.identity {
-                Some(identity) => vec![identity.name(), identity.names.name_with_organization()],
-                None => vec!["Signed-out Profile".to_owned()],
-            })
-            .collect(),
+            .map(|profile| profile.identity.as_ref().map(|identity| &identity.names)),
     )
-}
-
-/// One pick per list of choices (shortest first): the first no other list's
-/// pick shares. Colliding lists move on together until none collides or a
-/// list runs out of choices.
-fn unique(choices: Vec<Vec<String>>) -> Vec<String> {
-    let mut level = vec![0; choices.len()];
-    loop {
-        let label = |index: usize| &choices[index][level[index]];
-        let collided: Vec<usize> = (0..choices.len())
-            .filter(|&index| {
-                level[index] + 1 < choices[index].len()
-                    && (0..choices.len())
-                        .any(|other| other != index && label(other) == label(index))
-            })
-            .collect();
-        if collided.is_empty() {
-            break;
-        }
-        for index in collided {
-            level[index] += 1;
-        }
-    }
-    choices
-        .into_iter()
-        .zip(level)
-        .map(|(mut choices, level)| choices.swap_remove(level))
-        .collect()
 }
 
 /// A signed-in Profile as the menu lists it.
@@ -160,7 +88,7 @@ pub(crate) struct Listed<'a> {
     pub config_dir: &'a Path,
     /// Whether its folder holds a Login (signed in or expired).
     pub signed_in: bool,
-    /// Its Profile name (see [`names`]), or "Signed-out Profile".
+    /// Its Profile name (see [`names::profile_names`]).
     pub name: String,
     /// A nickname titles its row.
     pub nicknamed: bool,
@@ -175,13 +103,30 @@ pub(crate) struct Listed<'a> {
 pub(crate) struct SignedInProfile {
     pub id: String,
     pub key: ProfileKey,
-    /// Its Profile name (see [`names`]).
+    /// Its Profile name (see [`names::profile_names`]).
     pub name: String,
     /// Its Organization as people call it (see
     /// [`LoginNames::organization_label`]); empty when unknown.
     pub organization_label: String,
     /// Its Organization is its personal default: no other account is in it.
     pub personal_organization: bool,
+}
+
+/// Each signed-in Profile's personal Organization, with the one account that
+/// can be in it: Claude lets no one else join a personal Organization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PersonalOrganizations(BTreeMap<String, String>);
+
+impl PersonalOrganizations {
+    /// Whether the Sidebar folder of `account` in `organization` is what an
+    /// account switch in the desktop app left behind: another account paired
+    /// with a Profile's personal Organization (ADR 0003). Such a folder is
+    /// read, never listed and never written into.
+    pub(crate) fn is_leftover(&self, account: &str, organization: &str) -> bool {
+        self.0
+            .get(organization)
+            .is_some_and(|owner| owner != account)
+    }
 }
 
 /// `state/profiles.json`.
@@ -217,8 +162,9 @@ struct Profile {
 }
 
 impl Profile {
-    /// The menu row: `title` is the nickname, else the Profile name.
-    fn row(&self, title: String, limits: LimitsView) -> ProfileRow {
+    /// The menu row: `title` is the nickname, else the Profile name;
+    /// `muted` says whether its limit notifications are muted.
+    fn row(&self, title: String, limits: LimitsView, muted: bool) -> ProfileRow {
         let mut submenu = Vec::new();
         let mut row_limits = LimitsView::default();
         if let Some(identity) = &self.identity {
@@ -271,6 +217,17 @@ impl Profile {
             "Rename…",
             Command::Rename(NicknameTarget::Profile(self.id.clone())),
         ));
+        // Only a Profile with a Login has limits to be notified about.
+        if self.identity.is_some() {
+            submenu.push(MenuItem::Check {
+                title: "Mute notifications".to_owned(),
+                checked: muted,
+                command: Command::SetMuted {
+                    id: self.id.clone(),
+                    muted: !muted,
+                },
+            });
+        }
         submenu.push(action(
             "Remove…",
             Command::AskRemoveProfile(self.id.clone()),
@@ -799,7 +756,7 @@ impl ProfileRegistry {
                 "claude.json not seeded: paused",
                 &[("profile", Field::Profile(&id))],
             );
-        } else if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
+        } else if let Err(error) = profile_folder::seed_claude_json(&config_dir, &ctx.env.home) {
             let error = error.to_string();
             ctx.log(
                 Level::Warn,
@@ -955,14 +912,15 @@ impl ProfileRegistry {
     ) -> Vec<Listed<'_>> {
         let ordered = self.ordered(&settings.profile_order);
         let short_labels = short_labels(&ordered, settings);
-        let names = names(&ordered);
+        let names = profile_names(&ordered);
         ordered
             .into_iter()
             .zip(short_labels.into_iter().zip(names))
             .map(|(profile, (short_label, name))| {
                 let nickname = settings.nicknames.get(&profile.id);
                 let title = nickname.cloned().unwrap_or_else(|| name.clone());
-                let mut row = profile.row(title, limits(&profile.id));
+                let muted = settings.muted_profiles.contains(&profile.id);
+                let mut row = profile.row(title, limits(&profile.id), muted);
                 if self.removing(&profile.id) {
                     row.note = Some("Signing out…".to_owned());
                     row.dimmed = true;
@@ -1082,7 +1040,7 @@ impl ProfileRegistry {
     pub(crate) fn name(&self, id: &str) -> Option<String> {
         let all: Vec<&Profile> = self.profiles.iter().collect();
         let index = all.iter().position(|profile| profile.id == id)?;
-        names(&all).into_iter().nth(index)
+        profile_names(&all).into_iter().nth(index)
     }
 
     /// Starts signing out, then deleting, every folder under `profiles/`
@@ -1135,11 +1093,22 @@ impl ProfileRegistry {
         ordered
     }
 
+    /// The personal Organizations of the signed-in Profiles.
+    pub(crate) fn personal_organizations(&self) -> PersonalOrganizations {
+        PersonalOrganizations(
+            self.signed_in()
+                .into_iter()
+                .filter(|profile| profile.personal_organization)
+                .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
+                .collect(),
+        )
+    }
+
     /// Who each signed-in Profile is, in add order.
     pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
         let all: Vec<&Profile> = self.profiles.iter().collect();
         all.iter()
-            .zip(names(&all))
+            .zip(profile_names(&all))
             .filter_map(|(profile, name)| {
                 let identity = profile.identity.as_ref()?;
                 Some(SignedInProfile {
@@ -1321,7 +1290,7 @@ impl ProfileRegistry {
         let expected = profile.identity.clone();
         let config_dir = profile.config_dir.clone();
         self.notice = None;
-        let previous_account = fs::read(config_dir.join(".claude.json"))
+        let previous_account = fs::read(claude_files::config_file(&config_dir))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|body| body.get("oauthAccount").cloned());
@@ -1523,7 +1492,7 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
         );
         return;
     }
-    match cli_switcher::ensure_links(config_dir, &ctx.env.home.join(".claude")) {
+    match profile_folder::ensure_links(config_dir, &ClaudePaths::new(&ctx.env.home).claude_home()) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(
@@ -1598,7 +1567,7 @@ fn restore_account(
     let result = if ctx.is_paused(SafetyFeature::Seeding) {
         Err(NotRestored::Paused)
     } else {
-        write_account(ctx, &config_dir.join(".claude.json"), account)
+        write_account(ctx, &claude_files::config_file(config_dir), account)
     };
     if let Err(not_restored) = &result {
         let reason = match not_restored {

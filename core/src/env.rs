@@ -37,6 +37,8 @@ use std::thread::{self, JoinHandle};
 
 use jiff::Timestamp;
 
+use crate::claude_files;
+
 /// Everything outside the core, handed to [`crate::Core::launch`].
 pub struct Environment {
     /// The home-folder root (`~`).
@@ -172,9 +174,6 @@ pub trait OsFacts: Send {
     }
 }
 
-/// Where Claude Code reads managed (administrator) settings.
-const MANAGED_SETTINGS: &str = "/Library/Application Support/ClaudeCode/managed-settings.json";
-
 /// Starts real processes with [`std::process::Command`].
 pub struct SystemSpawner;
 
@@ -306,7 +305,8 @@ fn resolve_program(program: &std::ffi::OsStr, env: &[(OsString, OsString)]) -> i
         })
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is a file someone may execute.
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -352,7 +352,7 @@ impl OsFacts for SystemOsFacts {
     /// Read in-process from the bundle's `Info.plist`; nothing is spawned.
     fn desktop_app_version(&self) -> Option<String> {
         use objc2_foundation::{NSBundle, NSString};
-        let bundle = NSBundle::bundleWithPath(&NSString::from_str("/Applications/Claude.app"))?;
+        let bundle = NSBundle::bundleWithPath(&NSString::from_str(claude_files::DESKTOP_APP))?;
         let value =
             bundle.objectForInfoDictionaryKey(&NSString::from_str("CFBundleShortVersionString"))?;
         let version = value.downcast::<NSString>().ok()?.to_string();
@@ -361,7 +361,7 @@ impl OsFacts for SystemOsFacts {
     }
 
     fn managed_settings(&self) -> Option<Vec<u8>> {
-        std::fs::read(MANAGED_SETTINGS).ok()
+        std::fs::read(claude_files::MANAGED_SETTINGS).ok()
     }
 
     fn terminal_of(&self, pid: u32) -> Option<String> {
@@ -387,21 +387,24 @@ impl OsFacts for SystemOsFacts {
     }
 
     fn desktop_claude_code_children(&self) -> Vec<u32> {
-        const BUNDLED: &str = "/Library/Application Support/Claude/claude-code/";
         let Some(processes) = process_paths() else {
             return Vec::new();
         };
         processes
             .into_iter()
-            .filter(|(_, path)| path.contains(BUNDLED) && path.ends_with("/claude"))
+            .filter(|(_, path)| {
+                path.contains(claude_files::BUNDLED_CLAUDE_CODE) && path.ends_with("/claude")
+            })
             .map(|(pid, _)| pid)
             .collect()
     }
 
     fn desktop_app_running(&self) -> bool {
-        const DESKTOP_APP: &str = "/Applications/Claude.app/Contents/MacOS/Claude";
-        process_paths()
-            .is_none_or(|processes| processes.iter().any(|(_, path)| path == DESKTOP_APP))
+        process_paths().is_none_or(|processes| {
+            processes
+                .iter()
+                .any(|(_, path)| path == claude_files::DESKTOP_APP_EXECUTABLE)
+        })
     }
 }
 

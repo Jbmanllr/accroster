@@ -21,6 +21,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::claude_files::ClaudePaths;
 use crate::env::Environment;
 use crate::interface::{
     CheckRow, CheckStatus, ClaudeVersions, Command, DiagnosticsView, Effect, PausedFeature,
@@ -357,7 +358,7 @@ impl Safety {
     /// `only_if_changed` and the shared file's mtime and size are as last
     /// time. Returns whether it checked.
     pub(crate) fn check_settings_env(&mut self, env: &Environment, only_if_changed: bool) -> bool {
-        let shared = env.home.join(".claude/settings.json");
+        let shared = ClaudePaths::new(&env.home).shared_settings();
         let stamp = fs::metadata(&shared)
             .ok()
             .and_then(|meta| Some((meta.modified().ok()?, meta.len())));

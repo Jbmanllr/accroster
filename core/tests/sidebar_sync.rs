@@ -1122,7 +1122,7 @@ fn automatic_mode_watches_the_sidebars_and_syncs_a_few_seconds_after_the_last_ch
     mac.clock.advance(seconds(1));
     core.event(Event::Tick);
     assert_eq!(read(&mac, WORK, "s1"), Some(without_cleared(later)));
-    assert_eq!(core.tick_interval(), accroster_core::driver::TICK_INTERVAL);
+    assert_eq!(core.tick_interval(), accroster_core::TICK_INTERVAL);
 }
 
 #[test]
@@ -1165,7 +1165,7 @@ fn copies_sync_wrote_itself_do_not_start_another_run() {
 
     changed(&mut core, &[copy]);
 
-    assert_eq!(core.tick_interval(), accroster_core::driver::TICK_INTERVAL);
+    assert_eq!(core.tick_interval(), accroster_core::TICK_INTERVAL);
 }
 
 #[test]

@@ -26,12 +26,11 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use crate::claude_json::{self, LoginNames};
-use crate::desktop::{self, DesktopPaths};
+use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
+use crate::claude_json;
+use crate::desktop_account;
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
-
-/// The desktop loader skips Sidebar entries over this size.
-const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+use crate::names::LoginNames;
 
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +186,7 @@ impl Scanner {
     /// Reads every discovered pair under `home`: the `~/.claude.json` login
     /// first, then the most recently active.
     pub(crate) fn scan(&mut self, home: &Path) -> Vec<Evidence> {
-        let root = home.join("Library/Application Support/Claude/claude-code-sessions");
+        let root = ClaudePaths::new(home).sidebar_root();
         let pairs = self.sidebar_pairs(&root);
         evidence(home, pairs)
     }
@@ -197,38 +196,36 @@ impl Scanner {
     fn sidebar_pairs(&mut self, root: &Path) -> Vec<(ProfileKey, usize, Option<Timestamp>)> {
         let mut known = std::mem::take(&mut self.folders);
         let mut pairs = Vec::new();
-        for account in subfolders(root) {
-            for org in subfolders(&root.join(&account)) {
-                let path = root.join(&account).join(&org);
-                // Taken before listing: a write during the listing changes
-                // it, so the next scan lists again.
-                let Some(modified) = fs::metadata(&path).and_then(|m| m.modified()).ok() else {
-                    continue;
-                };
-                let folder = match known.remove(&path) {
-                    Some(folder) if folder.modified == modified => folder,
-                    previous => Folder {
-                        modified,
-                        entries: list(&path, previous.map(|f| f.entries).unwrap_or_default()),
+        for found in claude_files::sidebar_folders(root) {
+            let path = found.path;
+            // Taken before listing: a write during the listing changes
+            // it, so the next scan lists again.
+            let Some(modified) = fs::metadata(&path).and_then(|m| m.modified()).ok() else {
+                continue;
+            };
+            let folder = match known.remove(&path) {
+                Some(folder) if folder.modified == modified => folder,
+                previous => Folder {
+                    modified,
+                    entries: list(&path, previous.map(|f| f.entries).unwrap_or_default()),
+                },
+            };
+            let readable: Vec<Activity> = folder
+                .entries
+                .values()
+                .filter_map(|(_, activity)| *activity)
+                .collect();
+            if !readable.is_empty() {
+                pairs.push((
+                    ProfileKey {
+                        account_uuid: found.account,
+                        organization_uuid: found.organization,
                     },
-                };
-                let readable: Vec<Activity> = folder
-                    .entries
-                    .values()
-                    .filter_map(|(_, activity)| *activity)
-                    .collect();
-                if !readable.is_empty() {
-                    pairs.push((
-                        ProfileKey {
-                            account_uuid: account.clone(),
-                            organization_uuid: org,
-                        },
-                        readable.len(),
-                        readable.into_iter().flatten().max(),
-                    ));
-                }
-                self.folders.insert(path, folder);
+                    readable.len(),
+                    readable.into_iter().flatten().max(),
+                ));
             }
+            self.folders.insert(path, folder);
         }
         pairs
     }
@@ -240,31 +237,24 @@ fn list(
     folder: &Path,
     mut known: BTreeMap<OsString, (Stamp, Option<Activity>)>,
 ) -> BTreeMap<OsString, (Stamp, Option<Activity>)> {
-    fs::read_dir(folder)
+    claude_files::sidebar_entry_files(folder)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|item| {
-            let name = item.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("local_") && name.ends_with(".json")
-        })
-        .filter_map(|item| {
-            let meta = item.metadata().ok()?;
+        .map(|(name, meta)| {
             let stamp = (meta.len(), meta.modified().ok());
-            let name = item.file_name();
+            let path = folder.join(&name);
+            let name = OsString::from(name);
             let activity = match known.remove(&name) {
                 Some((was, activity)) if was == stamp => activity,
-                _ => read_activity(&item.path(), &meta),
+                _ => read_activity(&path, &meta),
             };
-            Some((name, (stamp, activity)))
+            (name, (stamp, activity))
         })
         .collect()
 }
 
 /// A readable entry's newest activity; `None` when it isn't readable.
 fn read_activity(path: &Path, meta: &fs::Metadata) -> Option<Activity> {
-    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
+    if meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
         return None;
     }
     let body: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
@@ -278,7 +268,7 @@ fn read_activity(path: &Path, meta: &fs::Metadata) -> Option<Activity> {
 
 /// The Sidebar `pairs` plus the `~/.claude.json` login, ordered.
 fn evidence(home: &Path, pairs: Vec<(ProfileKey, usize, Option<Timestamp>)>) -> Vec<Evidence> {
-    let desktop_last = desktop::last_known_account(&DesktopPaths::new(home));
+    let desktop_last = desktop_account::last_known_account(&ClaudePaths::new(home));
     let mut found: BTreeMap<ProfileKey, Evidence> = BTreeMap::new();
     for (pair, sessions, last_activity) in pairs {
         found.insert(
@@ -292,7 +282,7 @@ fn evidence(home: &Path, pairs: Vec<(ProfileKey, usize, Option<Timestamp>)>) -> 
             },
         );
     }
-    let cli = cli_login(&home.join(".claude.json"));
+    let cli = cli_login(&ClaudePaths::new(home).default_config_file());
     if let Some((pair, login)) = &cli {
         found
             .entry(pair.clone())
@@ -315,16 +305,6 @@ fn evidence(home: &Path, pairs: Vec<(ProfileKey, usize, Option<Timestamp>)>) -> 
             .then(a.pair.cmp(&b.pair))
     });
     all
-}
-
-fn subfolders(path: &Path) -> Vec<String> {
-    fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|item| item.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|item| item.file_name().to_string_lossy().into_owned())
-        .collect()
 }
 
 /// `oauthAccount` in `~/.claude.json`.

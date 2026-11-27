@@ -16,12 +16,11 @@
 
 use std::path::Path;
 
+use crate::claude_files::{self, DESKTOP_ENTRYPOINT};
 use crate::env::OsFacts;
 use crate::interface::{Command, Effect, OpenChoice, ProfileKey, RunningDot};
 use crate::sessions::{EntryFacts, SessionFacts};
-
-/// The desktop app's `entrypoint` in Transcripts.
-const DESKTOP_ENTRYPOINT: &str = "claude-desktop";
+use crate::shell;
 
 /// The clients that could open a Session, as of now.
 pub(crate) struct Clients {
@@ -120,8 +119,8 @@ pub(crate) fn terminal(facts: &SessionFacts, os: &dyn OsFacts) -> Option<Effect>
     let cwd = facts.cwd.as_deref().filter(|cwd| cwd.is_dir())?;
     Some(Effect::RunInTerminal(format!(
         "cd {} && claude --resume {}",
-        shell_quoted(&cwd.to_string_lossy()),
-        shell_quoted(&facts.id)
+        shell::quote_path(cwd),
+        shell::quote(&facts.id)
     )))
 }
 
@@ -239,7 +238,7 @@ pub(crate) fn choices(facts: &SessionFacts, clients: &Clients) -> Vec<OpenChoice
 /// The desktop's own entry is the archived `local_<id>`, which
 /// `claude --desktop --resume` unarchives instead of adding another.
 fn archived_resumable(facts: &SessionFacts, desktop: &DesktopClient) -> bool {
-    let own = format!("local_{}", facts.id);
+    let own = claude_files::sidebar_entry_id_of(&facts.id);
     facts
         .entries
         .iter()
@@ -259,13 +258,8 @@ fn open_entry<'a>(facts: &'a SessionFacts, pair: Option<&ProfileKey>) -> Option<
 
 /// The ids `claude://code/continue` accepts: `^local_[A-Za-z0-9-]{1,64}$`.
 fn linkable(entry_id: &str) -> bool {
-    entry_id.strip_prefix("local_").is_some_and(|rest| {
+    claude_files::sidebar_entry_suffix(entry_id).is_some_and(|rest| {
         (1..=64).contains(&rest.len())
             && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     })
-}
-
-/// One `sh` word: single-quoted, with `'` written as `'\''`.
-fn shell_quoted(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }

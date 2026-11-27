@@ -1,6 +1,5 @@
 //! [`Core`]: the one object the UI layer talks to.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -11,21 +10,25 @@ use jiff::SignedDuration;
 use crate::backups;
 use crate::checks;
 use crate::claude_code::{self, ClaudeLocator};
+use crate::claude_files::ClaudePaths;
 use crate::cli_switcher;
-use crate::desktop::{DesktopAccount, DesktopBridge, DesktopPaths, NewestEntries, Reopen, Target};
+use crate::context::Context;
+use crate::desktop::{DesktopBridge, Reopen, Target};
+use crate::desktop_account::{DesktopAccount, NewestEntries};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MOST_HEADROOM, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings,
-    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
+    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileSettings,
+    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, TICK_INTERVAL, Toggle,
+    UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening;
-use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
+use crate::profiles::{Listed, ProfileRegistry, SignInTarget};
 use crate::runner::Jobs;
 use crate::safety::{CheckId, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
@@ -162,8 +165,8 @@ fn context_of<'a>(
     settings: &Settings,
     safety: &Safety,
     claude: &'a ClaudeLocator,
-) -> profiles::Context<'a> {
-    profiles::Context {
+) -> Context<'a> {
+    Context {
         env,
         paths,
         logger,
@@ -309,10 +312,10 @@ impl Core {
     /// How soon the driver should send the next [`Event::Tick`]: every second
     /// while a sign-in is waiting (so its end shows at once), more often
     /// while a usage read runs, by the time the next read is due, and at most
-    /// [`crate::driver::TICK_INTERVAL`].
+    /// [`TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
         if self.uninstalled {
-            return crate::driver::TICK_INTERVAL;
+            return TICK_INTERVAL;
         }
         if self.sessions.busy() || self.sync.is_some() {
             // The next batch of the Session index, as soon as input allows.
@@ -328,9 +331,7 @@ impl Core {
             Duration::from_secs(1)
         } else {
             let sync_due = self.sidebar_watch.until_due(self.env.clock.now());
-            sync_due.map_or(crate::driver::TICK_INTERVAL, |due| {
-                due.min(crate::driver::TICK_INTERVAL)
-            })
+            sync_due.map_or(TICK_INTERVAL, |due| due.min(TICK_INTERVAL))
         };
         self.monitor
             .tick_interval(self.env.clock.now(), &self.watched(), idle)
@@ -825,7 +826,7 @@ impl Core {
                     id: &w.id,
                     name: &listed.short_label,
                     limits: self.monitor.limits(&w.id),
-                    tightest: tightest(&listed.row),
+                    tightest: listed.row.tightest_limit(),
                     muted: self.settings.muted_profiles.contains(&w.id),
                     cli_active: pointer.as_deref() == Some(w.config_dir.as_path()),
                 })
@@ -860,7 +861,7 @@ impl Core {
     /// The desktop's account and Organization.
     fn desktop_account(&self) -> Option<DesktopAccount> {
         self.newest_entries
-            .desktop_account(&DesktopPaths::new(&self.env.home))
+            .desktop_account(&ClaudePaths::new(&self.env.home))
     }
 
     /// Everything the UI shows right now.
@@ -961,26 +962,6 @@ impl Core {
                 continue;
             };
             let row = &mut listed.row;
-            let muted = self.settings.muted_profiles.contains(&profile.id);
-            let remove = row
-                .submenu
-                .iter()
-                .position(|item| {
-                    matches!(item, MenuItem::Action { title, .. } | MenuItem::Submenu { title, .. }
-                        if title == "Remove…")
-                })
-                .unwrap_or(row.submenu.len());
-            row.submenu.insert(
-                remove,
-                MenuItem::Check {
-                    title: "Mute notifications".into(),
-                    checked: muted,
-                    command: Command::SetMuted {
-                        id: profile.id.clone(),
-                        muted: !muted,
-                    },
-                },
-            );
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
                 row.badges.push(Badge::Desktop);
             } else if desktop_installed {
@@ -1008,6 +989,45 @@ impl Core {
         if items.len() > before {
             items.push(MenuItem::Separator);
         }
+        items.extend(self.fixed_menu_items());
+        let hidden_discovered = shown
+            .iter()
+            .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
+            .map(|(evidence, choice)| HiddenDiscovered {
+                title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
+                restore: Command::UnhideDiscovered(evidence.pair.clone()),
+            })
+            .collect();
+        View {
+            menu_bar: MenuBarView {
+                label: cli.label,
+                dimmed: menu_bar_dimmed,
+            },
+            menu: MenuView { items },
+            settings: self.settings_view(login_item, profile_settings, hidden_discovered),
+            about: AboutView {
+                name: "AccRoster".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                tagline: TAGLINE.into(),
+                disclaimer: DISCLAIMER.into(),
+            },
+            all_sessions: self.all_sessions(),
+            // Offered once: only until answered, and only while it's ours to
+            // offer (not already on, not turned off in System Settings).
+            first_run: (self.settings.launch_at_login.is_none()
+                && login_item == LoginItemStatus::NotRegistered)
+                .then_some(FirstRunView {
+                    launch_at_login: true,
+                }),
+            diagnostics: self.diagnostics(),
+        }
+    }
+
+    /// The menu's last items, the same whatever the Profiles are: Recent
+    /// Sessions, All Sessions…, Add Profile… (or the sign-in under way),
+    /// Settings…, Diagnostics…, About and Quit.
+    fn fixed_menu_items(&self) -> Vec<MenuItem> {
+        let mut items = Vec::new();
         let recent: Vec<MenuItem> = self
             .sessions
             .recent(RECENT_SESSIONS)
@@ -1057,74 +1077,56 @@ impl Core {
                 command: Command::Quit,
             },
         ]);
-        View {
-            menu_bar: MenuBarView {
-                label: cli.label,
-                dimmed: menu_bar_dimmed,
+        items
+    }
+
+    /// The Settings window. `profiles` and `hidden_discovered` come from
+    /// [`Core::view`], which lists the Profiles once for the menu and for
+    /// Settings.
+    fn settings_view(
+        &self,
+        login_item: LoginItemStatus,
+        profiles: Vec<ProfileSettings>,
+        hidden_discovered: Vec<HiddenDiscovered>,
+    ) -> SettingsView {
+        SettingsView {
+            verbose_logging: self.verbose_logging(),
+            verbose_logging_note: "Turns itself off after 24 hours.".into(),
+            launch_at_login: launch_at_login_view(login_item),
+            cli_switching: CliSwitchingView {
+                on: cli_switcher::is_on(&self.paths),
+                line: cli_switcher::path_line(&self.paths),
+                note: self.cli_switching_note(),
             },
-            menu: MenuView { items },
-            settings: SettingsView {
-                verbose_logging: self.verbose_logging(),
-                verbose_logging_note: "Turns itself off after 24 hours.".into(),
-                launch_at_login: launch_at_login_view(login_item),
-                cli_switching: CliSwitchingView {
-                    on: cli_switcher::is_on(&self.paths),
-                    line: cli_switcher::path_line(&self.paths),
-                    note: self.cli_switching_note(),
-                },
-                sidebar_sync: SidebarSyncView {
-                    mode: self.settings.sidebar_sync,
-                    sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
-                        .then_some(Command::SyncSidebarNow),
-                    note: self.sync_settings_note(),
-                    reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
-                    ssh_and_no_folder_sessions: Toggle {
-                        on: !self.settings.leave_out_ssh_and_no_folder_sessions,
-                        command: Command::SetIncludeSshAndNoFolderSessions(
-                            self.settings.leave_out_ssh_and_no_folder_sessions,
-                        ),
-                    },
-                },
-                profiles: profile_settings,
-                hidden_discovered: shown
-                    .iter()
-                    .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
-                    .map(|(evidence, choice)| HiddenDiscovered {
-                        title: evidence
-                            .hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
-                        restore: Command::UnhideDiscovered(evidence.pair.clone()),
-                    })
-                    .collect(),
-                notifications: NotificationsView {
-                    thresholds: self.settings.thresholds.values().to_vec(),
-                    reset_notification: self.settings.reset_notification,
-                },
-                uninstall: match &self.uninstalling {
-                    Some(_) => UninstallView {
-                        note: Some("Uninstalling · signing every Profile out…".into()),
-                        retry: None,
-                    },
-                    None => UninstallView {
-                        note: self.uninstall_note.clone(),
-                        retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
-                    },
+            sidebar_sync: SidebarSyncView {
+                mode: self.settings.sidebar_sync,
+                sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
+                    .then_some(Command::SyncSidebarNow),
+                note: self.sync_settings_note(),
+                reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
+                ssh_and_no_folder_sessions: Toggle {
+                    on: !self.settings.leave_out_ssh_and_no_folder_sessions,
+                    command: Command::SetIncludeSshAndNoFolderSessions(
+                        self.settings.leave_out_ssh_and_no_folder_sessions,
+                    ),
                 },
             },
-            about: AboutView {
-                name: "AccRoster".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                tagline: TAGLINE.into(),
-                disclaimer: DISCLAIMER.into(),
+            profiles,
+            hidden_discovered,
+            notifications: NotificationsView {
+                thresholds: self.settings.thresholds.values().to_vec(),
+                reset_notification: self.settings.reset_notification,
             },
-            all_sessions: self.all_sessions(),
-            // Offered once: only until answered, and only while it's ours to
-            // offer (not already on, not turned off in System Settings).
-            first_run: (self.settings.launch_at_login.is_none()
-                && login_item == LoginItemStatus::NotRegistered)
-                .then_some(FirstRunView {
-                    launch_at_login: true,
-                }),
-            diagnostics: self.diagnostics(),
+            uninstall: match &self.uninstalling {
+                Some(_) => UninstallView {
+                    note: Some("Uninstalling · signing every Profile out…".into()),
+                    retry: None,
+                },
+                None => UninstallView {
+                    note: self.uninstall_note.clone(),
+                    retry: self.uninstall_note.as_ref().map(|_| Command::Uninstall),
+                },
+            },
         }
     }
 
@@ -1292,24 +1294,12 @@ impl Core {
             .collect()
     }
 
-    /// Each signed-in Profile's personal Organization, with the one account
-    /// that can be in it.
-    fn personal_organizations(&self) -> BTreeMap<String, String> {
-        self.profiles
-            .signed_in()
-            .into_iter()
-            .filter(|profile| profile.personal_organization)
-            .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
-            .collect()
-    }
-
-    /// Another account paired with a Profile's personal Organization: no one
-    /// else can be in that Organization, so its Sidebar folder is what an
-    /// account switch in the desktop app left behind.
+    /// Whether `pair`'s Sidebar folder is an account switch's leftover
+    /// ([`crate::profiles::PersonalOrganizations::is_leftover`]).
     fn is_leftover(&self, pair: &ProfileKey) -> bool {
-        self.personal_organizations()
-            .get(&pair.organization_uuid)
-            .is_some_and(|owner| *owner != pair.account_uuid)
+        self.profiles
+            .personal_organizations()
+            .is_leftover(&pair.account_uuid, &pair.organization_uuid)
     }
 
     /// Discovered pairs without a signed-in Profile, with the user's choices,
@@ -1524,22 +1514,22 @@ impl Core {
     }
 
     /// The Desktop bridge, with what it needs from the rest of the core.
-    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+    fn desktop(&mut self) -> (&mut DesktopBridge, Context<'_>) {
         (&mut self.desktop, context!(self))
     }
 
     /// Reopen Claude, with what it needs from the rest of the core.
-    fn reopen(&mut self) -> (&mut Reopen, profiles::Context<'_>) {
+    fn reopen(&mut self) -> (&mut Reopen, Context<'_>) {
         (&mut self.reopen, context!(self))
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
-    fn profiles(&mut self) -> (&mut ProfileRegistry, profiles::Context<'_>) {
+    fn profiles(&mut self) -> (&mut ProfileRegistry, Context<'_>) {
         (&mut self.profiles, context!(self))
     }
 
     /// What the registry and the monitor need from the rest of the core.
-    fn context(&self) -> profiles::Context<'_> {
+    fn context(&self) -> Context<'_> {
         context!(self)
     }
 
@@ -1554,11 +1544,6 @@ impl Core {
     }
 }
 
-/// A row's tightest limit: its highest bar, unknown limit kinds included.
-fn tightest(row: &ProfileRow) -> Option<u32> {
-    row.limits.iter().map(|bar| bar.percent).max()
-}
-
 /// The non-stale watched Profile with the lowest tightest limit, among two
 /// or more.
 fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom> {
@@ -1569,7 +1554,7 @@ fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom>
         Some((
             listed.id,
             listed.short_label.as_str(),
-            tightest(&listed.row)?,
+            listed.row.tightest_limit()?,
         ))
     }))
 }

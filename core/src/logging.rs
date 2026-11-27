@@ -25,6 +25,8 @@ use std::sync::LazyLock;
 use jiff::Timestamp;
 use regex::Regex;
 
+use crate::claude_files;
+
 /// `app.log` rotates once a write would take it past this size.
 pub(crate) const ROTATE_AT_BYTES: u64 = 1024 * 1024;
 /// How many rotated files (`app.log.1` …) are kept.
@@ -145,8 +147,8 @@ fn render_path(home: &Path, path: &Path) -> String {
                 continue;
             }
             Component::Normal(part) => {
-                let hashed = previous[0] == Some(".claude".as_ref())
-                    && previous[1] == Some("projects".as_ref());
+                let hashed = previous[0] == Some(claude_files::CLAUDE_HOME.as_ref())
+                    && previous[1] == Some(claude_files::PROJECTS.as_ref());
                 previous = [previous[1], Some(part)];
                 if hashed {
                     format!("<project {}>", short_hash(&part.to_string_lossy()))
@@ -249,7 +251,7 @@ fn rotate(path: &Path) -> std::io::Result<()> {
 /// The app calls this once at startup with [`crate::Environment::home`]. It is
 /// process-wide, so the core never installs it itself.
 pub fn install_panic_hook(home: &Path) {
-    let path = crate::AppPaths::new(home).app_log();
+    let path = crate::storage::AppPaths::new(home).app_log();
     let home = home.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info

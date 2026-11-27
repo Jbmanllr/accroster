@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
+use crate::claude_files::ClaudePaths;
 use crate::env::{Environment, RunningProcess, SpawnOutput, SpawnRequest};
 use crate::storage::AppPaths;
 use crate::usage::{self, UsageReply};
@@ -147,6 +148,21 @@ impl Job {
     }
 }
 
+/// Marks the login shell's `PATH` line in whatever its startup files print.
+const PATH_MARKER: &str = "accroster-login-path=";
+
+/// The `PATH` in the output of [`Runner::start_login_shell_path`]: the
+/// marked line, whatever the shell's startup files printed around it.
+pub(crate) fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(PATH_MARKER.as_bytes()))
+        .next_back()
+        .filter(|path| !path.is_empty())
+        .map(|path| std::ffi::OsStr::from_bytes(path).to_owned())
+}
+
 /// A short run a [`Jobs`] queue can start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JobKind {
@@ -270,7 +286,7 @@ impl<'a> Runner<'a> {
     }
 
     /// Starts the user's login shell (`$SHELL -l`) printing the `PATH` its
-    /// startup files set up, marked with [`crate::claude_code::PATH_MARKER`].
+    /// startup files set up, for [`login_shell_path`] to read.
     pub(crate) fn start_login_shell_path(&self) -> io::Result<Job> {
         let shell = self
             .inherited("SHELL")
@@ -279,10 +295,7 @@ impl<'a> Runner<'a> {
             .ok_or_else(|| io::Error::other("SHELL is not an absolute path"))?;
         let cwd = self.paths.root().join("spawn-cwd");
         fs::create_dir_all(&cwd)?;
-        let command = format!(
-            "printf '\\n{}%s\\n' \"$PATH\"",
-            crate::claude_code::PATH_MARKER
-        );
+        let command = format!("printf '\\n{PATH_MARKER}%s\\n' \"$PATH\"");
         let request = SpawnRequest {
             program: shell.into_os_string(),
             args: vec!["-l".into(), "-c".into(), command.into()],
@@ -422,7 +435,7 @@ impl<'a> Runner<'a> {
         stdin: Option<Vec<u8>>,
     ) -> io::Result<SpawnRequest> {
         if config_dir.parent() != Some(self.paths.profiles().as_path())
-            || config_dir == self.env.home.join(".claude")
+            || config_dir == ClaudePaths::new(&self.env.home).claude_home()
         {
             return Err(io::Error::other("Claude Code only runs in Profile folders"));
         }

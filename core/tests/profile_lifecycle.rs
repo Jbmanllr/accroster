@@ -683,3 +683,69 @@ fn remove_warns_first_when_a_shared_anthropic_configs_folder_exists() {
         "{message}"
     );
 }
+
+/// Every titled item of a row's hover submenu, top to bottom.
+fn submenu_titles(core: &Core, row: usize) -> Vec<String> {
+    rows(core)[row]
+        .submenu
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Action { title, .. }
+            | MenuItem::Check { title, .. }
+            | MenuItem::Submenu { title, .. } => Some(title.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn mute_sits_right_above_remove_whatever_else_the_row_offers() {
+    let mac = mac_signing_in_as(&work(), limits_body());
+    mac.os.set_desktop_app_version(Some("1.2.3"));
+    mac.claude.reply(StubCall::AuthLogout, Reply::hanging());
+    let mut core = mac.launch();
+    add_profile(&mut core);
+    assert_eq!(
+        submenu_titles(&core, 0),
+        [
+            "Copy shell override",
+            "Limit resets → claude.ai",
+            "Rename…",
+            "Mute notifications",
+            "Remove…",
+            "Switch desktop app to this Profile…"
+        ]
+    );
+
+    // The CLI's Active Profile's Remove… is a submenu of what to use next.
+    core.command(Command::SetCliSwitching(true));
+    make_cli_active(&mac);
+    assert_eq!(
+        submenu_titles(&core, 0),
+        [
+            "Use for new CLI runs",
+            "Copy shell override",
+            "Limit resets → claude.ai",
+            "Rename…",
+            "Mute notifications",
+            "Remove…",
+            "Switch desktop app to this Profile…"
+        ]
+    );
+    core.command(Command::SetCliSwitching(false));
+
+    // While it signs out, Remove… is gone and Mute keeps its place.
+    let (_, confirm) = removal_prompt(&mut core, 0);
+    let (core, _) = command_promptly(core, confirm);
+    wait_for_calls(&mac, StubCall::AuthLogout, 1);
+    assert_eq!(
+        submenu_titles(&core, 0),
+        [
+            "Copy shell override",
+            "Limit resets → claude.ai",
+            "Rename…",
+            "Mute notifications",
+            "Switch desktop app to this Profile…"
+        ]
+    );
+}
