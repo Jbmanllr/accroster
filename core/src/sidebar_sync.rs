@@ -17,8 +17,9 @@
 //!   CLI-only Session), skipping WSL and scheduled-task Sessions, SSH and
 //!   No-folder Sessions when "Include SSH and No-folder Sessions" is off
 //!   (ADR 0003's amendments), files over 10 MB, empty and unparsable files. A copy keeps the
-//!   file name and every field; `bridgeSessionIds`, `remoteMcpServersConfig`
-//!   and `enabledMcpTools` are cleared when present, and `sshReattach` is
+//!   file name and every field; `bridgeSessionIds`, `remoteMcpServersConfig`,
+//!   `enabledMcpTools`, `servedConnectorCalls` and `connectorKeyHolders` are
+//!   cleared when present, and `sshReattach` is
 //!   dropped. Each run counts the Sessions it left out, by why. A `deleted_<id>`
 //!   tombstone in a folder stops the Session being added there again.
 //! - **Which copy wins.** Entries carry no per-field times, so sync keeps
@@ -36,7 +37,8 @@
 //! - **Reading** ([`EntryCache`]): a run plans from a slim summary of each
 //!   entry, and parses only the files changed since the last run read or
 //!   wrote them. A copy's source is read in full only when the copy is
-//!   written, and only while it is still the file planned from.
+//!   written: the file planned from, or the file as it is now when Claude
+//!   saved it again since (a Session running a turn).
 //! - **Watching** ([`Watch`]): while sync is on, the UI watches
 //!   `claude-code-sessions/`. Automatic mode runs a few seconds after the
 //!   last change to the desktop's Active Profile folder. An entry Claude
@@ -67,10 +69,14 @@ const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Fields a copy clears: they tie an entry to one account's connectors and
 /// remote-control bridge. The desktop app rebuilds them.
-const CLEARED: [&str; 3] = [
+const CLEARED: [&str; 5] = [
     "bridgeSessionIds",
     "remoteMcpServersConfig",
     "enabledMcpTools",
+    // Connector calls the Session's own account served, and which rows hold
+    // its connector keys (seen in Claude 6.28899.6).
+    "servedConnectorCalls",
+    "connectorKeyHolders",
 ];
 
 /// Fields a copy drops: `sshReattach` binds an SSH Session's remote process
@@ -687,18 +693,28 @@ impl SyncRun {
                 now_there.as_deref().and_then(parse_body)
             } else {
                 let source = &self.read.folders[write.source];
-                cache
-                    .read_again(&source.path.join(&write.name))
-                    .map(|mut body| {
-                        clear(&mut body);
-                        body
-                    })
+                source_now(source, &write.name, cache).map(|mut body| {
+                    clear(&mut body);
+                    body
+                })
             };
             let Some(mut body) = body else {
                 continue;
             };
-            take_fields(&mut body, &write.title, &TITLE_FIELDS);
-            take_fields(&mut body, &write.archive, &ARCHIVE_FIELDS);
+            // A source Claude saved again since the plan keeps the title and
+            // archive state it has now, unless the plan took them from
+            // another copy.
+            let planned = self.read.folders[write.source].copies.get(&write.name);
+            let from_source =
+                |fields: &Map<String, Value>, of: fn(&Entry) -> &Map<String, Value>| {
+                    !write.own_folder && planned.is_some_and(|entry| of(entry) == fields)
+                };
+            if !from_source(&write.title, |entry| &entry.title) {
+                take_fields(&mut body, &write.title, &TITLE_FIELDS);
+            }
+            if !from_source(&write.archive, |entry| &entry.archive) {
+                take_fields(&mut body, &write.archive, &ARCHIVE_FIELDS);
+            }
             let Ok(bytes) = serde_json::to_vec(&body) else {
                 continue;
             };
@@ -753,6 +769,27 @@ impl SyncRun {
         save(paths, &self.record);
         Run::Synced(self.report.clone())
     }
+}
+
+/// The body of `name` in `source` to copy from: the file planned from, or,
+/// when Claude saved it again since (a Session running a turn is saved every
+/// few seconds), the file as it is now. `None` when it is gone, can't be
+/// read, no longer names this Session, or became a kind sync leaves out.
+fn source_now(source: &Folder, name: &str, cache: &EntryCache) -> Option<Map<String, Value>> {
+    let path = source.path.join(name);
+    if let Some(body) = cache.read_again(&path) {
+        return Some(body);
+    }
+    let planned = source.copies.get(name)?;
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    let body = parse_body(&fs::read(&path).ok()?)?;
+    let stem = name.strip_suffix(".json")?;
+    (body.get("sessionId").and_then(Value::as_str) == Some(stem)
+        && left_out(&body) == planned.left_out)
+        .then_some(body)
 }
 
 /// A copy is never newer than what it was made from, so the folder Claude
