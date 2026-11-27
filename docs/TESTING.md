@@ -37,5 +37,5 @@ None: every event runs every check. T1 takes about 4 minutes and T2 about 10, bo
 
 ## Not covered by any gate
 
-- The AppKit layer (`src/ui.rs`): no automated tests by design. It is checked by hand against the `prototype/*` branches, and by the first-release checklist in `docs/RELEASING.md`.
+- The AppKit layer (`src/ui.rs`, `src/ui/`): no automated tests by design. It is checked by hand against the `prototype/*` branches, and by the first-release checklist in `docs/RELEASING.md`.
 - Anything that needs a real Claude login, a real desktop app switch or real Anthropic replies (429, 401, an expired Login).

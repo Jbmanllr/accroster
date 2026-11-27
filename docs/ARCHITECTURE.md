@@ -12,6 +12,17 @@ How AccRoster's code is organised, which module owns what, and the rules that ke
 
 The contract between the two parts is `core/src/interface.rs`. The driver (`core/src/driver.rs`) runs the core on its own thread, so the UI never waits on it. Everything the core touches outside itself comes through one `Environment` (`core/src/env.rs`), which the tests replace with the fake Mac.
 
+## The AppKit layer's files
+
+| File | Holds |
+|---|---|
+| `src/main.rs` | Builds the real `Environment`, launches the core, starts the UI. |
+| `src/ui.rs` | `Ui`: the target of every click and the owner of every window; rendering a `View`, performing an `Effect`, and building the windows. |
+| `src/ui/widgets.rs` | Views built from one view model each (a Profile row, a limit bar, a badge, a Session row, menu items). They don't know `Ui`. |
+| `src/ui/sidebar.rs` | The All Sessions sidebar's data source and delegate. |
+| `src/ui/mac.rs` | What the UI does to the rest of the Mac: Terminal, the Claude desktop app, bringing windows forward, the Trash, alerts, the network path. |
+| `src/notifications.rs` | Posting user notifications and receiving their clicks. |
+
 ## The core's modules
 
 Lowest layer first. A module uses only the modules above it in this table. The order is `LAYERS` in `core/tests/architecture.rs`, which is the source of truth.

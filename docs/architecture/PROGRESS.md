@@ -33,7 +33,7 @@ Behaviour: a wrong-typed `name`, `hostSessionId` or `sessionId` no longer makes 
 
 `core/tests/architecture.rs` (seven checks), ADR 0006, `docs/ARCHITECTURE.md`. Each behavioural check was shown to fail on a planted violation, with the file and line.
 
-## Round 5: small rules with two copies
+## Round 5: small rules with two copies (`7ae4781`)
 
 - Quoting a `sh` word: `cli_switcher::sh_quote` and `opening::shell_quoted` → `shell::quote` / `quote_path`, with a unit test.
 - A row's tightest limit: computed in `core` and again in `cli_switcher` → `ProfileRow::tightest_limit`.
@@ -42,3 +42,15 @@ Behaviour: a wrong-typed `name`, `hostSessionId` or `sessionId` no longer makes 
 - The installed Claude versions moved from the Desktop bridge to `claude_code::installed_versions`: `desktop` is now only the busy guard, the Guided switch and Reopen Claude.
 
 Behaviour unchanged.
+
+## Round 6: a row's items are placed by the module that builds the row (`ae06c7f`)
+
+The core added "Mute notifications" to each Profile row by searching the row's submenu for an item titled "Remove…", which the registry builds and the CLI switcher sometimes replaces with a submenu. Renaming that item would have silently moved Mute to the end. The registry now places Mute itself, from the settings it already receives.
+
+A new test (`mute_sits_right_above_remove_whatever_else_the_row_offers`) pins the submenu's order in three states; it passed before the change and after.
+
+## Round 7: the AppKit layer's leaves leave `ui.rs`
+
+`src/ui.rs` was one 2,858-line file. Its parts that don't touch the `Ui` object moved out, unchanged: `src/ui/widgets.rs` (views built from view models), `src/ui/sidebar.rs` (the All Sessions sidebar's data source) and `src/ui/mac.rs` (Terminal, the desktop app, the Trash, alerts, the network path). `ui.rs` is 2,000 lines: `Ui` and the windows (task 14).
+
+This layer has no tests, so the move was checked two other ways: the code lines of the four files are the same multiset as the old file's (apart from `use` lines, `pub(super)` and four signatures rustfmt rewrapped), and the debug build launched and ran against an empty throwaway home, logging `launch` and nothing else. No window was opened in that run.
