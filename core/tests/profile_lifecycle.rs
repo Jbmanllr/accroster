@@ -463,6 +463,27 @@ fn mac_with_expired_work() -> (FakeMac, Core) {
 }
 
 #[test]
+fn sign_in_again_while_a_sign_in_waits_starts_a_fresh_one() {
+    let (mac, mut core) = mac_with_expired_work();
+    mac.claude
+        .reply(StubCall::AuthLogin, Reply::hanging())
+        .reply(StubCall::AuthLogin, sign_in_as(&work()))
+        .reply(StubCall::GetUsage, usage_reply(limits_body()));
+    mac.clock.advance(jiff::SignedDuration::from_mins(1));
+    click_in_row(&mut core, 0, "Sign in again…");
+    let stuck = sign_in_call_number(&mac, 2);
+
+    // The browser page was lost: the user clicks again.
+    click_in_row(&mut core, 0, "Sign in again…");
+    let fresh = sign_in_call_number(&mac, 3);
+    wait_until_exited(&fresh);
+    wait_for_sign_in(&mut core);
+
+    wait_until_exited(&stuck);
+    assert!(!rows(&core)[0].dimmed, "the fresh sign-in fixed the login");
+}
+
+#[test]
 fn sign_in_again_in_the_same_folder_with_the_email_fixes_an_expired_login() {
     let (mac, mut core) = mac_with_expired_work();
     let folder = only_profile_folder(&mac);

@@ -770,9 +770,9 @@ impl ProfileRegistry {
     /// `target` (a Discovered Profile), its email is passed to the sign-in and
     /// the account that signs in is checked against its pair.
     pub(crate) fn add(&mut self, ctx: &Context, target: Option<SignInTarget>) {
-        if self.sign_in.is_some() {
-            return;
-        }
+        // A new click replaces a sign-in still waiting: its browser page
+        // may be lost, and only one runs at a time.
+        self.cancel(ctx);
         self.notice = None;
         let (id, config_dir) = match create_folder(ctx.paths) {
             Ok(created) => created,
@@ -1309,11 +1309,12 @@ impl ProfileRegistry {
 
     /// "Sign in again…": Claude Code's browser sign-in in the Profile's own
     /// folder (its Keychain slot is tied to that path), with `--email` when
-    /// the Login is known. Ignored while another sign-in is running.
+    /// the Login is known. Replaces a sign-in still waiting.
     pub(crate) fn sign_in_again(&mut self, ctx: &Context, id: &str) {
-        if self.sign_in.is_some() {
+        if self.profile(id).is_none() {
             return;
         }
+        self.cancel(ctx);
         let Some(profile) = self.profile(id) else {
             return;
         };
