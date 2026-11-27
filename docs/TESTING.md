@@ -8,7 +8,7 @@ What runs, when, and what a green result proves. Tier names (T0–T4) follow the
 |---|---|---|---|---|
 | Format | `cargo fmt --all --check` | formatting | static | seconds |
 | Lint | `cargo clippy --all-targets --locked -- -D warnings` | no lint, lockfile unchanged | static | ~1 min |
-| Tests | `cargo test --locked` | every core module through its interface against the fake Mac (temp home, stub `claude`, fake clock and OS facts), the shim, FSEvents | one machine | ~2 min |
+| Tests | `cargo test --locked` | every core module through its interface against the fake Mac (temp home, stub `claude`, fake clock and OS facts), the shim, FSEvents; and the architecture rules of `docs/ARCHITECTURE.md`, read from the source text (`core/tests/architecture.rs`) | one machine | ~2 min |
 | Release dry run | `scripts/release.sh --dry-run` | universal build, hardened-runtime ad-hoc signature with the entitlements, dmg layout and version | one machine | ~10 min cold |
 | Release | `scripts/release.sh --developer-id --version vX.Y.Z` | Developer ID signature, notarization, staples, Gatekeeper acceptance | one machine + Apple | per release |
 
