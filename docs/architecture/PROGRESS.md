@@ -61,11 +61,11 @@ The Profile name and the Short label are glossary terms, but their rules were in
 
 Behaviour unchanged; `core/tests/profile_names.rs` covers it through the menu.
 
-## Round 9: `Core::view` hands two parts to named functions
+## Round 9: `Core::view` hands two parts to named functions (`d28add3`)
 
 The menu's last items (Recent Sessions to Quit) are `Core::fixed_menu_items`, and the Settings window is `Core::settings_view`. `view` is 160 lines instead of 260 and reads as: status lines, header, Profile rows, Discovered rows, fixed items, then each window. Behaviour unchanged; task 12 keeps what is left.
 
-## Round 10: an independent review of rounds 1 to 7, and what it changed
+## Round 10: an independent review of rounds 1 to 7, and what it changed (`53fffa1`)
 
 A fresh reviewer compared old and new code over `e474feb..3ffbdb3`, read-only. It found no bug that shows on a real Mac, and confirmed the moves in rounds 3, 5 and 7 are identical code. It found four edge-case differences that weren't written down, documentation that claimed more than the checks do, and a blind spot in the architecture test. All are addressed:
 
