@@ -186,8 +186,9 @@ struct Profile {
 }
 
 impl Profile {
-    /// The menu row: `title` is the nickname, else the Profile name.
-    fn row(&self, title: String, limits: LimitsView) -> ProfileRow {
+    /// The menu row: `title` is the nickname, else the Profile name;
+    /// `muted` says whether its limit notifications are muted.
+    fn row(&self, title: String, limits: LimitsView, muted: bool) -> ProfileRow {
         let mut submenu = Vec::new();
         let mut row_limits = LimitsView::default();
         if let Some(identity) = &self.identity {
@@ -240,6 +241,17 @@ impl Profile {
             "Rename…",
             Command::Rename(NicknameTarget::Profile(self.id.clone())),
         ));
+        // Only a Profile with a Login has limits to be notified about.
+        if self.identity.is_some() {
+            submenu.push(MenuItem::Check {
+                title: "Mute notifications".to_owned(),
+                checked: muted,
+                command: Command::SetMuted {
+                    id: self.id.clone(),
+                    muted: !muted,
+                },
+            });
+        }
         submenu.push(action(
             "Remove…",
             Command::AskRemoveProfile(self.id.clone()),
@@ -931,7 +943,8 @@ impl ProfileRegistry {
             .map(|(profile, (short_label, name))| {
                 let nickname = settings.nicknames.get(&profile.id);
                 let title = nickname.cloned().unwrap_or_else(|| name.clone());
-                let mut row = profile.row(title, limits(&profile.id));
+                let muted = settings.muted_profiles.contains(&profile.id);
+                let mut row = profile.row(title, limits(&profile.id), muted);
                 if self.removing(&profile.id) {
                     row.note = Some("Signing out…".to_owned());
                     row.dimmed = true;

@@ -963,26 +963,6 @@ impl Core {
                 continue;
             };
             let row = &mut listed.row;
-            let muted = self.settings.muted_profiles.contains(&profile.id);
-            let remove = row
-                .submenu
-                .iter()
-                .position(|item| {
-                    matches!(item, MenuItem::Action { title, .. } | MenuItem::Submenu { title, .. }
-                        if title == "Remove…")
-                })
-                .unwrap_or(row.submenu.len());
-            row.submenu.insert(
-                remove,
-                MenuItem::Check {
-                    title: "Mute notifications".into(),
-                    checked: muted,
-                    command: Command::SetMuted {
-                        id: profile.id.clone(),
-                        muted: !muted,
-                    },
-                },
-            );
             if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
                 row.badges.push(Badge::Desktop);
             } else if desktop_installed {
