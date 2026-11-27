@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::claude_files;
+use crate::context::Context;
 use crate::env::RunningProcess;
 use crate::interface::LimitBar;
 use crate::limit_offers;
 use crate::logging::{Field, Level};
-use crate::profiles::Context;
 use crate::runner::UsageRead;
 use crate::storage::{self, ReadError, VersionedFile};
 use crate::usage::{Limit, Limits, UsageReply};

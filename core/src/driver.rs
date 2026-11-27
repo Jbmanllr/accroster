@@ -3,19 +3,17 @@
 //! The UI layer sends [`Input`]s through a [`CoreHandle`] and receives an
 //! [`Update`] (the new [`View`] and the [`Effect`]s to perform) after the
 //! core starts and after every input. The driver also sends
-//! [`Event::Tick`] every [`Core::tick_interval`] ([`TICK_INTERVAL`] unless
+//! [`Event::Tick`] every [`Core::tick_interval`]
+//! ([`crate::interface::TICK_INTERVAL`] unless
 //! the core is waiting on something). Inputs are handled one at a time, in
 //! order, so the core itself stays single-threaded.
 
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::Core;
+use crate::core::Core;
 use crate::interface::{Command, Effect, Event, View};
-
-/// How often the driver sends [`Event::Tick`].
-pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Something for the core to handle.
 #[derive(Debug, Clone, PartialEq, Eq)]

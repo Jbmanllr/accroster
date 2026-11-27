@@ -13,20 +13,23 @@ use crate::checks;
 use crate::claude_code::{self, ClaudeLocator};
 use crate::claude_files::ClaudePaths;
 use crate::cli_switcher;
-use crate::desktop::{DesktopAccount, DesktopBridge, NewestEntries, Reopen, Target};
+use crate::context::Context;
+use crate::desktop::{DesktopBridge, Reopen, Target};
+use crate::desktop_account::{DesktopAccount, NewestEntries};
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MOST_HEADROOM, MenuBarView, MenuItem, MenuView,
     NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings,
-    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, Toggle, UninstallView, View,
+    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, TICK_INTERVAL, Toggle,
+    UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening;
-use crate::profiles::{self, Listed, ProfileRegistry, SignInTarget};
+use crate::profiles::{Listed, ProfileRegistry, SignInTarget};
 use crate::runner::Jobs;
 use crate::safety::{CheckId, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
@@ -163,8 +166,8 @@ fn context_of<'a>(
     settings: &Settings,
     safety: &Safety,
     claude: &'a ClaudeLocator,
-) -> profiles::Context<'a> {
-    profiles::Context {
+) -> Context<'a> {
+    Context {
         env,
         paths,
         logger,
@@ -310,10 +313,10 @@ impl Core {
     /// How soon the driver should send the next [`Event::Tick`]: every second
     /// while a sign-in is waiting (so its end shows at once), more often
     /// while a usage read runs, by the time the next read is due, and at most
-    /// [`crate::driver::TICK_INTERVAL`].
+    /// [`TICK_INTERVAL`].
     pub fn tick_interval(&self) -> Duration {
         if self.uninstalled {
-            return crate::driver::TICK_INTERVAL;
+            return TICK_INTERVAL;
         }
         if self.sessions.busy() || self.sync.is_some() {
             // The next batch of the Session index, as soon as input allows.
@@ -329,9 +332,7 @@ impl Core {
             Duration::from_secs(1)
         } else {
             let sync_due = self.sidebar_watch.until_due(self.env.clock.now());
-            sync_due.map_or(crate::driver::TICK_INTERVAL, |due| {
-                due.min(crate::driver::TICK_INTERVAL)
-            })
+            sync_due.map_or(TICK_INTERVAL, |due| due.min(TICK_INTERVAL))
         };
         self.monitor
             .tick_interval(self.env.clock.now(), &self.watched(), idle)
@@ -1525,22 +1526,22 @@ impl Core {
     }
 
     /// The Desktop bridge, with what it needs from the rest of the core.
-    fn desktop(&mut self) -> (&mut DesktopBridge, profiles::Context<'_>) {
+    fn desktop(&mut self) -> (&mut DesktopBridge, Context<'_>) {
         (&mut self.desktop, context!(self))
     }
 
     /// Reopen Claude, with what it needs from the rest of the core.
-    fn reopen(&mut self) -> (&mut Reopen, profiles::Context<'_>) {
+    fn reopen(&mut self) -> (&mut Reopen, Context<'_>) {
         (&mut self.reopen, context!(self))
     }
 
     /// The Profile registry, with what it needs from the rest of the core.
-    fn profiles(&mut self) -> (&mut ProfileRegistry, profiles::Context<'_>) {
+    fn profiles(&mut self) -> (&mut ProfileRegistry, Context<'_>) {
         (&mut self.profiles, context!(self))
     }
 
     /// What the registry and the monitor need from the rest of the core.
-    fn context(&self) -> profiles::Context<'_> {
+    fn context(&self) -> Context<'_> {
         context!(self)
     }
 

@@ -251,7 +251,7 @@ fn rotate(path: &Path) -> std::io::Result<()> {
 /// The app calls this once at startup with [`crate::Environment::home`]. It is
 /// process-wide, so the core never installs it itself.
 pub fn install_panic_hook(home: &Path) {
-    let path = crate::AppPaths::new(home).app_log();
+    let path = crate::storage::AppPaths::new(home).app_log();
     let home = home.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info

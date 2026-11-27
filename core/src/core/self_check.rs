@@ -8,10 +8,10 @@ use super::Core;
 use super::sidebar::desktop_name;
 use crate::checks;
 use crate::claude_files::ClaudePaths;
-use crate::cli_switcher;
 use crate::desktop;
 use crate::interface::{CheckStatus, MenuItem, SafetyFeature, SidebarSyncMode};
 use crate::logging::{Field, Level};
+use crate::profile_folder;
 use crate::profiles::CrossCheckAnswer;
 use crate::safety::{self, CheckId, Finding};
 use crate::sidebar_sync;
@@ -83,7 +83,7 @@ impl Core {
         for name in links
             .replaced
             .iter()
-            .filter(|name| !cli_switcher::TRANSCRIPT_LINKS.contains(name))
+            .filter(|name| !profile_folder::TRANSCRIPT_LINKS.contains(name))
         {
             row.submenu.push(MenuItem::Detail(format!(
                 "{name} link replaced · not shared"
@@ -171,10 +171,8 @@ impl Core {
             .into_iter()
             .map(|(id, dir)| ProfileLinks {
                 id: id.to_owned(),
-                replaced: cli_switcher::replaced_links(dir, &claude_home),
-                transcripts_shared: cli_switcher::TRANSCRIPT_LINKS.iter().all(|name| {
-                    std::fs::read_link(dir.join(name)).ok() == Some(claude_home.join(name))
-                }),
+                replaced: profile_folder::replaced_links(dir, &claude_home),
+                transcripts_shared: profile_folder::transcripts_shared(dir, &claude_home),
             })
             .collect();
         if self.links.is_empty() {
@@ -188,7 +186,7 @@ impl Core {
                     .replaced
                     .iter()
                     .copied()
-                    .filter(|name| cli_switcher::TRANSCRIPT_LINKS.contains(name) == transcript)
+                    .filter(|name| profile_folder::TRANSCRIPT_LINKS.contains(name) == transcript)
                     .collect();
                 if !hit.is_empty() {
                     profiles += 1;

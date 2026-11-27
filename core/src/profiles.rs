@@ -18,52 +18,20 @@ use serde_json::Value;
 use crate::backups;
 use crate::claude_files::{self, ClaudePaths};
 use crate::claude_json::{self, LoginNames};
-use crate::cli_switcher;
-use crate::env::{Environment, RunningProcess};
+use crate::context::Context;
+use crate::env::RunningProcess;
 use crate::interface::{
     Command, Effect, MenuItem, NicknameTarget, ProfileKey, ProfileRow, SafetyFeature,
 };
-use crate::logging::{Field, Level, Logger};
+use crate::logging::{Field, Level};
 use crate::monitor::{Completed, LimitsView, Watched};
-use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs, Runner};
+use crate::profile_folder;
+use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs};
 use crate::settings::Settings;
 use crate::storage::{self, AppPaths, ReadError, VersionedFile};
 
 /// A sign-in still running after this long is killed.
 pub(crate) const SIGN_IN_TIMEOUT: SignedDuration = SignedDuration::from_mins(10);
-
-/// What the registry needs from the core for one call.
-pub(crate) struct Context<'a> {
-    pub env: &'a Environment,
-    pub paths: &'a AppPaths,
-    pub logger: &'a Logger,
-    pub verbose: bool,
-    /// The write features under a Safety pause: nothing they write is
-    /// written.
-    pub paused: Vec<SafetyFeature>,
-    /// The `claude` spawns run; `None` while none is found.
-    pub claude: Option<&'a std::path::Path>,
-}
-
-impl Context<'_> {
-    pub(crate) fn is_paused(&self, feature: SafetyFeature) -> bool {
-        self.paused.contains(&feature)
-    }
-
-    pub(crate) fn log(
-        &self,
-        level: Level,
-        message: &'static str,
-        fields: &[(&'static str, Field<'_>)],
-    ) {
-        self.logger
-            .write(self.env.clock.now(), self.verbose, level, message, fields);
-    }
-
-    pub(crate) fn runner(&self) -> Runner<'_> {
-        Runner::new(self.env, self.paths, self.claude)
-    }
-}
 
 /// A Login acting within an Organization, from `oauthAccount` in a Profile
 /// folder's `.claude.json`.
@@ -800,7 +768,7 @@ impl ProfileRegistry {
                 "claude.json not seeded: paused",
                 &[("profile", Field::Profile(&id))],
             );
-        } else if let Err(error) = cli_switcher::seed_claude_json(&config_dir, &ctx.env.home) {
+        } else if let Err(error) = profile_folder::seed_claude_json(&config_dir, &ctx.env.home) {
             let error = error.to_string();
             ctx.log(
                 Level::Warn,
@@ -1524,7 +1492,7 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
         );
         return;
     }
-    match cli_switcher::ensure_links(config_dir, &ClaudePaths::new(&ctx.env.home).claude_home()) {
+    match profile_folder::ensure_links(config_dir, &ClaudePaths::new(&ctx.env.home).claude_home()) {
         Ok(blocked) => {
             for blocked in blocked {
                 ctx.log(

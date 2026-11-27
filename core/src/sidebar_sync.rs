@@ -60,7 +60,7 @@ use serde_json::{Map, Value};
 
 use crate::backups;
 use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
-use crate::desktop;
+use crate::desktop_account;
 use crate::env::Environment;
 use crate::interface::Effect;
 use crate::storage::{self, AppPaths, VersionedFile};
@@ -366,7 +366,7 @@ impl Watch {
             *self = Watch {
                 watching: true,
                 desktop: active_key(&desktop_paths),
-                main_log_length: desktop::main_log_length(&desktop_paths),
+                main_log_length: desktop_account::main_log_length(&desktop_paths),
                 switched_at: env.clock.now(),
                 ..Watch::default()
             };
@@ -387,12 +387,13 @@ impl Watch {
         }
         let desktop_paths = ClaudePaths::new(&env.home);
         let desktop = active_key(&desktop_paths);
-        let signed_in = desktop::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
+        let signed_in =
+            desktop_account::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
         if desktop != self.desktop || signed_in {
             self.switched_at = env.clock.now();
         }
         self.desktop = desktop;
-        self.main_log_length = desktop::main_log_length(&desktop_paths);
+        self.main_log_length = desktop_account::main_log_length(&desktop_paths);
     }
 
     /// FSEvents reported `changed`. Entries that differ from sync's record
@@ -501,7 +502,7 @@ fn parse_body(bytes: &[u8]) -> Option<Map<String, Value>> {
 
 /// The desktop's Active Profile folder as `<account>/<org>`.
 fn active_key(desktop_paths: &ClaudePaths) -> Option<String> {
-    let account = desktop::desktop_account(desktop_paths)?;
+    let account = desktop_account::desktop_account(desktop_paths)?;
     let org = account.organization_uuid?;
     Some(format!("{}/{org}", account.account_uuid))
 }
@@ -550,7 +551,7 @@ pub(crate) fn begin(
     cache: &mut EntryCache,
 ) -> Begun {
     let desktop_paths = ClaudePaths::new(&env.home);
-    let desktop = desktop::desktop_account(&desktop_paths);
+    let desktop = desktop_account::desktop_account(&desktop_paths);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
         return Begun::Ended(Run::DesktopAccountUnknown);
@@ -583,11 +584,11 @@ pub(crate) fn begin(
     // The dormant multi-account mode: since the last run, with no account
     // switch, a folder sync may write changed although it belongs to an
     // account Claude wasn't on. Without a known account then, nothing tells.
-    let log_length = desktop::main_log_length(&desktop_paths);
+    let log_length = desktop_account::main_log_length(&desktop_paths);
     let switched = record.desktop_folder != active_key
         || record
             .main_log_length
-            .is_some_and(|length| desktop::signed_in_since(&desktop_paths, length));
+            .is_some_and(|length| desktop_account::signed_in_since(&desktop_paths, length));
     if let (false, Some(recorded_desktop)) = (switched, &record.desktop_folder) {
         let desktop_account = recorded_desktop.split('/').next().unwrap_or_default();
         let changed = read
@@ -813,7 +814,7 @@ pub(crate) fn accept_current(env: &Environment, paths: &AppPaths, cache: &mut En
         .map(|folder| (folder.key.clone(), copy_records(folder)))
         .collect();
     record.desktop_folder = active_key(&desktop_paths);
-    record.main_log_length = desktop::main_log_length(&desktop_paths);
+    record.main_log_length = desktop_account::main_log_length(&desktop_paths);
     save(paths, &record);
 }
 

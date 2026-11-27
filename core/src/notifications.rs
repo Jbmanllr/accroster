@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::context::Context;
 use crate::interface::{Effect, NotificationAction};
 use crate::limit_offers;
 use crate::logging::{Field, Level};
-use crate::profiles::Context;
 use crate::storage::{self, ReadError, VersionedFile};
 use crate::usage::{Limit, Limits};
 

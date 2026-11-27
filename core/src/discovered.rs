@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
 use crate::claude_json::{self, LoginNames};
-use crate::desktop;
+use crate::desktop_account;
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 
 /// One discovered pair and what the Mac says about it.
@@ -267,7 +267,7 @@ fn read_activity(path: &Path, meta: &fs::Metadata) -> Option<Activity> {
 
 /// The Sidebar `pairs` plus the `~/.claude.json` login, ordered.
 fn evidence(home: &Path, pairs: Vec<(ProfileKey, usize, Option<Timestamp>)>) -> Vec<Evidence> {
-    let desktop_last = desktop::last_known_account(&ClaudePaths::new(home));
+    let desktop_last = desktop_account::last_known_account(&ClaudePaths::new(home));
     let mut found: BTreeMap<ProfileKey, Evidence> = BTreeMap::new();
     for (pair, sessions, last_activity) in pairs {
         found.insert(

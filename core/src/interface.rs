@@ -17,6 +17,11 @@
 //! everything else in the UI layer stays a renderer.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// How often the driver sends [`Event::Tick`] unless the core asks for one
+/// sooner ([`crate::core::Core::tick_interval`]).
+pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A user intent, sent by the UI layer when something is clicked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,8 +304,8 @@ impl Command {
 /// Something that happened outside the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Time passed. The driver sends one every [`crate::driver::TICK_INTERVAL`];
-    /// the core reads the actual time from its [`crate::Clock`].
+    /// Time passed. The driver sends one every [`TICK_INTERVAL`]; the core
+    /// reads the actual time from its [`crate::env::Clock`].
     Tick,
     /// The status item's menu is about to open.
     MenuOpened,

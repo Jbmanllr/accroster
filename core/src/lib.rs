@@ -11,8 +11,10 @@ mod claude_code;
 mod claude_files;
 mod claude_json;
 mod cli_switcher;
+mod context;
 mod core;
 mod desktop;
+mod desktop_account;
 mod discovered;
 pub mod driver;
 pub mod env;
@@ -23,6 +25,7 @@ mod logging;
 mod monitor;
 mod notifications;
 mod opening;
+mod profile_folder;
 mod profiles;
 mod runner;
 mod safety;
@@ -41,7 +44,7 @@ pub use env::{
 pub use env::{LoginItem, LoginItemStatus, SystemLoginItem};
 pub use interface::{
     AboutView, Badge, Command, Effect, Event, LimitBar, MOST_HEADROOM, MenuBarView, MenuItem,
-    MenuView, ProfileRow, SettingsView, StatusTone, View,
+    MenuView, ProfileRow, SettingsView, StatusTone, TICK_INTERVAL, View,
 };
 pub use interface::{
     AllSessionsView, OpenChoice, RunningDot, SessionDetail, SessionFilter, SessionRow,

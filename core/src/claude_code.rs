@@ -17,22 +17,19 @@
 //! shim skips itself). Spawns run the found file and get its folder first on
 //! their `PATH`, so Claude Code finds `node`, `git` and the rest next to it.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::claude_files::{self, ClaudePaths};
 use crate::env::Environment;
 use crate::logging::{Field, Level, Logger};
-use crate::runner::{Finished, Job, Runner};
+use crate::runner::{self, Finished, Job, Runner};
 use crate::storage::{self, AppPaths};
 
 /// What the menu says while no `claude` can be found.
 pub(crate) const MISSING: &str =
     "Can't find Claude Code (claude). Install it, or open AccRoster from a terminal once.";
-
-/// Marks the login shell's `PATH` line in whatever its startup files print.
-pub(crate) const PATH_MARKER: &str = "accroster-login-path=";
 
 /// Where the found `claude` is, or why there is none yet.
 #[derive(Default)]
@@ -106,7 +103,7 @@ impl ClaudeLocator {
         if let ShellLookup::Asking(job) = &mut self.shell {
             let answer = match job.poll(env.clock.now()) {
                 None => None,
-                Some(Finished::Exited(output)) => Some(login_path(&output.stdout)),
+                Some(Finished::Exited(output)) => Some(runner::login_shell_path(&output.stdout)),
                 Some(finished) => {
                     log(
                         Level::Info,
@@ -242,18 +239,6 @@ fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// The `PATH` in the login shell's output: the marked line, whatever its
-/// startup files printed around it.
-fn login_path(stdout: &[u8]) -> Option<OsString> {
-    use std::os::unix::ffi::OsStrExt;
-    stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(PATH_MARKER.as_bytes()))
-        .next_back()
-        .filter(|path| !path.is_empty())
-        .map(|path| OsStr::from_bytes(path).to_owned())
 }
 
 fn remembered_file(paths: &AppPaths) -> PathBuf {

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::claude_files::{self, ClaudePaths, DESKTOP_ENTRYPOINT};
-use crate::desktop::{DesktopAccount, NewestEntries};
+use crate::desktop_account::{DesktopAccount, NewestEntries};
 use crate::env::Environment;
 use crate::interface::{
     AllSessionsView, ProfileKey, RunningDot, SessionDetail, SessionFilter, SessionRow,
