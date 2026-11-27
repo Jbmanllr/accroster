@@ -1,6 +1,5 @@
 //! [`Core`]: the one object the UI layer talks to.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -1295,24 +1294,12 @@ impl Core {
             .collect()
     }
 
-    /// Each signed-in Profile's personal Organization, with the one account
-    /// that can be in it.
-    fn personal_organizations(&self) -> BTreeMap<String, String> {
-        self.profiles
-            .signed_in()
-            .into_iter()
-            .filter(|profile| profile.personal_organization)
-            .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
-            .collect()
-    }
-
-    /// Another account paired with a Profile's personal Organization: no one
-    /// else can be in that Organization, so its Sidebar folder is what an
-    /// account switch in the desktop app left behind.
+    /// Whether `pair`'s Sidebar folder is an account switch's leftover
+    /// ([`crate::profiles::PersonalOrganizations::is_leftover`]).
     fn is_leftover(&self, pair: &ProfileKey) -> bool {
-        self.personal_organizations()
-            .get(&pair.organization_uuid)
-            .is_some_and(|owner| *owner != pair.account_uuid)
+        self.profiles
+            .personal_organizations()
+            .is_leftover(&pair.account_uuid, &pair.organization_uuid)
     }
 
     /// Discovered pairs without a signed-in Profile, with the user's choices,

@@ -7,6 +7,7 @@
 //! Profile folders decide which Profiles exist; the file only records each
 //! one's path.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -109,6 +110,23 @@ pub(crate) struct SignedInProfile {
     pub organization_label: String,
     /// Its Organization is its personal default: no other account is in it.
     pub personal_organization: bool,
+}
+
+/// Each signed-in Profile's personal Organization, with the one account that
+/// can be in it: Claude lets no one else join a personal Organization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PersonalOrganizations(BTreeMap<String, String>);
+
+impl PersonalOrganizations {
+    /// Whether the Sidebar folder of `account` in `organization` is what an
+    /// account switch in the desktop app left behind: another account paired
+    /// with a Profile's personal Organization (ADR 0003). Such a folder is
+    /// read, never listed and never written into.
+    pub(crate) fn is_leftover(&self, account: &str, organization: &str) -> bool {
+        self.0
+            .get(organization)
+            .is_some_and(|owner| owner != account)
+    }
 }
 
 /// `state/profiles.json`.
@@ -1073,6 +1091,17 @@ impl ProfileRegistry {
             }
         }
         ordered
+    }
+
+    /// The personal Organizations of the signed-in Profiles.
+    pub(crate) fn personal_organizations(&self) -> PersonalOrganizations {
+        PersonalOrganizations(
+            self.signed_in()
+                .into_iter()
+                .filter(|profile| profile.personal_organization)
+                .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
+                .collect(),
+        )
     }
 
     /// Who each signed-in Profile is, in add order.

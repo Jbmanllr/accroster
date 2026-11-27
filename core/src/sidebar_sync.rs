@@ -63,6 +63,7 @@ use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
 use crate::desktop_account;
 use crate::env::Environment;
 use crate::interface::Effect;
+use crate::profiles::PersonalOrganizations;
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// Fields a copy clears: they tie an entry to one account's connectors and
@@ -539,15 +540,14 @@ pub(crate) enum Begun {
 /// With `include_optional` ("Include SSH and No-folder Sessions", the
 /// default), SSH and No-folder Sessions are copied too; WSL and
 /// scheduled-task Sessions never are. `cache` holds the entries as of the
-/// last run; this one parses only those changed since. `personal` maps each
-/// signed-in Profile's personal Organization to its account: a folder of
-/// another account in one is an account switch's leftover, read for its
-/// Sessions but never written into.
+/// last run; this one parses only those changed since. `personal` tells
+/// which folders are an account switch's leftovers: read for their Sessions
+/// but never written into.
 pub(crate) fn begin(
     env: &Environment,
     paths: &AppPaths,
     include_optional: bool,
-    personal: &BTreeMap<String, String>,
+    personal: &PersonalOrganizations,
     cache: &mut EntryCache,
 ) -> Begun {
     let desktop_paths = ClaudePaths::new(&env.home);
@@ -574,9 +574,7 @@ pub(crate) fn begin(
 
     let leftover = |folder: &Folder| {
         let organization = folder.key.split('/').nth(1).unwrap_or_default();
-        personal
-            .get(organization)
-            .is_some_and(|owner| *owner != folder.account)
+        personal.is_leftover(&folder.account, organization)
     };
 
     let (writes, decided, held) = plan(&read, &record, active, &add_only, &leftover);

@@ -73,3 +73,18 @@ A fresh reviewer compared old and new code over `e474feb..3ffbdb3`, read-only. I
 - **Docs made exact:** the self-check still looks into every Sidebar subfolder (ADR 0006 said every reader used the uuid rule); `docs/ARCHITECTURE.md` now lists what each check looks for and what it leaves to review.
 - **Two more rules given their owner**, which the review pointed at: which files are Transcripts (`claude_files::transcript_files`, used by the Session index and the self-check, which now also skips `agent-*.jsonl`), and a Sidebar entry's file name (`sidebar_entry_file_name`, `sidebar_entry_id` in the two places that still cut `.json` by hand).
 - **The architecture test** no longer stops reading a file at the first `#[cfg(test)]`: it skips test modules wherever they are, and trailing comments. It has a test of its own for that, and the planted-violation probe of round 4 was run again.
+
+## Round 11: the leftover-folder rule has one owner
+
+A Sidebar folder that pairs an account with another Profile's personal Organization is an account switch's leftover (ADR 0003). The rule was written in `core.rs` (to hide the folder) and again in `sidebar_sync::begin` (to never write into it), each from a map the core built. It is `PersonalOrganizations::is_leftover`, built by the Profile registry, which knows whose Organization is personal.
+
+Behaviour unchanged; `a_leftover_folder_in_another_profiles_personal_organization_is_read_but_never_written` and `a_profiles_sidebars_in_other_organizations_follow_it_and_leftovers_are_hidden` cover both uses.
+
+This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates are in `TASKS.md`: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
+
+## Where it stands
+
+- The gate is green on the branch: format, lint, and 33 test binaries, eight of them architecture checks.
+- Not run here: the release dry run (`scripts/release.sh --dry-run`); the hosted workflow runs it on a pull request.
+- Not checked by any test: the AppKit layer beyond launching (round 7).
+- Persisted files, settings and the menu's wording are unchanged. The edge-case differences are listed in ADR 0006.
