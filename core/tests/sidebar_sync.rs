@@ -59,6 +59,8 @@ fn entry(id: &str, title: &str) -> Value {
         "bridgeSessionIds": ["bridge-1"],
         "remoteMcpServersConfig": [{"uuid": "u", "name": "n", "url": "https://mcp.example", "tools": []}],
         "enabledMcpTools": {"n": ["search"]},
+        "servedConnectorCalls": [{"toolUseId": "t1", "connectorCall": {"uuid": "c1", "tool": "search"}}],
+        "connectorKeyHolders": {"mcp__n": ["row-1"]},
         "toolSurfaceSnapshot": {"tools": ["Bash"]},
         "completedTurns": 3,
     })
@@ -144,6 +146,8 @@ fn without_cleared(mut body: Value) -> Value {
     object.insert("bridgeSessionIds".into(), json!([]));
     object.insert("remoteMcpServersConfig".into(), json!([]));
     object.insert("enabledMcpTools".into(), json!({}));
+    object.insert("servedConnectorCalls".into(), json!([]));
+    object.insert("connectorKeyHolders".into(), json!({}));
     body
 }
 
@@ -224,6 +228,8 @@ fn a_copy_keeps_the_file_name_and_every_field_but_clears_the_connector_and_bridg
         "bridgeSessionIds",
         "remoteMcpServersConfig",
         "enabledMcpTools",
+        "servedConnectorCalls",
+        "connectorKeyHolders",
     ] {
         lean.as_object_mut().unwrap().remove(field);
     }
@@ -629,6 +635,34 @@ fn an_entry_claude_creates_while_sync_adds_it_is_kept() {
 
     assert_eq!(read(&mac, PERSO, "s1"), Some(claudes));
     assert!(!is_paused(&core));
+}
+
+#[test]
+fn a_session_claude_saves_again_during_a_sync_is_copied_as_it_is_now() {
+    let mac = FakeMac::new();
+    put(&mac, PERSO, "s1", &entry("s1", "One"));
+    empty_folder(&mac, WORK);
+    let mut core = manual(&mac);
+    let command = core.view().settings.sidebar_sync.sync_now.unwrap();
+    core.command(command);
+    // A turn is running: Claude saves the entry again, with its new title,
+    // before sync copies it.
+    let mut saved = entry("s1", "Named after the first turn");
+    saved["lastActivityAt"] = json!(1_761_400_060_000_i64);
+    saved["completedTurns"] = json!(4);
+    put(&mac, PERSO, "s1", &saved);
+
+    settle(&mut core);
+
+    assert_eq!(read(&mac, WORK, "s1"), Some(without_cleared(saved.clone())));
+    assert_eq!(
+        read(&mac, PERSO, "s1"),
+        Some(saved),
+        "the source is left alone"
+    );
+    assert!(!is_paused(&core));
+    sync(&mut core);
+    assert_eq!(note(&core), "Every sidebar was already in sync");
 }
 
 #[test]
