@@ -27,9 +27,10 @@ use jiff::tz::TimeZone;
 use serde_json::Value;
 
 use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
-use crate::claude_json::{self, LoginNames};
+use crate::claude_json;
 use crate::desktop_account;
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
+use crate::names::LoginNames;
 
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::backups;
 use crate::claude_files::{self, ClaudePaths};
-use crate::claude_json::{self, LoginNames};
+use crate::claude_json;
 use crate::context::Context;
 use crate::env::RunningProcess;
 use crate::interface::{
@@ -25,6 +25,7 @@ use crate::interface::{
 };
 use crate::logging::{Field, Level};
 use crate::monitor::{Completed, LimitsView, Watched};
+use crate::names::{self, LoginNames};
 use crate::profile_folder;
 use crate::runner::{AuthStatus, Ended, Finished, JobKind, Jobs};
 use crate::settings::Settings;
@@ -61,65 +62,22 @@ impl Identity {
     }
 }
 
-/// Each Profile's short name, in `profiles`' order: its nickname, else the
-/// shortest of [`LoginNames::short_labels`] no other Profile shares (two
-/// Profiles named `Lucie` become `Lucie · Work Inc` and `Lucie · Research
-/// Lab`).
+/// Each Profile's Short label, in `profiles`' order.
 fn short_labels(profiles: &[&Profile], settings: &Settings) -> Vec<String> {
-    unique(
-        profiles
-            .iter()
-            .map(|profile| match settings.nicknames.get(&profile.id) {
-                Some(nickname) => vec![nickname.clone()],
-                None => match &profile.identity {
-                    Some(identity) => identity.names.short_labels(),
-                    None => vec!["Signed out".to_owned()],
-                },
-            })
-            .collect(),
-    )
+    names::short_labels(profiles.iter().map(|profile| {
+        let nickname = settings.nicknames.get(&profile.id).map(String::as_str);
+        let login = profile.identity.as_ref().map(|identity| &identity.names);
+        (nickname, login)
+    }))
 }
 
-/// Each Profile's name, in `profiles`' order: [`LoginNames::name`], with the
-/// Organization added when two Profiles would otherwise share it.
-fn names(profiles: &[&Profile]) -> Vec<String> {
-    unique(
+/// Each Profile's Profile name, in `profiles`' order.
+fn profile_names(profiles: &[&Profile]) -> Vec<String> {
+    names::profile_names(
         profiles
             .iter()
-            .map(|profile| match &profile.identity {
-                Some(identity) => vec![identity.name(), identity.names.name_with_organization()],
-                None => vec!["Signed-out Profile".to_owned()],
-            })
-            .collect(),
+            .map(|profile| profile.identity.as_ref().map(|identity| &identity.names)),
     )
-}
-
-/// One pick per list of choices (shortest first): the first no other list's
-/// pick shares. Colliding lists move on together until none collides or a
-/// list runs out of choices.
-fn unique(choices: Vec<Vec<String>>) -> Vec<String> {
-    let mut level = vec![0; choices.len()];
-    loop {
-        let label = |index: usize| &choices[index][level[index]];
-        let collided: Vec<usize> = (0..choices.len())
-            .filter(|&index| {
-                level[index] + 1 < choices[index].len()
-                    && (0..choices.len())
-                        .any(|other| other != index && label(other) == label(index))
-            })
-            .collect();
-        if collided.is_empty() {
-            break;
-        }
-        for index in collided {
-            level[index] += 1;
-        }
-    }
-    choices
-        .into_iter()
-        .zip(level)
-        .map(|(mut choices, level)| choices.swap_remove(level))
-        .collect()
 }
 
 /// A signed-in Profile as the menu lists it.
@@ -129,7 +87,7 @@ pub(crate) struct Listed<'a> {
     pub config_dir: &'a Path,
     /// Whether its folder holds a Login (signed in or expired).
     pub signed_in: bool,
-    /// Its Profile name (see [`names`]), or "Signed-out Profile".
+    /// Its Profile name (see [`names::profile_names`]).
     pub name: String,
     /// A nickname titles its row.
     pub nicknamed: bool,
@@ -144,7 +102,7 @@ pub(crate) struct Listed<'a> {
 pub(crate) struct SignedInProfile {
     pub id: String,
     pub key: ProfileKey,
-    /// Its Profile name (see [`names`]).
+    /// Its Profile name (see [`names::profile_names`]).
     pub name: String,
     /// Its Organization as people call it (see
     /// [`LoginNames::organization_label`]); empty when unknown.
@@ -936,7 +894,7 @@ impl ProfileRegistry {
     ) -> Vec<Listed<'_>> {
         let ordered = self.ordered(&settings.profile_order);
         let short_labels = short_labels(&ordered, settings);
-        let names = names(&ordered);
+        let names = profile_names(&ordered);
         ordered
             .into_iter()
             .zip(short_labels.into_iter().zip(names))
@@ -1064,7 +1022,7 @@ impl ProfileRegistry {
     pub(crate) fn name(&self, id: &str) -> Option<String> {
         let all: Vec<&Profile> = self.profiles.iter().collect();
         let index = all.iter().position(|profile| profile.id == id)?;
-        names(&all).into_iter().nth(index)
+        profile_names(&all).into_iter().nth(index)
     }
 
     /// Starts signing out, then deleting, every folder under `profiles/`
@@ -1121,7 +1079,7 @@ impl ProfileRegistry {
     pub(crate) fn signed_in(&self) -> Vec<SignedInProfile> {
         let all: Vec<&Profile> = self.profiles.iter().collect();
         all.iter()
-            .zip(names(&all))
+            .zip(profile_names(&all))
             .filter_map(|(profile, name)| {
                 let identity = profile.identity.as_ref()?;
                 Some(SignedInProfile {

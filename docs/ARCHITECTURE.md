@@ -40,13 +40,19 @@ They know none of the app's features.
 | `logging` | `app.log`: redacted when written, rotated. The panic hook. |
 | `shell` | Quoting a path or an id as one `sh` word. |
 
+### The domain's own rules
+
+| Module | Owns |
+|---|---|
+| `names` | How a Profile is called: its Profile name and its Short label, alone and among other Profiles. |
+
 ### Claude's formats
 
 One reader per undocumented format. Each checks the fields it uses every time it reads them (ADR 0004).
 
 | Module | Owns |
 |---|---|
-| `claude_json` | `oauthAccount` in a `.claude.json`: a Login, its names, its Organization. |
+| `claude_json` | `oauthAccount` in a `.claude.json`: which Login and Organization a config folder is signed in to. |
 | `limit_offers` | Banked resets and Session refills in a usage reply. |
 | `usage` | The `get_usage` reply and the `/usage` fallback: a Limit reading. |
 | `live_processes` | `sessions/<pid>.json`: which Claude Code processes run, for which Session, busy or idle. |

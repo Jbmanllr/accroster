@@ -49,8 +49,14 @@ The core added "Mute notifications" to each Profile row by searching the row's s
 
 A new test (`mute_sits_right_above_remove_whatever_else_the_row_offers`) pins the submenu's order in three states; it passed before the change and after.
 
-## Round 7: the AppKit layer's leaves leave `ui.rs`
+## Round 7: the AppKit layer's leaves leave `ui.rs` (`3ffbdb3`)
 
 `src/ui.rs` was one 2,858-line file. Its parts that don't touch the `Ui` object moved out, unchanged: `src/ui/widgets.rs` (views built from view models), `src/ui/sidebar.rs` (the All Sessions sidebar's data source) and `src/ui/mac.rs` (Terminal, the desktop app, the Trash, alerts, the network path). `ui.rs` is 2,000 lines: `Ui` and the windows (task 14).
 
 This layer has no tests, so the move was checked two other ways: the code lines of the four files are the same multiset as the old file's (apart from `use` lines, `pub(super)` and four signatures rustfmt rewrapped), and the debug build launched and ran against an empty throwaway home, logging `launch` and nothing else. No window was opened in that run.
+
+## Round 8: how a Profile is called has one module
+
+The Profile name and the Short label are glossary terms, but their rules were in two places: for one Login in `claude_json` (the reader of `oauthAccount`), and across Profiles in `profiles` (`names`, `short_labels`, `unique`). Both now live in `names`; `claude_json` only reads the file, and the registry passes each Profile's nickname and Login. The personal default Organization's name (`<email>'s Organization`) was built twice and is built once.
+
+Behaviour unchanged; `core/tests/profile_names.rs` covers it through the menu.

@@ -30,6 +30,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "shell",
         ],
     ),
+    ("The domain's own rules, which need no file.", &["names"]),
     (
         "Claude's formats: one reader per undocumented format (ADR 0004).",
         &["claude_json", "limit_offers", "usage", "live_processes"],

@@ -23,6 +23,7 @@ mod limit_offers;
 mod live_processes;
 mod logging;
 mod monitor;
+mod names;
 mod notifications;
 mod opening;
 mod profile_folder;
