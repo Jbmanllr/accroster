@@ -21,7 +21,7 @@ use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
     AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
     HiddenDiscovered, LaunchAtLoginView, MOST_HEADROOM, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileRow, ProfileSettings,
+    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileSettings,
     SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, TICK_INTERVAL, Toggle,
     UninstallView, View,
 };
@@ -827,7 +827,7 @@ impl Core {
                     id: &w.id,
                     name: &listed.short_label,
                     limits: self.monitor.limits(&w.id),
-                    tightest: tightest(&listed.row),
+                    tightest: listed.row.tightest_limit(),
                     muted: self.settings.muted_profiles.contains(&w.id),
                     cli_active: pointer.as_deref() == Some(w.config_dir.as_path()),
                 })
@@ -1556,11 +1556,6 @@ impl Core {
     }
 }
 
-/// A row's tightest limit: its highest bar, unknown limit kinds included.
-fn tightest(row: &ProfileRow) -> Option<u32> {
-    row.limits.iter().map(|bar| bar.percent).max()
-}
-
 /// The non-stale watched Profile with the lowest tightest limit, among two
 /// or more.
 fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom> {
@@ -1571,7 +1566,7 @@ fn most_headroom(listed: &[Listed<'_>], watched: &[Watched]) -> Option<Headroom>
         Some((
             listed.id,
             listed.short_label.as_str(),
-            tightest(&listed.row)?,
+            listed.row.tightest_limit()?,
         ))
     }))
 }

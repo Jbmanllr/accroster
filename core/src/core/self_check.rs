@@ -7,8 +7,8 @@ use std::path::Path;
 use super::Core;
 use super::sidebar::desktop_name;
 use crate::checks;
+use crate::claude_code;
 use crate::claude_files::ClaudePaths;
-use crate::desktop;
 use crate::interface::{CheckStatus, MenuItem, SafetyFeature, SidebarSyncMode};
 use crate::logging::{Field, Level};
 use crate::profile_folder;
@@ -94,7 +94,10 @@ impl Core {
     /// Runs the full self-check when a Claude version changed since the last
     /// one. Returns whether it ran.
     pub(super) fn self_check_if_versions_changed(&mut self) -> bool {
-        if !self.safety.versions_changed(&desktop::versions(&self.env)) {
+        if !self
+            .safety
+            .versions_changed(&claude_code::installed_versions(&self.env))
+        {
             return false;
         }
         self.log(Level::Info, "claude versions changed", &[]);
@@ -107,7 +110,7 @@ impl Core {
     /// `auth` (recorded once its answers are in); then pauses whatever a
     /// failed check blocks.
     pub(super) fn self_check(&mut self, auth: AuthCheck) {
-        let versions = desktop::versions(&self.env);
+        let versions = claude_code::installed_versions(&self.env);
         let run_auth = auth == AuthCheck::Always || self.safety.versions_changed(&versions);
         self.versions = versions;
         self.safety.check_settings_env(&self.env, false);
@@ -243,7 +246,7 @@ impl Core {
     pub(super) fn resume(&mut self, feature: SafetyFeature) {
         match feature {
             SafetyFeature::CliSwitching => {
-                self.versions = desktop::versions(&self.env);
+                self.versions = claude_code::installed_versions(&self.env);
                 self.safety.check_settings_env(&self.env, false);
                 self.check_accounts();
                 if self.check_config_dir_honoured() {

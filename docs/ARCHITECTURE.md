@@ -27,6 +27,7 @@ They know none of the app's features.
 | `storage` | The app's own folder (`AppPaths`) and the one way a file is written: temp file, then rename. Versioned JSON files. |
 | `env` | The boundary with the rest of the Mac: home folder, inherited variables, spawning, the clock, OS facts, the login item. |
 | `logging` | `app.log`: redacted when written, rotated. The panic hook. |
+| `shell` | Quoting a path or an id as one `sh` word. |
 
 ### Claude's formats
 
@@ -46,7 +47,7 @@ One reader per undocumented format. Each checks the fields it uses every time it
 | `backups` | `backups/`: a copy before every write to a file the app doesn't own; pruning. |
 | `settings` | `settings.json`: the user's choices. |
 | `runner` | The only module that spawns Claude Code: the cleared environment, the neutral working folder, timeouts, the job queue. |
-| `claude_code` | Finding `claude` on this Mac (and remembering it in `state/claude-path`). |
+| `claude_code` | Finding `claude` on this Mac (and remembering it in `state/claude-path`); the installed Claude versions. |
 | `context` | `Context`: the environment, paths, log and Safety pauses the core lends a feature for one call. |
 | `safety` | Format check results and Safety pauses (`state/safety.json`); the settings `env` check; Diagnostics. |
 

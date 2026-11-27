@@ -29,6 +29,16 @@ Behaviour: a wrong-typed `name`, `hostSessionId` or `sessionId` no longer makes 
 
 `Context` → `context`; the Profile-folder half of `cli_switcher` → `profile_folder`; the desktop's account facts → `desktop_account`; the login-shell `PATH` marker into `runner`; `TICK_INTERVAL` into `interface`. The module graph is acyclic. Behaviour unchanged.
 
-## Round 4: the rules become checks
+## Round 4: the rules become checks (`f314237`)
 
 `core/tests/architecture.rs` (seven checks), ADR 0006, `docs/ARCHITECTURE.md`. Each behavioural check was shown to fail on a planted violation, with the file and line.
+
+## Round 5: small rules with two copies
+
+- Quoting a `sh` word: `cli_switcher::sh_quote` and `opening::shell_quoted` → `shell::quote` / `quote_path`, with a unit test.
+- A row's tightest limit: computed in `core` and again in `cli_switcher` → `ProfileRow::tightest_limit`.
+- "Is this file executable": `env` and `claude_code` → `env::is_executable`.
+- Deleting a file that may be gone: twice in `cli_switcher` → one private helper.
+- The installed Claude versions moved from the Desktop bridge to `claude_code::installed_versions`: `desktop` is now only the busy guard, the Guided switch and Reopen Claude.
+
+Behaviour unchanged.

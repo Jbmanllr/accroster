@@ -31,6 +31,7 @@ mod runner;
 mod safety;
 mod sessions;
 mod settings;
+mod shell;
 mod sidebar_sync;
 mod storage;
 mod usage;

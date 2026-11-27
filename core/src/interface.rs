@@ -659,6 +659,14 @@ pub struct ProfileRow {
     pub submenu: Vec<MenuItem>,
 }
 
+impl ProfileRow {
+    /// The row's tightest limit: its highest bar, unknown limit kinds
+    /// included.
+    pub(crate) fn tightest_limit(&self) -> Option<u32> {
+        self.limits.iter().map(|bar| bar.percent).max()
+    }
+}
+
 /// The most-headroom marker's text. It can move to another row while the
 /// menu is open, so the UI keeps room for it on every row.
 pub const MOST_HEADROOM: &str = "most headroom";

@@ -22,7 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::claude_files::{self, ClaudePaths};
-use crate::env::Environment;
+use crate::env::{Environment, is_executable};
+use crate::interface::ClaudeVersions;
 use crate::logging::{Field, Level, Logger};
 use crate::runner::{self, Finished, Job, Runner};
 use crate::storage::{self, AppPaths};
@@ -234,13 +235,6 @@ fn is_bundled(resolved: &Path) -> bool {
         || Path::new(&*text).starts_with(claude_files::DESKTOP_APP)
 }
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 fn remembered_file(paths: &AppPaths) -> PathBuf {
     paths.state().join("claude-path")
 }
@@ -257,4 +251,35 @@ fn remember(paths: &AppPaths, program: &Path) {
         // Only a convenience for the next launch from Finder.
         let _ = storage::write_atomically(&remembered_file(paths), program.as_os_str().as_bytes());
     }
+}
+
+/// The installed Claude versions, from links, folder names and the app's
+/// `Info.plist`; nothing is spawned.
+pub(crate) fn installed_versions(env: &Environment) -> ClaudeVersions {
+    let paths = ClaudePaths::new(&env.home);
+    let claude_code = fs::read_link(paths.installed_claude())
+        .ok()
+        .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
+        .filter(|name| version_key(name).is_some());
+    let mut desktop_claude_code: Vec<String> = fs::read_dir(paths.bundled_claude_code())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| version_key(name).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    desktop_claude_code.sort_by_key(|name| version_key(name));
+    ClaudeVersions {
+        claude_code,
+        desktop_claude_code,
+        desktop: env.os.desktop_app_version(),
+    }
+}
+
+/// `2.1.310` as numbers, for ordering; `None` for anything else.
+fn version_key(name: &str) -> Option<Vec<u64>> {
+    name.split('.').map(|part| part.parse().ok()).collect()
 }

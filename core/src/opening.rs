@@ -20,6 +20,7 @@ use crate::claude_files::{self, DESKTOP_ENTRYPOINT};
 use crate::env::OsFacts;
 use crate::interface::{Command, Effect, OpenChoice, ProfileKey, RunningDot};
 use crate::sessions::{EntryFacts, SessionFacts};
+use crate::shell;
 
 /// The clients that could open a Session, as of now.
 pub(crate) struct Clients {
@@ -118,8 +119,8 @@ pub(crate) fn terminal(facts: &SessionFacts, os: &dyn OsFacts) -> Option<Effect>
     let cwd = facts.cwd.as_deref().filter(|cwd| cwd.is_dir())?;
     Some(Effect::RunInTerminal(format!(
         "cd {} && claude --resume {}",
-        shell_quoted(&cwd.to_string_lossy()),
-        shell_quoted(&facts.id)
+        shell::quote_path(cwd),
+        shell::quote(&facts.id)
     )))
 }
 
@@ -261,9 +262,4 @@ fn linkable(entry_id: &str) -> bool {
         (1..=64).contains(&rest.len())
             && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     })
-}
-
-/// One `sh` word: single-quoted, with `'` written as `'\''`.
-fn shell_quoted(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }

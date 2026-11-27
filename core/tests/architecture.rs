@@ -21,7 +21,14 @@ const LAYERS: &[(&str, &[&str])] = &[
         "Foundations: the contract with the UI, where files are, and the \
          boundary with the rest of the Mac. They know none of the app's \
          features.",
-        &["interface", "claude_files", "storage", "env", "logging"],
+        &[
+            "interface",
+            "claude_files",
+            "storage",
+            "env",
+            "logging",
+            "shell",
+        ],
     ),
     (
         "Claude's formats: one reader per undocumented format (ADR 0004).",

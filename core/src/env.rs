@@ -305,7 +305,8 @@ fn resolve_program(program: &std::ffi::OsStr, env: &[(OsString, OsString)]) -> i
         })
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is a file someone may execute.
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)

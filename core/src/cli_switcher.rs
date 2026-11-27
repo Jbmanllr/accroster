@@ -19,6 +19,7 @@ use jiff::Timestamp;
 use crate::backups;
 use crate::interface::{Badge, Command, MenuItem};
 use crate::profiles::Listed;
+use crate::shell;
 use crate::storage::{self, AppPaths};
 
 /// The variables the shim unsets on every launch, even when an inherited
@@ -48,19 +49,13 @@ pub(crate) fn is_on(paths: &AppPaths) -> bool {
 
 /// The `PATH` line of the `.zshrc` block, exactly as written.
 pub(crate) fn path_line(paths: &AppPaths) -> String {
-    format!(
-        "export PATH={}:\"$PATH\"",
-        sh_quote(paths.bin().as_os_str().as_bytes())
-    )
+    format!("export PATH={}:\"$PATH\"", shell::quote_path(&paths.bin()))
 }
 
 /// The line "Copy shell override" copies: one terminal on `config_dir`
 /// without changing the CLI's Active Profile.
 pub(crate) fn shell_override(config_dir: &Path) -> String {
-    format!(
-        "export CLAUDE_CONFIG_DIR={}",
-        sh_quote(config_dir.as_os_str().as_bytes())
-    )
+    format!("export CLAUDE_CONFIG_DIR={}", shell::quote_path(config_dir))
 }
 
 /// The folder the pointer names, byte for byte, or `None` without a pointer.
@@ -122,7 +117,12 @@ fn ask_next_cli_on_removal(listed: &mut [Listed<'_>], active: usize) {
 
 /// Back to Default: deletes the pointer, so new CLI runs use `~/.claude`.
 pub(crate) fn clear_pointer(paths: &AppPaths) -> io::Result<()> {
-    match fs::remove_file(paths.bin().join(POINTER)) {
+    remove_if_present(&paths.bin().join(POINTER))
+}
+
+/// Deletes a file; one already gone is done.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
     }
@@ -178,7 +178,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -
         row.submenu.splice(0..0, items);
         if is_active {
             row.badges.insert(0, Badge::Cli);
-            let tightest = row.limits.iter().map(|bar| bar.percent).max();
+            let tightest = row.tightest_limit();
             active = Some((profile.short_label.clone(), tightest));
         }
     }
@@ -270,12 +270,8 @@ pub(crate) fn turn_off(paths: &AppPaths, home: &Path, now: Timestamp) -> io::Res
             outcome = TurnedOff::EditedBlock(lines);
         }
     }
-    for name in [SHIM, POINTER] {
-        match fs::remove_file(paths.bin().join(name)) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-    }
+    remove_if_present(&paths.bin().join(SHIM))?;
+    clear_pointer(paths)?;
     Ok(outcome)
 }
 
@@ -334,7 +330,7 @@ fn edited_block(contents: &str) -> Option<Vec<String>> {
 /// 4. Walks `PATH`, skipping its own folder and empty entries, and `exec`s
 ///    the first other `claude`.
 fn shim_script(paths: &AppPaths) -> String {
-    let bin = sh_quote(paths.bin().as_os_str().as_bytes());
+    let bin = shell::quote_path(&paths.bin());
     let cleared = CLEARED_VARS.join(" ");
     format!(
         r#"#!/bin/sh
@@ -367,14 +363,6 @@ done
 echo "accroster: no claude found on PATH besides AccRoster's shim." >&2
 exit 127
 "#
-    )
-}
-
-/// `bytes` as one single-quoted `sh` word.
-fn sh_quote(bytes: &[u8]) -> String {
-    format!(
-        "'{}'",
-        String::from_utf8_lossy(bytes).replace('\'', r"'\''")
     )
 }
 
