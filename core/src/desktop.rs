@@ -38,6 +38,7 @@ use serde::Deserialize;
 use crate::claude_files::{self, ClaudePaths};
 use crate::env::Environment;
 use crate::interface::{ClaudeVersions, Command, Effect, MenuItem, ProfileKey, StatusTone};
+use crate::live_processes::{self, LiveProcess};
 use crate::logging::{Field, Level};
 use crate::profiles::{Context, SignedInProfile};
 
@@ -250,25 +251,13 @@ pub(crate) enum Guard {
     CantTell(usize),
 }
 
-/// The fields of a live-process file the guard reads.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LiveProcess {
-    pid: u32,
-    proc_start: Option<String>,
-    entrypoint: Option<String>,
-    status: Option<String>,
-    host_session_id: Option<String>,
-    name: Option<String>,
-}
-
 /// Checks whether switching accounts now would cut a desktop turn.
 pub(crate) fn guard(env: &Environment, paths: &ClaudePaths) -> Guard {
     let mut live: Vec<LiveProcess> = live_desktop_processes(env, paths);
     live.sort_by_key(|process| process.pid);
     let mut busy: Vec<String> = Vec::new();
     for process in &live {
-        if process.status.as_deref() == Some("idle") {
+        if process.is_idle() {
             continue;
         }
         let title = session_title(paths, process);
@@ -292,53 +281,14 @@ pub(crate) fn guard(env: &Environment, paths: &ClaudePaths) -> Guard {
     }
 }
 
-/// The live-process files of running desktop children. Stale files (dead pid,
-/// or a pid reused by a process that started at another time) are skipped,
-/// as are files of other clients. Only `<digits>.json` names are opened.
+/// The live-process files of running desktop children, which write them in
+/// `~/.claude`. Stale files and files of other clients are skipped.
 fn live_desktop_processes(env: &Environment, paths: &ClaudePaths) -> Vec<LiveProcess> {
-    let Ok(entries) = fs::read_dir(claude_files::live_process_folder(&paths.claude_home())) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            if !claude_files::is_live_process_file(&name) {
-                return None;
-            }
-            let bytes = fs::read(entry.path()).ok()?;
-            let process: LiveProcess = serde_json::from_slice(&bytes).ok()?;
-            if process.entrypoint.as_deref() != Some(claude_files::DESKTOP_ENTRYPOINT) {
-                return None;
-            }
-            let facts = env.os.process(process.pid)?;
-            let started = parse_proc_start(process.proc_start.as_deref()?)?;
-            (started.as_second() == facts.started_at.as_second()).then_some(process)
-        })
+    live_processes::files(&paths.claude_home())
+        .iter()
+        .filter_map(|path| LiveProcess::read(path))
+        .filter(|process| process.is_desktop() && process.is_running(env.os.as_ref()))
         .collect()
-}
-
-/// `procStart` as `ps -o lstart` prints it (`Sun Oct 25 14:02:11 2026`, the
-/// day space-padded). Claude Code runs it as `LC_ALL=C TZ=UTC ps …`, so the
-/// time is UTC whatever the Mac's time zone.
-pub(crate) fn parse_proc_start(text: &str) -> Option<Timestamp> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    let [_weekday, month, day, time, year] = parts.as_slice() else {
-        return None;
-    };
-    let month = i8::try_from(MONTHS.iter().position(|m| m == month)? + 1).ok()?;
-    let mut clock = time.split(':').map(|part| part.parse::<i8>().ok());
-    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
-    let date = jiff::civil::Date::new(year.parse().ok()?, month, day.parse().ok()?).ok()?;
-    let time = jiff::civil::Time::new(hour, minute, second, 0).ok()?;
-    let zoned = date
-        .to_datetime(time)
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .ok()?;
-    Some(zoned.timestamp())
 }
 
 /// A busy Session's name for the menu: its Sidebar entry's title, else the

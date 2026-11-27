@@ -17,6 +17,7 @@ use serde_json::value::RawValue;
 use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
 use crate::claude_json;
 use crate::interface::{ClaudeVersions, SafetyFeature};
+use crate::live_processes;
 use crate::profiles::{Account, CrossCheckAnswer};
 use crate::safety::{Finding, claude_code_name, reportable};
 use crate::sidebar_sync::Stamp;
@@ -528,32 +529,18 @@ pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding
 pub(crate) fn live_processes(config_dirs: &[PathBuf]) -> Finding {
     let mut read = 0usize;
     let mut bad = BTreeSet::new();
-    for dir in config_dirs {
-        for entry in fs::read_dir(claude_files::live_process_folder(dir))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !claude_files::is_live_process_file(&name) {
-                continue;
-            }
-            let Some(body) = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            else {
-                continue;
-            };
-            read += 1;
-            if !body.get("pid").is_some_and(Value::is_u64) {
-                bad.insert("pid");
-            }
-            for key in ["sessionId", "procStart", "entrypoint", "status"] {
-                if !body.get(key).is_some_and(Value::is_string) {
-                    bad.insert(key);
-                }
-            }
-        }
+    for path in config_dirs
+        .iter()
+        .flat_map(|dir| live_processes::files(dir))
+    {
+        let Some(body) = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        read += 1;
+        bad.extend(live_processes::bad_fields(&body));
     }
     if read == 0 {
         Finding::never_seen()
