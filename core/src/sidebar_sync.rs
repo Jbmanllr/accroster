@@ -781,7 +781,7 @@ fn source_now(source: &Folder, name: &str, cache: &EntryCache) -> Option<Map<Str
         return None;
     }
     let body = parse_body(&fs::read(&path).ok()?)?;
-    let stem = name.strip_suffix(".json")?;
+    let stem = claude_files::sidebar_entry_id(name)?;
     (body.get("sessionId").and_then(Value::as_str) == Some(stem)
         && left_out(&body) == planned.left_out)
         .then_some(body)

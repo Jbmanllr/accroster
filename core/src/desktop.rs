@@ -114,7 +114,7 @@ fn sidebar_title(paths: &ClaudePaths, id: &str) -> Option<String> {
     struct Entry {
         title: Option<String>,
     }
-    let file = format!("{id}.json");
+    let file = claude_files::sidebar_entry_file_name(id);
     claude_files::sidebar_folders(&paths.sidebar_root())
         .into_iter()
         .find_map(|folder| {

@@ -449,6 +449,8 @@ pub(crate) fn sidebar_entries(home: &Path, shapes: &mut EntryShapes) -> (Finding
     let mut mismatched = 0usize;
     let mut unknown_files = 0usize;
     let mut before = std::mem::take(&mut shapes.0);
+    // Every real subfolder, not only the uuid-named ones the features read:
+    // the check is there to notice what the app doesn't expect.
     for org in subfolders(&root)
         .iter()
         .flat_map(|account| subfolders(account))
@@ -560,13 +562,11 @@ const TRANSCRIPT_BYTES: u64 = 1024 * 1024;
 /// top-level Transcripts (links not followed, subagents skipped).
 pub(crate) fn transcript_records(home: &Path) -> Finding {
     let projects = ClaudePaths::new(home).projects();
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = subfolders(&projects)
-        .iter()
-        .flat_map(|project| fs::read_dir(project).into_iter().flatten().flatten())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-        .collect();
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> =
+        claude_files::transcript_files(&projects)
+            .into_iter()
+            .filter_map(|(path, meta)| Some((meta.modified().ok()?, path)))
+            .collect();
     if files.is_empty() {
         return Finding::never_seen();
     }

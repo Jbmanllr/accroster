@@ -107,20 +107,81 @@ fn sources_under(folder: &Path, shown_as: &str) -> Vec<Source> {
                 .trim_end_matches(".rs")
                 .to_owned();
             let text = fs::read_to_string(&path).expect("a readable source file");
-            let lines = text
-                .lines()
-                .enumerate()
-                .take_while(|(_, line)| line.trim() != "#[cfg(test)]")
-                .filter(|(_, line)| !line.trim_start().starts_with("//"))
-                .map(|(index, line)| (index + 1, line.to_owned()))
-                .collect();
             Source {
                 module,
                 file: format!("{shown_as}/{}", inside.display()),
-                lines,
+                lines: code_lines(&text),
             }
         })
         .collect()
+}
+
+/// The lines of `text` that are code, numbered from 1: comments (whole
+/// lines and trailing ones) and `#[cfg(test)] mod … { … }` blocks are left
+/// out, wherever in the file the block is.
+fn code_lines(text: &str) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let mut in_test_module = false;
+    let mut after_cfg_test = false;
+    for (index, line) in text.lines().enumerate() {
+        if in_test_module {
+            // rustfmt puts a top-level module's closing brace in column one.
+            in_test_module = line != "}";
+            continue;
+        }
+        if line == "#[cfg(test)]" {
+            after_cfg_test = true;
+            continue;
+        }
+        if std::mem::take(&mut after_cfg_test) && line.starts_with("mod ") {
+            in_test_module = line.ends_with('{');
+            continue;
+        }
+        let code = without_trailing_comment(line);
+        if !code.trim().is_empty() {
+            lines.push((index + 1, code.to_owned()));
+        }
+    }
+    lines
+}
+
+/// `line` up to a `//` that isn't inside a string literal (told by the
+/// quotes before it; an escaped quote in a string can fool this, which only
+/// ever hides the rest of that one line).
+fn without_trailing_comment(line: &str) -> &str {
+    let mut from = 0;
+    while let Some(found) = line[from..].find("//") {
+        let at = from + found;
+        if line[..at].matches('"').count().is_multiple_of(2) {
+            return &line[..at];
+        }
+        from = at + 2;
+    }
+    line
+}
+
+#[test]
+fn the_checks_read_code_and_skip_comments_and_test_modules() {
+    let text = [
+        "use crate::storage; // crate::sessions in a comment",
+        "/// A doc line naming `crate::core`.",
+        "const URL: &str = \"https://example.com//x\"; // trailing",
+        "#[cfg(test)]",
+        "mod tests {",
+        "    use crate::desktop;",
+        "}",
+        "fn after() { crate::env::now(); }",
+    ]
+    .join("\n");
+    let code: Vec<String> = code_lines(&text).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(
+        code,
+        [
+            "use crate::storage; ",
+            "const URL: &str = \"https://example.com//x\"; ",
+            "fn after() { crate::env::now(); }",
+        ]
+    );
 }
 
 /// The core's source files.
@@ -282,11 +343,12 @@ fn a_whole_file_is_written_only_by_storage() {
 }
 
 #[test]
-fn the_ui_layer_reads_and_writes_no_files_and_parses_nothing() {
+fn the_ui_layer_keeps_no_files_and_reads_no_formats() {
     assert_none(
         matches(&ui_sources(), r"std::fs|\bfs::|serde|std::env::var", &[]),
         "The AppKit layer (src/) only renders the core's `View`, forwards clicks as `Command`s \
-         and performs `Effect`s. Anything that reads a file, parses or decides belongs in the \
-         core, behind a `Command`, an `Event` or a field of the `View`.",
+         and performs `Effect`s. Anything that reads or writes a file, reads a format or the \
+         environment, or decides, belongs in the core, behind a `Command`, an `Event` or a \
+         field of the `View`.",
     );
 }

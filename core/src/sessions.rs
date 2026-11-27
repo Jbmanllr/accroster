@@ -384,8 +384,8 @@ impl SessionIndex {
         let (mut all_transcripts, mut entries, mut live) = (false, false, false);
         for path in changed {
             if let Ok(inside) = path.strip_prefix(&projects) {
-                if inside.components().count() == 2 && is_jsonl(path) {
-                    if !is_subagent(path) {
+                if inside.components().count() == 2 && claude_files::is_transcript_name(path) {
+                    if !claude_files::is_subagent_transcript(path) {
                         transcripts.push(path.clone());
                     }
                 } else {
@@ -545,7 +545,7 @@ impl SessionIndex {
                         account_uuid: account.clone(),
                         organization_uuid: org.clone(),
                     },
-                    entry_id: name.strip_suffix(".json")?.to_owned(),
+                    entry_id: claude_files::sidebar_entry_id(name)?.to_owned(),
                     cli_session_id: entry.cli_session_id.filter(|id| !id.is_empty())?,
                     title: entry.title.filter(|title| !title.trim().is_empty()),
                     user_title: entry.title_source.is_some_and(|source| source != "auto"),
@@ -1047,18 +1047,6 @@ fn age(now: Timestamp, at_ms: i64) -> String {
     }
 }
 
-fn is_jsonl(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "jsonl")
-}
-
-/// A subagent's Transcript kept next to its Session's own (`agent-<id>.jsonl`,
-/// as SSH Sessions do): part of that Session, not a Session itself.
-fn is_subagent(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("agent-"))
-}
-
 /// The size and mtime of a regular file that isn't a link.
 fn regular_file_stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::symlink_metadata(path).ok()?;
@@ -1075,25 +1063,12 @@ fn stamp_of(meta: &fs::Metadata) -> Stamp {
     (meta.len(), mtime)
 }
 
-/// Every top-level `~/.claude/projects/<project>/<id>.jsonl`, with its size
-/// and mtime. Links (folders or files) aren't followed, and subagent
-/// Transcripts, one folder deeper or named `agent-*`, are skipped.
+/// Every Session's Transcript, with its size and mtime.
 fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
-    let mut found = BTreeMap::new();
-    for (project, kind) in real_children(&ClaudePaths::new(home).projects()) {
-        if !kind.is_dir() {
-            continue;
-        }
-        for (path, kind) in real_children(&project) {
-            if !kind.is_file() || !is_jsonl(&path) || is_subagent(&path) {
-                continue;
-            }
-            if let Some(stamp) = regular_file_stamp(&path) {
-                found.insert(path, stamp);
-            }
-        }
-    }
-    found
+    claude_files::transcript_files(&ClaudePaths::new(home).projects())
+        .into_iter()
+        .map(|(path, meta)| (path, stamp_of(&meta)))
+        .collect()
 }
 
 /// A folder's children with their own type (links stay links).

@@ -3,8 +3,8 @@
 //!
 //! This is the one module that knows that layout. Every other module asks it
 //! for a path or a naming rule instead of joining a literal, so when Claude
-//! moves or renames something, one place changes. Nothing here opens a file:
-//! each format has its own reader ([`crate::claude_json`],
+//! moves or renames something, one place changes. It lists folders, but
+//! reads no file's contents: each format has its own reader ([`crate::claude_json`],
 //! [`crate::live_processes`], [`crate::usage`], …).
 //!
 //! - **Claude Code** keeps its config in a config folder: `~/.claude` by
@@ -182,6 +182,12 @@ pub(crate) fn sidebar_entry_id(file_name: &str) -> Option<&str> {
         .filter(|stem| stem.starts_with(ENTRY_PREFIX))
 }
 
+/// The name of the file that holds the Sidebar entry `entry_id`
+/// (`local_<id>.json`).
+pub(crate) fn sidebar_entry_file_name(entry_id: &str) -> String {
+    format!("{entry_id}{JSON}")
+}
+
 /// The Sidebar entry id of the Session with this Transcript id, when the
 /// desktop app created the entry for it.
 pub(crate) fn sidebar_entry_id_of(transcript_id: &str) -> String {
@@ -197,6 +203,39 @@ pub(crate) fn sidebar_entry_suffix(id: &str) -> Option<&str> {
 /// workspaces: a "No folder" Session's.
 pub(crate) fn is_scratch_workspace(cwd: &str) -> bool {
     cwd.contains(SCRATCH_WORKSPACE)
+}
+
+/// Whether `path` is named like a Transcript: `<id>.jsonl`.
+pub(crate) fn is_transcript_name(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+}
+
+/// A subagent's Transcript kept next to its Session's own (`agent-<id>.jsonl`,
+/// as SSH Sessions do): part of that Session, not a Session itself.
+pub(crate) fn is_subagent_transcript(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("agent-"))
+}
+
+/// Every Session's Transcript under `projects` ([`ClaudePaths::projects`]),
+/// with its metadata: the regular files `<project>/<id>.jsonl`. Links
+/// (folders or files) aren't followed, and subagent Transcripts, one folder
+/// deeper or named `agent-*`, are skipped.
+pub(crate) fn transcript_files(projects: &Path) -> Vec<(PathBuf, fs::Metadata)> {
+    let real_entries = |dir: &Path| fs::read_dir(dir).into_iter().flatten().flatten();
+    real_entries(projects)
+        .filter(|project| project.file_type().is_ok_and(|kind| kind.is_dir()))
+        .flat_map(|project| real_entries(&project.path()).collect::<Vec<_>>())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_transcript_name(&path) || is_subagent_transcript(&path) {
+                return None;
+            }
+            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
+            Some((path, meta))
+        })
+        .collect()
 }
 
 /// One Profile's Sidebar folder: `claude-code-sessions/<account>/<org>/`.

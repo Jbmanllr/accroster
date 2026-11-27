@@ -34,7 +34,7 @@ They know none of the app's features.
 | Module | Owns |
 |---|---|
 | `interface` | The contract with the UI: `Command`, `Event`, `Effect`, `View` and its parts. |
-| `claude_files` | Where Claude Code and the desktop app keep their files, and how they name them. Opens nothing. |
+| `claude_files` | Where Claude Code and the desktop app keep their files, and how they name them. Lists folders; reads no file's contents. |
 | `storage` | The app's own folder (`AppPaths`) and the one way a file is written: temp file, then rename. Versioned JSON files. |
 | `env` | The boundary with the rest of the Mac: home folder, inherited variables, spawning, the clock, OS facts, the login item. |
 | `logging` | `app.log`: redacted when written, rotated. The panic hook. |
@@ -70,7 +70,7 @@ One reader per undocumented format. Each checks the fields it uses every time it
 
 ### Features
 
-Each owns its state and its own file under `state/`.
+Each owns its state, and its file under `state/` when it keeps one.
 
 | Module | Owns |
 |---|---|
@@ -119,12 +119,14 @@ A file has one writer. To change what a file holds, change its owner.
 
 `cargo test -p accroster-core --test architecture` runs them; a failure prints the file, the line and what to do instead.
 
-1. **Layering.** A module of the core uses only modules listed before it in `LAYERS`. No cycles.
-2. **Named by module.** Inside the core, write `crate::core::Core`, not `crate::Core`.
-3. **Claude's layout has one owner.** No module but `claude_files` writes one of Claude's paths or file-name rules as a literal.
-4. **The environment boundary.** No module but `env` reads the clock, the process environment or the process table, or spawns a program.
-5. **One way to write a file.** No module but `storage` writes a whole file in place.
-6. **The AppKit layer decides nothing.** `src/` reads and writes no files and parses nothing.
+Each check reads the code's text (comments and test modules left out) and looks for exactly what is listed here. It is a tripwire for the common mistake, not a proof.
+
+1. **Layering.** A module of the core names (`crate::…`) only modules listed before it in `LAYERS`, so there is no cycle. A `super::` path from one top-level module to another is not seen.
+2. **Named by module.** Inside the core, write `crate::core::Core`, not `crate::Core` or a grouped `crate::{…}`.
+3. **Claude's layout has one owner.** Outside `claude_files`, the core's code holds none of these: a string starting with `.claude` or `.claude.json`, `claude-code-sessions`, `Application Support/Claude`, `Logs/Claude`, `Claude.app`, `claude-desktop`, `scratch-workspaces`, a string starting with `local_` or `deleted_`. Names that are another module's decision stay there: which of `~/.claude`'s entries a Profile folder links to (`profile_folder`), which files a Sidebar folder may hold (`checks`).
+4. **The environment boundary.** Outside `env`, the core's code calls none of `std::env::var`/`vars`, `Timestamp::now`, `Zoned::now`, `SystemTime::now`, `TimeZone::system`, `process::Command`. The panic hook in `logging` is exempt: it has no `Environment` to ask. The driver's `Instant::now` is allowed: it only paces ticks.
+5. **One way to write a file.** Outside `storage`, the core's code calls neither `fs::write` nor `File::create`. (`backups` copies files and `logging` appends to the log; neither rewrites a file in place.)
+6. **The AppKit layer keeps no files.** `src/` uses no `std::fs`, no `serde` and no `std::env::var`. That it decides nothing is for review to hold: it does turn what the user types in a field into the `Command` it sends.
 
 ## Rules the compiler checks
 
