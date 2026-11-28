@@ -785,6 +785,40 @@ fn a_folder_of_another_account_is_flagged_as_a_mismatch() {
     );
 }
 
+/// What happens today, pinned so a change is a decision (D4 in
+/// `docs/architecture/TASKS.md`): the Guided switch doesn't know leftover
+/// folders. An entry Claude writes in the target's account's folder in
+/// another Profile's personal Organization reads as another Profile, though
+/// the account is the target's. On the owner's Mac such folders held no
+/// Session of their own (ADR 0003), so this has not been seen.
+#[test]
+fn an_entry_in_a_leftover_folder_of_the_targets_account_is_flagged_as_a_mismatch() {
+    let (mac, mut core, _) = switch_started();
+    let perso = FixtureLogin::perso();
+    let leftover = FixtureLogin::new(
+        &work().account_uuid,
+        &perso.organization_uuid,
+        "me@work.example",
+        "me@example.com's Organization",
+    );
+    desktop_signed_in_as(&mac, &work());
+    sidebar_entry(&mac, &leftover, "l", "Left behind", Duration::ZERO);
+
+    let effects = core.event(Event::Tick);
+
+    assert_eq!(
+        effects,
+        [Effect::Notify {
+            title: "Claude signed in to another Profile".into(),
+            body: format!("Claude signed in as another Profile, not {WORK}"),
+        }]
+    );
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: me@example.com (default login)    Desktop: another Profile")
+    );
+}
+
 #[test]
 fn main_log_confirms_when_no_folder_was_written_yet() {
     let (mac, mut core, _) = switch_started();

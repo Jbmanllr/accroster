@@ -79,12 +79,12 @@ impl Core {
             self.show_result(StatusTone::Failed);
             return Some(Run::Paused);
         }
-        let personal = self.profiles.personal_organizations();
+        let kinds = self.profiles.sidebar_kinds();
         match sidebar_sync::begin(
             &self.env,
             &self.paths,
             !self.settings.leave_out_ssh_and_no_folder_sessions,
-            &personal,
+            &kinds,
             &mut self.sidebar_entries,
         ) {
             Begun::Ended(run) => {

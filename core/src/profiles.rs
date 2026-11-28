@@ -113,20 +113,62 @@ pub(crate) struct SignedInProfile {
     pub personal_organization: bool,
 }
 
-/// Each signed-in Profile's personal Organization, with the one account that
-/// can be in it: Claude lets no one else join a personal Organization.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PersonalOrganizations(BTreeMap<String, String>);
+/// What a Sidebar folder (one account in one Organization) is to the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarKind {
+    /// What an account switch in the desktop app left behind: another
+    /// account paired with a Profile's personal Organization, which Claude
+    /// lets no one else join (ADR 0003). Read for its Sessions, never listed
+    /// and never written into.
+    Leftover,
+    /// A signed-in Profile's own.
+    Profile,
+    /// A signed-in Profile's account in another Organization: the same
+    /// Login, so All Sessions lists it under that Profile and the menu
+    /// offers no sign-in for it.
+    OtherOrganization,
+    /// A Login with no Profile: a Discovered Profile.
+    Discovered,
+}
 
-impl PersonalOrganizations {
-    /// Whether the Sidebar folder of `account` in `organization` is what an
-    /// account switch in the desktop app left behind: another account paired
-    /// with a Profile's personal Organization (ADR 0003). Such a folder is
-    /// read, never listed and never written into.
-    pub(crate) fn is_leftover(&self, account: &str, organization: &str) -> bool {
-        self.0
+/// The signed-in Profiles as what tells one Sidebar folder from another:
+/// the one answer the menu, All Sessions and Sidebar sync ask.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SidebarKinds {
+    signed_in: Vec<ProfileKey>,
+    /// Each signed-in Profile's personal Organization, with the one
+    /// account that can be in it.
+    personal: BTreeMap<String, String>,
+}
+
+impl SidebarKinds {
+    /// What the Sidebar folder of `account` in `organization` is. The
+    /// leftover rule comes first: a folder in a Profile's personal
+    /// Organization under another account is a leftover whatever else
+    /// names that pair.
+    pub(crate) fn of_folder(&self, account: &str, organization: &str) -> SidebarKind {
+        let leftover = self
+            .personal
             .get(organization)
-            .is_some_and(|owner| owner != account)
+            .is_some_and(|owner| owner != account);
+        let own = |key: &&ProfileKey| key.account_uuid == account;
+        if leftover {
+            SidebarKind::Leftover
+        } else if (self.signed_in.iter())
+            .filter(own)
+            .any(|key| key.organization_uuid == organization)
+        {
+            SidebarKind::Profile
+        } else if self.signed_in.iter().any(|key| own(&key)) {
+            SidebarKind::OtherOrganization
+        } else {
+            SidebarKind::Discovered
+        }
+    }
+
+    /// [`SidebarKinds::of_folder`] for a pair.
+    pub(crate) fn of(&self, pair: &ProfileKey) -> SidebarKind {
+        self.of_folder(&pair.account_uuid, &pair.organization_uuid)
     }
 }
 
@@ -623,16 +665,6 @@ impl ProfileRegistry {
         self.notice.as_deref()
     }
 
-    /// Whether a signed-in Profile has this (account, Organization) pair.
-    pub(crate) fn has_signed_in(&self, pair: &ProfileKey) -> bool {
-        self.profiles.iter().any(|profile| {
-            profile
-                .identity
-                .as_ref()
-                .is_some_and(|identity| identity.key == *pair)
-        })
-    }
-
     /// The folder of signed-in Profile `id`, verbatim.
     pub(crate) fn config_dir(&self, id: &str) -> Option<&Path> {
         self.profiles
@@ -749,15 +781,22 @@ impl ProfileRegistry {
         ordered
     }
 
-    /// The personal Organizations of the signed-in Profiles.
-    pub(crate) fn personal_organizations(&self) -> PersonalOrganizations {
-        PersonalOrganizations(
-            self.signed_in()
-                .into_iter()
+    /// What each Sidebar folder is, judged against the signed-in Profiles.
+    pub(crate) fn sidebar_kinds(&self) -> SidebarKinds {
+        let signed_in = self.signed_in();
+        SidebarKinds {
+            personal: signed_in
+                .iter()
                 .filter(|profile| profile.personal_organization)
-                .map(|profile| (profile.key.organization_uuid, profile.key.account_uuid))
+                .map(|profile| {
+                    (
+                        profile.key.organization_uuid.clone(),
+                        profile.key.account_uuid.clone(),
+                    )
+                })
                 .collect(),
-        )
+            signed_in: signed_in.into_iter().map(|profile| profile.key).collect(),
+        }
     }
 
     /// Who each signed-in Profile is, in add order.
@@ -909,5 +948,63 @@ fn link(ctx: &Context, id: &str, config_dir: &Path) {
                 ],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADA: &str = "11111111-1111-4111-8111-111111111111";
+    const ADAS_OWN: &str = "22222222-2222-4222-8222-222222222222";
+    const BOB: &str = "33333333-3333-4333-8333-333333333333";
+    const TEAM: &str = "44444444-4444-4444-8444-444444444444";
+    const STRANGER: &str = "55555555-5555-4555-8555-555555555555";
+    const ELSEWHERE: &str = "66666666-6666-4666-8666-666666666666";
+
+    fn key(account: &str, organization: &str) -> ProfileKey {
+        ProfileKey {
+            account_uuid: account.to_owned(),
+            organization_uuid: organization.to_owned(),
+        }
+    }
+
+    /// Ada in her personal Organization, and Bob in a team.
+    fn kinds() -> SidebarKinds {
+        SidebarKinds {
+            signed_in: vec![key(ADA, ADAS_OWN), key(BOB, TEAM)],
+            personal: BTreeMap::from([(ADAS_OWN.to_owned(), ADA.to_owned())]),
+        }
+    }
+
+    #[test]
+    fn a_sidebar_folder_is_a_profiles_another_organizations_a_leftover_or_discovered() {
+        let kinds = kinds();
+        assert_eq!(kinds.of(&key(ADA, ADAS_OWN)), SidebarKind::Profile);
+        assert_eq!(kinds.of(&key(BOB, TEAM)), SidebarKind::Profile);
+        // The same Login somewhere else, and a team anyone may be in.
+        assert_eq!(kinds.of(&key(ADA, TEAM)), SidebarKind::OtherOrganization);
+        assert_eq!(
+            kinds.of(&key(BOB, ELSEWHERE)),
+            SidebarKind::OtherOrganization
+        );
+        // No one else can be in Ada's personal Organization.
+        assert_eq!(kinds.of(&key(BOB, ADAS_OWN)), SidebarKind::Leftover);
+        assert_eq!(kinds.of(&key(STRANGER, ADAS_OWN)), SidebarKind::Leftover);
+        assert_eq!(kinds.of(&key(STRANGER, TEAM)), SidebarKind::Discovered);
+        assert_eq!(kinds.of(&key(STRANGER, ELSEWHERE)), SidebarKind::Discovered);
+    }
+
+    #[test]
+    fn the_leftover_rule_comes_before_a_sign_in_of_that_pair() {
+        let mut kinds = kinds();
+        kinds.signed_in.push(key(BOB, ADAS_OWN));
+        assert_eq!(kinds.of(&key(BOB, ADAS_OWN)), SidebarKind::Leftover);
+    }
+
+    #[test]
+    fn without_profiles_every_folder_is_discovered() {
+        let kinds = SidebarKinds::default();
+        assert_eq!(kinds.of(&key(ADA, ADAS_OWN)), SidebarKind::Discovered);
     }
 }

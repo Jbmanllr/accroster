@@ -26,7 +26,7 @@ use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening;
-use crate::profiles::{Listed, ProfileRegistry, SignInTarget};
+use crate::profiles::{Listed, ProfileRegistry, SidebarKind, SignInTarget};
 use crate::runner::Jobs;
 use crate::safety::{CheckId, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
@@ -1044,6 +1044,7 @@ impl Core {
     /// order (by nickname when set), then Discovered Profiles.
     fn sidebar_profiles(&self) -> Vec<SidebarProfile> {
         let signed_in = self.profiles.signed_in();
+        let kinds = self.profiles.sidebar_kinds();
         let discovered = self.shown_discovered();
         let mut sidebars = Vec::new();
         // Each Profile, then its account's sidebars in other Organizations,
@@ -1061,7 +1062,7 @@ impl Core {
             });
             let others = discovered.iter().filter(|(evidence, _)| {
                 evidence.pair.account_uuid == profile.key.account_uuid
-                    && evidence.pair != profile.key
+                    && kinds.of(&evidence.pair) == SidebarKind::OtherOrganization
             });
             for (evidence, _) in others {
                 let organization = signed_in
@@ -1091,7 +1092,9 @@ impl Core {
                 });
             }
         }
-        for evidence in self.discovered.iter().filter(|e| self.is_leftover(&e.pair)) {
+        let leftovers = (self.discovered.iter())
+            .filter(|evidence| kinds.of(&evidence.pair) == SidebarKind::Leftover);
+        for evidence in leftovers {
             sidebars.push(SidebarProfile {
                 pair: evidence.pair.clone(),
                 name: String::new(),
@@ -1122,33 +1125,28 @@ impl Core {
     /// sync copies entries into them, so they look active. Today's
     /// `~/.claude.json` login stays unless its exact pair is signed in.
     fn discovered_rows(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
-        let signed_in = self.profiles.signed_in();
+        let kinds = self.profiles.sidebar_kinds();
         self.shown_discovered()
             .into_iter()
             .filter(|(evidence, _)| {
                 evidence.default_login().is_some()
-                    || !signed_in
-                        .iter()
-                        .any(|profile| profile.key.account_uuid == evidence.pair.account_uuid)
+                    || kinds.of(&evidence.pair) == SidebarKind::Discovered
             })
             .collect()
     }
 
-    /// Whether `pair`'s Sidebar folder is an account switch's leftover
-    /// ([`crate::profiles::PersonalOrganizations::is_leftover`]).
-    fn is_leftover(&self, pair: &ProfileKey) -> bool {
-        self.profiles
-            .personal_organizations()
-            .is_leftover(&pair.account_uuid, &pair.organization_uuid)
-    }
-
     /// Discovered pairs without a signed-in Profile, with the user's choices,
-    /// leftovers ([`Core::is_leftover`]) left out.
+    /// an account switch's leftovers left out ([`SidebarKind`]).
     fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
+        let kinds = self.profiles.sidebar_kinds();
         self.discovered
             .iter()
-            .filter(|evidence| !self.profiles.has_signed_in(&evidence.pair))
-            .filter(|evidence| !self.is_leftover(&evidence.pair))
+            .filter(|evidence| {
+                matches!(
+                    kinds.of(&evidence.pair),
+                    SidebarKind::OtherOrganization | SidebarKind::Discovered
+                )
+            })
             .map(|evidence| (evidence, self.choice(&evidence.pair)))
             .collect()
     }
