@@ -17,7 +17,8 @@ The contract between the two parts is `core/src/interface.rs`. The driver (`core
 | File | Holds |
 |---|---|
 | `src/main.rs` | Builds the real `Environment`, launches the core, starts the UI. |
-| `src/ui.rs` | `Ui`: the target of every click and the owner of every window; rendering a `View`, performing an `Effect`, and building the windows. |
+| `src/ui.rs` | `Ui`: the target of every click and the owner of every window; rendering a `View`, performing an `Effect`, and the menu. |
+| `src/ui/settings_window.rs`, `all_sessions_window.rs`, `diagnostics_window.rs`, `first_run_window.rs` | One window each: its struct, how it is built and how its part of the `View` fills it. |
 | `src/ui/widgets.rs` | Views built from one view model each (a Profile row, a limit bar, a badge, a Session row, menu items). They don't know `Ui`. |
 | `src/ui/sidebar.rs` | The All Sessions sidebar's data source and delegate. |
 | `src/ui/mac.rs` | What the UI does to the rest of the Mac: Terminal, the Claude desktop app, bringing windows forward, the Trash, alerts, the network path. |
@@ -35,6 +36,7 @@ They know none of the app's features.
 |---|---|
 | `interface` | The contract with the UI: `Command`, `Event`, `Effect`, `View` and its parts. |
 | `claude_files` | Where Claude Code and the desktop app keep their files, and how they name them. Lists folders; reads no file's contents. |
+| `stamp` | `Stamp`: a file as `stat` sees it, the one answer to "has this file changed since I read it" for every cache of Claude's files. |
 | `storage` | The app's own folder (`AppPaths`) and the one way a file is written: temp file, then rename. Versioned JSON files. |
 | `env` | The boundary with the rest of the Mac: home folder, inherited variables, spawning, the clock, OS facts, the login item. |
 | `logging` | `app.log`: redacted when written, rotated. The panic hook. |
@@ -45,6 +47,7 @@ They know none of the app's features.
 | Module | Owns |
 |---|---|
 | `names` | How a Profile is called: its Profile name and its Short label, alone and among other Profiles. |
+| `times` | How a time reads to the user: the clock time, a coming day, a countdown, an age. |
 
 ### Claude's formats
 
@@ -76,7 +79,7 @@ Each owns its state, and its file under `state/` when it keeps one.
 |---|---|
 | `profile_folder` | A Profile folder's links back to `~/.claude` and its `.claude.json` seed (ADR 0002). |
 | `monitor` | The Limit monitor: when each Profile's limits are read, backoff (`state/backoff.json`), the limit bars. |
-| `profiles` | The Profile registry (`state/profiles.json`, `profiles/<id>/`): sign-in, sign-out, removal, names and Short labels. |
+| `profiles` | The Profile registry (`state/profiles.json`, `profiles/<id>/`): which Profiles exist, their rows, names and Short labels, and what each Sidebar folder is to them (`SidebarKinds`). Its submodules are the flows it drives: `profiles/sign_in.rs` (Add Profile…, Sign in again…) and `profiles/removal.rs` (Remove…). |
 | `notifications` | Which limit notifications fired (`state/notifications.json`) and which are due. |
 | `cli_switcher` | CLI switching: the shim, the pointer, the `~/.zshrc` block, and its part of the menu (ADR 0002). |
 | `desktop_account` | The desktop's Active Profile, as far as its files tell. |
@@ -91,7 +94,7 @@ Each owns its state, and its file under `state/` when it keeps one.
 
 | Module | Owns |
 |---|---|
-| `core` | `Core`: composes the features, handles every `Command` and `Event`, builds the `View`. Its submodules (`core/cli.rs`, `open.rs`, `self_check.rs`, `sidebar.rs`, `uninstaller.rs`) are the flows that span several features. |
+| `core` | `Core`: composes the features, handles every `Command` and `Event`, builds the `View`. Its submodules are what spans several features: `core/menu.rs` (the menu's parts, and each client's Active Profile read once per input), `cli.rs`, `open.rs`, `self_check.rs`, `sidebar.rs` (Sidebar sync as the core runs it, and which of the Guided switch, Sidebar sync and Reopen Claude may start), `uninstaller.rs`. |
 | `driver` | The core's thread and its ticks. |
 | `watcher` | The real FSEvents watch behind the watch effects. |
 
@@ -126,7 +129,8 @@ Each check reads the code's text (comments and test modules left out) and looks 
 3. **Claude's layout has one owner.** Outside `claude_files`, the core's code holds none of these: a string starting with `.claude` or `.claude.json`, `claude-code-sessions`, `Application Support/Claude`, `Logs/Claude`, `Claude.app`, `claude-desktop`, `scratch-workspaces`, a string starting with `local_` or `deleted_`. Names that are another module's decision stay there: which of `~/.claude`'s entries a Profile folder links to (`profile_folder`), which files a Sidebar folder may hold (`checks`).
 4. **The environment boundary.** Outside `env`, the core's code calls none of `std::env::var`/`vars`, `Timestamp::now`, `Zoned::now`, `SystemTime::now`, `TimeZone::system`, `process::Command`. The panic hook in `logging` is exempt: it has no `Environment` to ask. The driver's `Instant::now` is allowed: it only paces ticks.
 5. **One way to write a file.** Outside `storage`, the core's code calls neither `fs::write` nor `File::create`. (`backups` copies files and `logging` appends to the log; neither rewrites a file in place.)
-6. **The AppKit layer keeps no files.** `src/` uses no `std::fs`, no `serde` and no `std::env::var`. That it decides nothing is for review to hold: it does turn what the user types in a field into the `Command` it sends.
+6. **Time wording has one owner.** Outside `times`, the core's code calls no `strftime`, except for the machine formats in `backups`, `settings` and `logging`.
+7. **The AppKit layer keeps no files.** `src/` uses no `std::fs`, no `serde` and no `std::env::var`. That it decides nothing is for review to hold: it does turn what the user types in a field into the `Command` it sends.
 
 ## Rules the compiler checks
 
@@ -139,6 +143,8 @@ Each check reads the code's text (comments and test modules left out) and looks 
 - **One canonical rule.** Before writing a rule about a Claude format or a domain concept, look for its owner in the tables above and call it.
 - **A feature owns its state.** The core calls a feature's methods; it doesn't reach into its file or its fields.
 - **Text shown to the user** uses the glossary's words.
+- **Who goes first.** Whether a Guided switch, a Sidebar sync or Reopen Claude may start is asked of `may_switch_desktop`, `may_reopen` and `may_sync` in `core/sidebar.rs`, nowhere else.
+- **What a Sidebar folder is** (a Profile's, the same Login in another Organization, a leftover, a Discovered Profile's) is asked of `profiles::SidebarKinds`.
 
 ## Adding something
 

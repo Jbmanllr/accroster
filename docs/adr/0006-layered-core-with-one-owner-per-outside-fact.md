@@ -23,5 +23,7 @@ Before this, the layout of Claude's files was joined from literals in more than 
   - The self-check takes a Sidebar entry's id from its file name by removing one `.json`, as Sidebar sync does (it removed every trailing `.json`).
   - The self-check samples the Transcripts the Session index reads, so not a subagent's `agent-*.jsonl` kept next to a Session's own.
   - A busy Session's title, when its entry exists in several Sidebar folders with different titles, comes from the first folder in sorted order (it came from whichever the file system listed first).
+- Every cache of Claude's files tells a changed file by one stamp (`stamp::Stamp`: inode, size, modification and change time). The Session index and the Discovered scan compared size and modification time only; they now also read an entry again when only its inode or change time differs.
+- A time shown to the user is worded in `times`; no other module of the core calls `strftime`, except for file names and the log.
 - The checks read source text, not types. They can miss a dependency reached through a re-export or a `super::` path, and they match literals, not meaning. They are a tripwire for the common mistake; review still decides.
 - The AppKit layer (`src/`) is checked for one thing: it uses no `std::fs`, no `serde` and no `std::env::var`. That it decides nothing is left to review, and its internal structure has no tests (see `docs/TESTING.md`).
