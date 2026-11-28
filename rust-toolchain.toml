@@ -1,5 +1,6 @@
 [toolchain]
 channel = "1.93.0"
-components = ["rustfmt", "clippy"]
+# rust-analyzer: the LSP agents use for definitions and references.
+components = ["rustfmt", "clippy", "rust-analyzer"]
 # Both Mac architectures, for the universal release build (scripts/release.sh).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
