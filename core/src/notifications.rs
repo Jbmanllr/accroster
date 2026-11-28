@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::interface::{Effect, NotificationAction};
-use crate::limit_offers;
 use crate::logging::{Field, Level};
 use crate::storage::{self, ReadError, VersionedFile};
+use crate::times;
 use crate::usage::{Limit, Limits};
 
 /// A signed-in, watched Profile, as the notifier sees it.
@@ -294,7 +294,11 @@ fn warning(
     );
     if let Some(at) = limit.resets_at {
         title.push_str(" · resets ");
-        title.push_str(&reset_time(ctx, at, now));
+        title.push_str(&times::clock_today_else_day(
+            at,
+            now,
+            &ctx.env.clock.time_zone(),
+        ));
     }
     let better = headroom.filter(|headroom| {
         subject.cli_active
@@ -329,17 +333,6 @@ fn limit_name(limits: &Limits, label: &str) -> String {
         format!("{label} weekly limit")
     } else {
         format!("{label} limit")
-    }
-}
-
-/// `16:40` today, else the day ("Thu", "Nov 3"), in the Mac's time zone.
-fn reset_time(ctx: &Context, at: Timestamp, now: Timestamp) -> String {
-    let tz = ctx.env.clock.time_zone();
-    let day = limit_offers::day(at, now, &tz);
-    if day == "today" {
-        at.to_zoned(tz).strftime("%H:%M").to_string()
-    } else {
-        day
     }
 }
 

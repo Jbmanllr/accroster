@@ -22,6 +22,7 @@ use crate::limit_offers;
 use crate::logging::{Field, Level};
 use crate::runner::UsageRead;
 use crate::storage::{self, ReadError, VersionedFile};
+use crate::times;
 use crate::usage::{Limit, Limits, UsageReply};
 
 /// How often an Active Profile is read.
@@ -364,7 +365,10 @@ impl LimitMonitor {
             .filter_map(|w| self.watches.get(&w.id)?.read_at)
             .min();
         Some(match oldest {
-            Some(at) => format!("Offline — showing figures from {}", clock_time(ctx, at)),
+            Some(at) => format!(
+                "Offline — showing figures from {}",
+                times::clock(at, &ctx.env.clock.time_zone())
+            ),
             None => "Offline".into(),
         })
     }
@@ -443,7 +447,8 @@ impl LimitMonitor {
                 }));
             }
         }
-        let time = |at: Timestamp| clock_time(ctx, at);
+        let tz = ctx.env.clock.time_zone();
+        let time = |at: Timestamp| times::clock(at, &tz);
         let stale = watch
             .read_at
             .is_some_and(|at| now.duration_since(at) > cadence(active) * 2);
@@ -685,27 +690,15 @@ fn cached_fetch_time(config_dir: &Path, account_uuid: &str) -> Option<Timestamp>
     Timestamp::from_millisecond(cache.get("fetchedAtMs")?.as_i64()?).ok()
 }
 
-/// `14:02` in the Mac's time zone.
 /// When a limit resets, after its bar: a countdown for the Session limit
 /// ("resets in 1 h 40 min", minutes rounded up), else the day and time
 /// ("resets Thu 09:00", "resets today 23:00", "resets Nov 12 00:00").
 fn resets_text(at: Timestamp, now: Timestamp, tz: &jiff::tz::TimeZone, countdown: bool) -> String {
     if countdown {
-        let minutes = (at.duration_since(now).as_secs() + 59) / 60;
-        return match (minutes / 60, minutes % 60) {
-            (0, minutes) => format!("resets in {minutes} min"),
-            (hours, 0) => format!("resets in {hours} h"),
-            (hours, minutes) => format!("resets in {hours} h {minutes} min"),
-        };
+        format!("resets {}", times::countdown(at, now))
+    } else {
+        format!("resets {}", times::day_and_clock(at, now, tz))
     }
-    let time = at.to_zoned(tz.clone()).strftime("%H:%M").to_string();
-    format!("resets {} {time}", limit_offers::day(at, now, tz))
-}
-
-fn clock_time(ctx: &Context, at: Timestamp) -> String {
-    at.to_zoned(ctx.env.clock.time_zone())
-        .strftime("%H:%M")
-        .to_string()
 }
 
 fn backoff_path(ctx: &Context) -> PathBuf {

@@ -24,13 +24,17 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "interface",
             "claude_files",
+            "stamp",
             "storage",
             "env",
             "logging",
             "shell",
         ],
     ),
-    ("The domain's own rules, which need no file.", &["names"]),
+    (
+        "The domain's own rules, which need no file.",
+        &["names", "times"],
+    ),
     (
         "Claude's formats: one reader per undocumented format (ADR 0004).",
         &["claude_json", "limit_offers", "usage", "live_processes"],
@@ -339,6 +343,21 @@ fn a_whole_file_is_written_only_by_storage() {
         "Files are written temp-file-then-rename, by `storage::write_atomically`, \
          `write_new` or `write_versioned` (core/src/storage.rs): a crash must never leave half \
          a file. Use one of those instead of writing in place.",
+    );
+}
+
+#[test]
+fn a_time_the_user_reads_is_worded_only_in_times() {
+    assert_none(
+        matches(
+            &core_sources(),
+            r"strftime\(",
+            // The machine formats: backup and file names, and the log.
+            &["times", "backups", "settings", "logging"],
+        ),
+        "A time shown to the user is worded by `times` (core/src/times.rs), so the menu, the \
+         windows and the notifications name a day or a time the same way. Use one of its \
+         functions, or add one there.",
     );
 }
 

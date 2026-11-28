@@ -9,32 +9,32 @@ use jiff::SignedDuration;
 
 use crate::backups;
 use crate::checks;
-use crate::claude_code::{self, ClaudeLocator};
-use crate::claude_files::ClaudePaths;
+use crate::claude_code::ClaudeLocator;
 use crate::cli_switcher;
 use crate::context::Context;
 use crate::desktop::{DesktopBridge, Reopen, Target};
-use crate::desktop_account::{DesktopAccount, NewestEntries};
+use crate::desktop_account::NewestEntries;
 use crate::discovered::{self, Evidence};
 use crate::env::{Environment, LoginItemStatus};
 use crate::interface::{
-    AboutView, Badge, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
-    HiddenDiscovered, LaunchAtLoginView, MOST_HEADROOM, MenuBarView, MenuItem, MenuView,
-    NicknameTarget, NotificationAction, NotificationsView, ProfileKey, ProfileSettings,
-    SafetyFeature, SettingsView, SidebarSyncMode, SidebarSyncView, TICK_INTERVAL, Toggle,
-    UninstallView, View,
+    AboutView, ClaudeVersions, CliSwitchingView, Command, Effect, Event, FirstRunView,
+    HiddenDiscovered, LaunchAtLoginView, MenuBarView, MenuItem, MenuView, NicknameTarget,
+    NotificationAction, NotificationsView, ProfileKey, ProfileSettings, SafetyFeature,
+    SettingsView, SidebarSyncMode, SidebarSyncView, TICK_INTERVAL, Toggle, UninstallView, View,
 };
 use crate::logging::{Field, Level, Logger};
 use crate::monitor::{LimitMonitor, Watched};
 use crate::notifications::{self, Choices, Headroom, Notifier, Subject};
 use crate::opening;
-use crate::profiles::{Listed, ProfileRegistry, SignInTarget};
+use crate::profiles::{Listed, ProfileRegistry, SidebarKind, SignInTarget};
 use crate::runner::Jobs;
 use crate::safety::{CheckId, Safety};
 use crate::sessions::{SessionIndex, SidebarProfile};
 use crate::settings::{self, DiscoveredChoice, Settings, Thresholds};
 use crate::sidebar_sync;
 use crate::storage::{self, AppPaths};
+
+use self::menu::ActiveProfiles;
 
 /// The tagline, shown in About and the README.
 pub const TAGLINE: &str =
@@ -187,6 +187,7 @@ fn verbose_logging(settings: &Settings, env: &Environment) -> bool {
 const RUN_TICK: Duration = Duration::from_millis(250);
 
 mod cli;
+mod menu;
 mod open;
 mod self_check;
 mod sidebar;
@@ -333,8 +334,11 @@ impl Core {
             let sync_due = self.sidebar_watch.until_due(self.env.clock.now());
             sync_due.map_or(TICK_INTERVAL, |due| due.min(TICK_INTERVAL))
         };
-        self.monitor
-            .tick_interval(self.env.clock.now(), &self.watched(), idle)
+        self.monitor.tick_interval(
+            self.env.clock.now(),
+            &self.watched(&self.active_profiles()),
+            idle,
+        )
     }
 
     /// Effects the core queued outside an input (a Safety pause noticed at
@@ -499,8 +503,7 @@ impl Core {
                     .iter()
                     .find(|profile| profile.id == id)
                     .map(Target::of);
-                // One thing at a time with Claude: a reopen under way first.
-                let Some(target) = target.filter(|_| !self.reopen.active()) else {
+                let Some(target) = target.filter(|_| self.may_switch_desktop()) else {
                     return Vec::new();
                 };
                 let (desktop, ctx) = self.desktop();
@@ -508,7 +511,7 @@ impl Core {
                 self.guide_desktop_switch(cleared)
             }
             Command::ReopenDesktopApp => {
-                if self.desktop.active() {
+                if !self.may_reopen() {
                     return Vec::new();
                 }
                 let (reopen, ctx) = self.reopen();
@@ -616,7 +619,7 @@ impl Core {
                 // The user's click confirms the first write after a pause
                 // from the Sidebar entries check, as Resume does; the pause
                 // stays while that check fails (ADR 0004).
-                if self.sidebar_entries_paused_sync() {
+                if self.may_sync() && self.sidebar_entries_paused_sync() {
                     self.resume(SafetyFeature::SidebarSync);
                 }
                 self.sync_sidebar();
@@ -712,12 +715,9 @@ impl Core {
                 effects.extend(self.guide_desktop_switch(cleared));
                 effects.extend(self.poll_reopen());
                 self.sidebar_watch.notice_switch(&self.env);
-                // While a Guided switch waits, copies sync wrote would look
-                // like Claude writing the target's folder: sync waits too.
-                // So it does while Claude quits and opens again.
+                // A due sync that must wait stays due.
                 if self.settings.sidebar_sync == SidebarSyncMode::Automatic
-                    && !self.desktop.waiting()
-                    && !self.reopen.restarting()
+                    && self.may_sync()
                     && self.sidebar_watch.take_due(self.env.clock.now())
                 {
                     self.sync_sidebar();
@@ -735,7 +735,7 @@ impl Core {
                     self.check_links();
                     self.settle();
                 }
-                let watched = self.watched();
+                let watched = self.watched(&self.active_profiles());
                 self.monitor.menu_opened(self.env.clock.now(), &watched);
                 // While the window is closed nothing is watched: a stat-only
                 // rescan keeps the index current.
@@ -759,12 +759,12 @@ impl Core {
                 Vec::new()
             }
             Event::WillSleep | Event::DidWake => {
-                let watched = self.watched();
+                let watched = self.watched(&self.active_profiles());
                 self.monitor.set_asleep(event == Event::WillSleep, &watched);
                 Vec::new()
             }
             Event::ScreenLocked | Event::ScreenUnlocked => {
-                let watched = self.watched();
+                let watched = self.watched(&self.active_profiles());
                 self.monitor
                     .set_locked(event == Event::ScreenLocked, &watched);
                 Vec::new()
@@ -791,33 +791,33 @@ impl Core {
     /// Finished reads go to the Profile registry, which notices an expired
     /// Login; returns the notifications that produced.
     fn run_monitor(&mut self) -> Vec<Effect> {
-        let watched = self.watched();
+        let active = self.active_profiles();
+        let watched = self.watched(&active);
         let ctx = context!(self);
         // A finished read is handed over before the next starts: a Profile
         // whose `auth status` the registry queues isn't watched meanwhile.
         if let Some(done) = self.monitor.collect_finished(&ctx, &watched) {
             self.profiles.record_reading(&ctx, &done);
         }
-        let watched = self.watched();
+        let watched = self.watched(&active);
         if let Some(done) = self.monitor.start_due(&ctx, &watched) {
             self.profiles.record_reading(&ctx, &done);
         }
         let mut effects = self.profiles.take_effects();
-        effects.extend(self.notify_limits());
+        effects.extend(self.notify_limits(&active));
         effects
     }
 
     /// The limit notifications due now (thresholds crossed, warned limits
     /// that reset).
-    fn notify_limits(&mut self) -> Vec<Effect> {
+    fn notify_limits(&mut self, active: &ActiveProfiles) -> Vec<Effect> {
         let ctx = context!(self);
-        let watched = self.watched();
+        let watched = self.watched(active);
         let listed = self.profiles.listed(&self.settings, |id| {
             let active = watched.iter().any(|w| w.id == id && w.active);
             self.monitor.view(&ctx, id, active)
         });
         let headroom = most_headroom(&listed, &watched);
-        let pointer = cli_switcher::pointer(&self.paths);
         let subjects: Vec<Subject> = watched
             .iter()
             .filter_map(|w| {
@@ -828,7 +828,7 @@ impl Core {
                     limits: self.monitor.limits(&w.id),
                     tightest: listed.row.tightest_limit(),
                     muted: self.settings.muted_profiles.contains(&w.id),
-                    cli_active: pointer.as_deref() == Some(w.config_dir.as_path()),
+                    cli_active: active.cli.as_deref() == Some(w.config_dir.as_path()),
                 })
             })
             .collect();
@@ -840,164 +840,57 @@ impl Core {
             .check(&ctx, &subjects, headroom.as_ref(), &choices)
     }
 
-    /// The signed-in Profiles the Limit monitor reads, with which are a
-    /// client's Active Profile: the CLI's (its pointer) or the desktop app's.
-    fn watched(&self) -> Vec<Watched> {
-        let cli_active = cli_switcher::pointer(&self.paths);
-        let desktop_active = self.desktop_account().and_then(|account| {
-            let signed_in = self.profiles.signed_in();
-            account
-                .profile(&signed_in)
-                .map(|profile| profile.id.clone())
-        });
-        let mut watched = self.profiles.watched(|id, config_dir| {
-            cli_active.as_deref() == Some(config_dir) || desktop_active.as_deref() == Some(id)
-        });
-        // Two Claude Code runs never share a folder.
-        watched.retain(|w| !self.openings.queued().any(|(dir, _)| dir == w.config_dir));
-        watched
-    }
-
-    /// The desktop's account and Organization.
-    fn desktop_account(&self) -> Option<DesktopAccount> {
-        self.newest_entries
-            .desktop_account(&ClaudePaths::new(&self.env.home))
-    }
-
     /// Everything the UI shows right now.
     pub fn view(&self) -> View {
         let login_item = self.env.login_item.status();
         let ctx = self.context();
-        let watched = self.watched();
-        let mut items: Vec<MenuItem> = self
-            .monitor
-            .offline_line(&ctx, &watched)
-            .into_iter()
-            .chain(
-                self.warnings
-                    .iter()
-                    .cloned()
-                    .chain(
-                        self.claude
-                            .missing()
-                            .then(|| claude_code::MISSING.to_owned()),
-                    )
-                    .chain(self.safety.warning_lines())
-                    .chain(self.profiles.notice().map(str::to_owned)),
-            )
-            .map(MenuItem::Warning)
-            .collect();
-        let mut listed = self.profiles.listed(&self.settings, |id| {
-            let active = watched.iter().any(|w| w.id == id && w.active);
-            self.monitor.view(&ctx, id, active)
-        });
-        if let Some(headroom) = most_headroom(&listed, &watched) {
-            for listed in listed.iter_mut() {
-                listed.row.marker = (listed.id == headroom.id).then(|| MOST_HEADROOM.to_owned());
-            }
-        }
-        for profile in &mut listed {
-            self.annotate_links(profile.id, &mut profile.row);
-        }
+        let active = self.active_profiles();
+        let watched = self.watched(&active);
+        let signed_in = self.profiles.signed_in();
+        let desktop_profile = active
+            .desktop
+            .as_ref()
+            .and_then(|account| account.profile(&signed_in));
+
+        let mut listed = self.listed_profiles(&ctx, &watched);
         let profile_settings = self.profile_settings(&listed);
-        let cli = cli_switcher::present(&self.paths, &mut listed, self.cli_hold());
-        let pointer = cli_switcher::pointer(&self.paths);
+        let cli = cli_switcher::present(
+            &self.paths,
+            active.cli.as_deref(),
+            &mut listed,
+            self.cli_hold(),
+        );
         // The menu bar's figure is the CLI's Active Profile's: dimmed with it.
         let menu_bar_dimmed = listed
             .iter()
-            .any(|profile| Some(profile.config_dir) == pointer.as_deref() && profile.row.dimmed);
-        // The status line goes first: a Guided switch's, else a sync's.
-        let mut status = self.desktop.menu_items(self.sync_progress());
-        status.extend(self.sync_menu_items());
-        items.splice(0..0, status);
+            .any(|profile| Some(profile.config_dir) == active.cli.as_deref() && profile.row.dimmed);
+        let cli_part = match cli.header {
+            Some(part) => Some(part),
+            None => self.default_login_part(&mut listed, &signed_in),
+        };
+        let header = menu::header_line(cli_part, active.desktop.as_ref(), desktop_profile, &listed);
+        self.add_desktop_items(&mut listed, desktop_profile, &signed_in);
+        let (discovered_rows, hidden_discovered) = self.discovered_parts();
+
+        let mut items = self.status_lines(&ctx, &watched);
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        let signed_in = self.profiles.signed_in();
-        let desktop_account = self.desktop_account();
-        let desktop_profile = desktop_account
-            .as_ref()
-            .and_then(|account| account.profile(&signed_in));
-        // Each client's Active Profile by its Short label, the CLI's first:
-        // without CLI switching that is the Default login, else Default,
-        // said when the desktop's is.
-        let desktop_part = desktop_account.as_ref().map(|_| {
-            let name = desktop_profile
-                .and_then(|desktop| listed.iter().find(|listed| listed.id == desktop.id))
-                .map_or("another Profile", |listed| listed.short_label.as_str());
-            format!("Desktop: {name}")
-        });
-        // Without CLI switching the CLI uses `~/.claude`: named by its Login.
-        let default_login = self
-            .discovered
-            .iter()
-            .find_map(|evidence| Some((&evidence.pair, evidence.default_login()?)))
-            .filter(|_| cli.header.is_none());
-        let default_login_part = default_login.map(|(pair, names)| {
-            let listed = signed_in
-                .iter()
-                .find(|profile| profile.key == *pair)
-                .and_then(|profile| listed.iter_mut().find(|listed| listed.id == profile.id));
-            let name = match listed {
-                Some(listed) => {
-                    listed.row.default_login = true;
-                    listed.short_label.clone()
-                }
-                None => names.name(),
-            };
-            format!("CLI: {name} (default login)")
-        });
-        let cli_part = cli
-            .header
-            .or(default_login_part)
-            .or_else(|| desktop_part.as_ref().map(|_| "CLI: Default".to_owned()));
-        let header: Vec<String> = cli_part.into_iter().chain(desktop_part).collect();
-        if !header.is_empty() {
-            items.push(MenuItem::Detail(header.join("    ")));
+        if let Some(header) = header {
+            items.push(MenuItem::Detail(header));
             items.push(MenuItem::Separator);
         }
-        let desktop_installed = self.env.os.desktop_app_version().is_some();
-        for listed in listed.iter_mut() {
-            let Some(profile) = signed_in.iter().find(|profile| profile.id == listed.id) else {
-                continue;
-            };
-            let row = &mut listed.row;
-            if desktop_profile.is_some_and(|desktop| desktop.id == profile.id) {
-                row.badges.push(Badge::Desktop);
-            } else if desktop_installed {
-                row.submenu.push(MenuItem::Action {
-                    title: "Switch desktop app to this Profile…".into(),
-                    command: Command::SwitchDesktopApp(profile.id.clone()),
-                });
-            }
-        }
-        let shown = self.discovered_rows();
-        let tz = self.env.clock.time_zone();
-        let discovered_rows = shown
-            .iter()
-            .filter(|(_, choice)| !choice.is_some_and(|c| c.hidden))
-            .map(|(evidence, choice)| {
-                MenuItem::Discovered(evidence.row(choice.and_then(|c| c.nickname.as_deref()), &tz))
-            });
-        let before = items.len();
+        let rows = items.len();
         items.extend(
             listed
                 .into_iter()
                 .map(|profile| MenuItem::Profile(profile.row)),
         );
         items.extend(discovered_rows);
-        if items.len() > before {
+        if items.len() > rows {
             items.push(MenuItem::Separator);
         }
         items.extend(self.fixed_menu_items());
-        let hidden_discovered = shown
-            .iter()
-            .filter(|(_, choice)| choice.is_some_and(|c| c.hidden))
-            .map(|(evidence, choice)| HiddenDiscovered {
-                title: evidence.hidden_title(choice.and_then(|c| c.nickname.as_deref()), &tz),
-                restore: Command::UnhideDiscovered(evidence.pair.clone()),
-            })
-            .collect();
         View {
             menu_bar: MenuBarView {
                 label: cli.label,
@@ -1023,63 +916,6 @@ impl Core {
         }
     }
 
-    /// The menu's last items, the same whatever the Profiles are: Recent
-    /// Sessions, All Sessions…, Add Profile… (or the sign-in under way),
-    /// Settings…, Diagnostics…, About and Quit.
-    fn fixed_menu_items(&self) -> Vec<MenuItem> {
-        let mut items = Vec::new();
-        let recent: Vec<MenuItem> = self
-            .sessions
-            .recent(RECENT_SESSIONS)
-            .into_iter()
-            .map(|(id, title)| MenuItem::Action {
-                title,
-                command: Command::OpenSession(id),
-            })
-            .collect();
-        if !recent.is_empty() {
-            items.push(MenuItem::Submenu {
-                title: "Recent Sessions".into(),
-                items: recent,
-            });
-        }
-        items.push(MenuItem::Action {
-            title: "All Sessions…".into(),
-            command: Command::OpenAllSessions,
-        });
-        items.push(if self.profiles.signing_in() {
-            MenuItem::Action {
-                title: "Waiting for sign-in… Cancel".into(),
-                command: Command::CancelSignIn,
-            }
-        } else {
-            MenuItem::Action {
-                title: "Add Profile…".into(),
-                command: Command::AddProfile,
-            }
-        });
-        items.extend([
-            MenuItem::Action {
-                title: "Settings…".into(),
-                command: Command::OpenSettings,
-            },
-            MenuItem::Action {
-                title: "Diagnostics…".into(),
-                command: Command::OpenDiagnostics,
-            },
-            MenuItem::Action {
-                title: "About".into(),
-                command: Command::OpenAbout,
-            },
-            MenuItem::Separator,
-            MenuItem::Action {
-                title: "Quit".into(),
-                command: Command::Quit,
-            },
-        ]);
-        items
-    }
-
     /// The Settings window. `profiles` and `hidden_discovered` come from
     /// [`Core::view`], which lists the Profiles once for the menu and for
     /// Settings.
@@ -1100,8 +936,7 @@ impl Core {
             },
             sidebar_sync: SidebarSyncView {
                 mode: self.settings.sidebar_sync,
-                sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
-                    .then_some(Command::SyncSidebarNow),
+                sync_now: self.sync_now_offered().then_some(Command::SyncSidebarNow),
                 note: self.sync_settings_note(),
                 reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
                 ssh_and_no_folder_sessions: Toggle {
@@ -1204,6 +1039,7 @@ impl Core {
     /// order (by nickname when set), then Discovered Profiles.
     fn sidebar_profiles(&self) -> Vec<SidebarProfile> {
         let signed_in = self.profiles.signed_in();
+        let kinds = self.profiles.sidebar_kinds();
         let discovered = self.shown_discovered();
         let mut sidebars = Vec::new();
         // Each Profile, then its account's sidebars in other Organizations,
@@ -1221,7 +1057,7 @@ impl Core {
             });
             let others = discovered.iter().filter(|(evidence, _)| {
                 evidence.pair.account_uuid == profile.key.account_uuid
-                    && evidence.pair != profile.key
+                    && kinds.of(&evidence.pair) == SidebarKind::OtherOrganization
             });
             for (evidence, _) in others {
                 let organization = signed_in
@@ -1251,7 +1087,9 @@ impl Core {
                 });
             }
         }
-        for evidence in self.discovered.iter().filter(|e| self.is_leftover(&e.pair)) {
+        let leftovers = (self.discovered.iter())
+            .filter(|evidence| kinds.of(&evidence.pair) == SidebarKind::Leftover);
+        for evidence in leftovers {
             sidebars.push(SidebarProfile {
                 pair: evidence.pair.clone(),
                 name: String::new(),
@@ -1282,33 +1120,28 @@ impl Core {
     /// sync copies entries into them, so they look active. Today's
     /// `~/.claude.json` login stays unless its exact pair is signed in.
     fn discovered_rows(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
-        let signed_in = self.profiles.signed_in();
+        let kinds = self.profiles.sidebar_kinds();
         self.shown_discovered()
             .into_iter()
             .filter(|(evidence, _)| {
                 evidence.default_login().is_some()
-                    || !signed_in
-                        .iter()
-                        .any(|profile| profile.key.account_uuid == evidence.pair.account_uuid)
+                    || kinds.of(&evidence.pair) == SidebarKind::Discovered
             })
             .collect()
     }
 
-    /// Whether `pair`'s Sidebar folder is an account switch's leftover
-    /// ([`crate::profiles::PersonalOrganizations::is_leftover`]).
-    fn is_leftover(&self, pair: &ProfileKey) -> bool {
-        self.profiles
-            .personal_organizations()
-            .is_leftover(&pair.account_uuid, &pair.organization_uuid)
-    }
-
     /// Discovered pairs without a signed-in Profile, with the user's choices,
-    /// leftovers ([`Core::is_leftover`]) left out.
+    /// an account switch's leftovers left out ([`SidebarKind`]).
     fn shown_discovered(&self) -> Vec<(&Evidence, Option<&DiscoveredChoice>)> {
+        let kinds = self.profiles.sidebar_kinds();
         self.discovered
             .iter()
-            .filter(|evidence| !self.profiles.has_signed_in(&evidence.pair))
-            .filter(|evidence| !self.is_leftover(&evidence.pair))
+            .filter(|evidence| {
+                matches!(
+                    kinds.of(&evidence.pair),
+                    SidebarKind::OtherOrganization | SidebarKind::Discovered
+                )
+            })
             .map(|evidence| (evidence, self.choice(&evidence.pair)))
             .collect()
     }

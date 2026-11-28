@@ -82,9 +82,57 @@ Behaviour unchanged; `a_leftover_folder_in_another_profiles_personal_organizatio
 
 This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates are in `TASKS.md`: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
 
+Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 19 take the task pool's open tasks.
+
+## Round 12: one file stamp (task 9)
+
+The Session index, the Discovered Profiles, Sidebar sync and the self-check each defined "this file changed since I read it": size and modification time; size and an optional modification time; inode, size, modification and change time. They share `stamp::Stamp`, the strictest of the three, which Sidebar sync needs (ADR 0003). The Session index still saves a Transcript's size and modification time in `index/sessions.json`, taken from the stamp.
+
+Two differences. The Discovered Profiles and Session index caches now also read an entry again when only its inode or change time differs. And a file whose modification time the file system can't give is skipped, where the Session index used to record 0 and the Discovered scan compared sizes only; macOS always gives one. A test of the Discovered cache relied on the old rule (it made an entry unreadable with `chmod`, which changes the change time); what it proved is now `a_listing_reads_only_new_and_rewritten_entries` in `discovered.rs`, and the integration test keeps the folder-level half.
+
+## Round 13: time wording in one module (task 11)
+
+The clock time, a coming day ("today", "Thu", "Nov 3"), the countdown to a reset and a Session's age were formatted in `monitor`, `notifications`, `discovered`, `limit_offers` and `sessions`. They are `times`, each wording unchanged and pinned by a unit test. A new architecture check keeps `strftime` out of the other modules (the machine formats in `backups`, `settings` and `logging` are exempt).
+
+## Round 14: the menu from named parts, each client's Active Profile read once (tasks 12 and 16)
+
+`Core::view` was one 160-line function. Its parts are functions in `core/menu.rs`: `status_lines`, `listed_profiles`, `default_login_part`, `add_desktop_items`, `header_line`, `discovered_parts` and `fixed_menu_items`; `view` puts them in order.
+
+The CLI's pointer and the desktop app's account were read five to seven times per tick. `ActiveProfiles` holds both as read once; one view and one monitor step read it once and pass it down, and `cli_switcher::present` takes the pointer instead of reading it again. For the menu and the Limit monitor that is three reads per tick: once each for the monitor step, the view and the tick interval. Two readers are left as they were: the All Sessions detail of a selected Session, and Sidebar sync's watch, which reads the desktop's account on every tick while sync is on.
+
+Not done as the task said: no test counts the reads of `config.json`. The files are read with `std::fs`, so counting would need a seam that exists only for the test. The existing menu tests cover the behaviour.
+
+## Round 15: `profiles.rs` split (task 13)
+
+`profiles.rs` was 1,600 lines. The browser sign-ins (Add Profile… and Sign in again…) are `profiles/sign_in.rs`, Remove… is `profiles/removal.rs`, and the registry file (about 1,000 lines) keeps which Profiles exist, each one's menu row and its Limit reading. A pure move: the same code lines, with two signatures rewrapped by rustfmt.
+
+## Round 16: one file per window (task 14)
+
+`src/ui.rs` was 2,000 lines. Settings, All Sessions, Diagnostics and the first-run window are each a file under `src/ui/` holding the window's struct, its builder and its render; `ui.rs` (960 lines) keeps `Ui`, `render`, `perform` and the menu. Verified as round 7 was: the same code lines, and the debug build launched against a throwaway home. The four windows were then opened in the installed build.
+
+## Round 17: one answer to "what is this Sidebar folder" (task 15)
+
+Whether a folder is a Profile's own, the same Login in another Organization, an account switch's leftover or a Discovered Profile's was worked out separately for the menu, for All Sessions and for Sidebar sync. All three ask `profiles::SidebarKinds`, which replaces round 11's `PersonalOrganizations`. Behaviour is unchanged: the leftover rule still comes first.
+
+The Guided switch and the desktop's account don't apply the leftover rule. A test now pins what happens: an entry Claude writes in a leftover folder of the target's account reads as "another Profile". Whether it should is decision D4.
+
+## Round 18: who goes first, and a Sync now bug (task 17)
+
+Which of the Guided switch, Sidebar sync and Reopen Claude waits for which was spread over the tick, two command handlers and Settings. Three rules in `core/sidebar.rs` hold the whole order: `may_switch_desktop`, `may_reopen`, `may_sync`.
+
+Writing them down showed two gaps. Automatic sync waited while a Guided switch waited for Claude to sign in, because its copies in the target's folder would read as Claude signing in; "Sync now" did not wait. `sync_now_waits_while_a_switch_waits_so_its_copies_confirm_nothing` failed before the change. "Sync now" is now off in Settings while a sync must wait.
+
+The second gap came from the independent review of this round. "Switch Claude to X, then open…" in All Sessions started a Guided switch without asking whether Reopen Claude was under way, which the menu's switch does ask. With `may_sync` in place, such a switch would have sat at "Syncing sidebars into X…" with no sync running. It now asks `may_switch_desktop` like the menu's (`switch_then_open_does_not_start_while_claude_is_being_reopened` failed before).
+
+## Round 19: All Sessions' join, measured and left alone (task 18)
+
+`SessionIndex::sessions` joins the Transcripts and the Sidebar entries two or three times per input. The task said to measure first. With 1,400 Sessions and 5,600 Sidebar entries in a fake home (the owner's Mac has about 1,300 and 6,600), in a release build, one `Core::view` took 7 ms with the All Sessions window open or closed, and a menu open 9 ms. The machine was busy with other builds: a second run took 12 ms, and one taken at a load average near 85 took over 100 ms.
+
+7 to 12 ms per input is not slow enough to earn a cache with its own invalidation, so the join stays as it is. The probe was a temporary ignored test and is not kept.
+
 ## Where it stands
 
-- The gate is green on the branch: format, lint, and 33 test binaries, eight of them architecture checks.
-- Not run here: the release dry run (`scripts/release.sh --dry-run`); the hosted workflow runs it on a pull request.
-- Not checked by any test: the AppKit layer beyond launching (round 7).
-- Persisted files, settings and the menu's wording are unchanged. The edge-case differences are listed in ADR 0006.
+- The gate is green on the branch: format, lint, and 33 test binaries (397 tests), nine of them architecture checks.
+- Open: task 8, which waits on decision D1. Decisions D1 to D4 are in `TASKS.md`.
+- Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
+- Persisted files and settings are unchanged. What the user can see changed in one place: "Sync now" is off while a Guided switch waits or Claude restarts.

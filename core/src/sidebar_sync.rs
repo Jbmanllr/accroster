@@ -49,7 +49,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, Read as _};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -63,7 +62,8 @@ use crate::claude_files::{self, ClaudePaths, MAX_ENTRY_BYTES};
 use crate::desktop_account;
 use crate::env::Environment;
 use crate::interface::Effect;
-use crate::profiles::PersonalOrganizations;
+use crate::profiles::{SidebarKind, SidebarKinds};
+use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// Fields a copy clears: they tie an entry to one account's connectors and
@@ -302,28 +302,6 @@ impl EntryCache {
     }
 }
 
-/// A file as `stat` sees it. Claude and sync replace an entry by renaming
-/// a new file over it, which changes the inode; the change time also
-/// catches an edit in place whose modification time was put back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Stamp {
-    inode: u64,
-    len: u64,
-    modified: SystemTime,
-    changed: (i64, i64),
-}
-
-impl Stamp {
-    pub(crate) fn of(meta: &fs::Metadata) -> Option<Stamp> {
-        Some(Stamp {
-            inode: meta.ino(),
-            len: meta.len(),
-            modified: meta.modified().ok()?,
-            changed: (meta.ctime(), meta.ctime_nsec()),
-        })
-    }
-}
-
 /// Everything under `claude-code-sessions/`, plus what the checks found.
 struct Read {
     folders: Vec<Folder>,
@@ -540,14 +518,14 @@ pub(crate) enum Begun {
 /// With `include_optional` ("Include SSH and No-folder Sessions", the
 /// default), SSH and No-folder Sessions are copied too; WSL and
 /// scheduled-task Sessions never are. `cache` holds the entries as of the
-/// last run; this one parses only those changed since. `personal` tells
-/// which folders are an account switch's leftovers: read for their Sessions
-/// but never written into.
+/// last run; this one parses only those changed since. `kinds` tells which
+/// folders are an account switch's leftovers: read for their Sessions but
+/// never written into.
 pub(crate) fn begin(
     env: &Environment,
     paths: &AppPaths,
     include_optional: bool,
-    personal: &PersonalOrganizations,
+    kinds: &SidebarKinds,
     cache: &mut EntryCache,
 ) -> Begun {
     let desktop_paths = ClaudePaths::new(&env.home);
@@ -574,7 +552,7 @@ pub(crate) fn begin(
 
     let leftover = |folder: &Folder| {
         let organization = folder.key.split('/').nth(1).unwrap_or_default();
-        personal.is_leftover(&folder.account, organization)
+        kinds.of_folder(&folder.account, organization) == SidebarKind::Leftover
     };
 
     let (writes, decided, held) = plan(&read, &record, active, &add_only, &leftover);
@@ -718,7 +696,7 @@ impl SyncRun {
             };
             if written.is_ok() {
                 if let Some(stamp) = date_copy(&file, &bytes, write.modified) {
-                    let entry = Entry::new(&bytes, &body, stamp.modified);
+                    let entry = Entry::new(&bytes, &body, stamp.modified());
                     cache.0.insert(file, (stamp, Some(Arc::new(entry))));
                 }
                 copies.insert(write.name.clone(), copy_record(&body));
@@ -1168,7 +1146,7 @@ fn read_folder(
                 parse_body(&bytes)
                     // A copy under another name would be a second entry in Claude.
                     .filter(|body| body.get("sessionId").and_then(Value::as_str) == Some(stem))
-                    .map(|body| Arc::new(Entry::new(&bytes, &body, stamp.modified)))
+                    .map(|body| Arc::new(Entry::new(&bytes, &body, stamp.modified())))
             }
         };
         cache.0.insert(path, (stamp, summary.clone()));

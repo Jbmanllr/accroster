@@ -20,7 +20,7 @@ use crate::interface::{ClaudeVersions, SafetyFeature};
 use crate::live_processes;
 use crate::profiles::{Account, CrossCheckAnswer};
 use crate::safety::{Finding, claude_code_name, reportable};
-use crate::sidebar_sync::Stamp;
+use crate::stamp::Stamp;
 
 /// `oauthAccount` and `cachedUsageUtilization` in each Profile's
 /// `.claude.json`. A malformed `oauthAccount` pauses CLI switching (the app

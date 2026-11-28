@@ -32,6 +32,32 @@ pub(super) struct SyncResult {
     at: Timestamp,
 }
 
+/// Who goes first. The Guided switch, Sidebar sync and Reopen Claude all act
+/// on the desktop app and its Sidebar folders, so each may start only when
+/// the other two leave it room. These three rules are the whole order: the
+/// commands, the tick and Settings ask them, and nothing else decides it.
+impl Core {
+    /// A Guided switch may start unless Reopen Claude is under way: one
+    /// thing at a time with Claude.
+    pub(super) fn may_switch_desktop(&self) -> bool {
+        !self.reopen.active()
+    }
+
+    /// Reopen Claude may start unless a Guided switch has Claude's
+    /// attention.
+    pub(super) fn may_reopen(&self) -> bool {
+        !self.desktop.active()
+    }
+
+    /// A sync may start (Sync now, Automatic, or the one a Guided switch
+    /// begins with) unless a Guided switch waits for Claude to sign in,
+    /// when copies would look like Claude writing the target's folder, or
+    /// Claude is being quit or opened.
+    pub(super) fn may_sync(&self) -> bool {
+        !self.desktop.waiting() && !self.reopen.restarting()
+    }
+}
+
 impl Core {
     /// The Sidebar sync mode in Settings. Turning sync on checks the Sidebar
     /// entries first, so a changed format pauses it before any write.
@@ -64,9 +90,14 @@ impl Core {
 
     /// "Sync now" (or Automatic mode, or a Guided switch): checks the
     /// Sidebar entries again, plans the run and starts it (ADR 0003).
-    /// Returns how it ended when it ended at once.
+    /// Returns how it ended when it ended at once. Nothing starts while
+    /// sync is off, a run is under way, or sync must wait
+    /// ([`Core::may_sync`]).
     pub(super) fn sync_sidebar(&mut self) -> Option<Run> {
-        if self.settings.sidebar_sync == SidebarSyncMode::Off || self.sync.is_some() {
+        if self.settings.sidebar_sync == SidebarSyncMode::Off
+            || self.sync.is_some()
+            || !self.may_sync()
+        {
             return None;
         }
         self.sidebar_watch.ran();
@@ -79,12 +110,12 @@ impl Core {
             self.show_result(StatusTone::Failed);
             return Some(Run::Paused);
         }
-        let personal = self.profiles.personal_organizations();
+        let kinds = self.profiles.sidebar_kinds();
         match sidebar_sync::begin(
             &self.env,
             &self.paths,
             !self.settings.leave_out_ssh_and_no_folder_sessions,
-            &personal,
+            &kinds,
             &mut self.sidebar_entries,
         ) {
             Begun::Ended(run) => {
@@ -134,10 +165,14 @@ impl Core {
         }
     }
 
-    /// Whether "Reopen Claude" is offered: not while a Guided switch has
-    /// Claude's attention.
+    /// Whether "Reopen Claude" is offered ([`Core::may_reopen`]).
     pub(super) fn reopen_offered(&self) -> bool {
-        self.reopen.offered() && !self.desktop.active()
+        self.reopen.offered() && self.may_reopen()
+    }
+
+    /// Whether "Sync now" is offered: sync is on and may start now.
+    pub(super) fn sync_now_offered(&self) -> bool {
+        self.settings.sidebar_sync != SidebarSyncMode::Off && self.may_sync()
     }
 
     /// The menu's sync status line, while a run is under way (unless a

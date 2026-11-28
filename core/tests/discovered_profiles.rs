@@ -456,11 +456,11 @@ fn another_organization_of_a_signed_in_account_is_not_discovered() {
 }
 
 /// Opening the menu must stay cheap with thousands of entries: a Sidebar
-/// folder whose listing didn't change isn't read again, and a changed folder
-/// reads only its new or rewritten entries. (Claude writes entries
-/// temp-file-then-rename, so every write changes its folder.)
+/// folder whose listing didn't change isn't read again. (Claude writes
+/// entries temp-file-then-rename, so every write changes its folder; which
+/// entries of a changed folder are read is `discovered`'s own unit test.)
 #[test]
-fn a_menu_open_reads_only_the_sidebar_entries_that_changed() {
+fn a_menu_open_reads_no_entry_of_a_sidebar_folder_that_did_not_change() {
     use std::os::unix::fs::PermissionsExt;
     let mac = mac_without_cli_login();
     let old = mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "a", &entry(OCT_23));
@@ -470,10 +470,10 @@ fn a_menu_open_reads_only_the_sidebar_entries_that_changed() {
 
     core.event(Event::MenuOpened);
     let unchanged = discovered(&core);
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
     mac.write_sidebar_entry(WORK_ACCOUNT, WORK_ORG, "b", &entry(OCT_24));
     core.event(Event::MenuOpened);
     let changed = discovered(&core);
-    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     assert_eq!(
         unchanged[0].subtitle.as_deref(),
