@@ -825,7 +825,7 @@ fn a_folder_of_another_account_is_flagged_as_a_mismatch() {
     );
 }
 
-/// What happens today, pinned so a change is a decision (D4 in
+/// What happens today, pinned until issue #85 changes it (see
 /// `docs/architecture/TASKS.md`): the Guided switch doesn't know leftover
 /// folders. An entry Claude writes in the target's account's folder in
 /// another Profile's personal Organization reads as another Profile, though

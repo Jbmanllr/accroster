@@ -114,7 +114,7 @@ Not done as the task said: no test counts the reads of `config.json`. The files 
 
 Whether a folder is a Profile's own, the same Login in another Organization, an account switch's leftover or a Discovered Profile's was worked out separately for the menu, for All Sessions and for Sidebar sync. All three ask `profiles::SidebarKinds`, which replaces round 11's `PersonalOrganizations`. Behaviour is unchanged: the leftover rule still comes first.
 
-The Guided switch and the desktop's account don't apply the leftover rule. A test now pins what happens: an entry Claude writes in a leftover folder of the target's account reads as "another Profile". Whether it should is decision D4.
+The Guided switch and the desktop's account don't apply the leftover rule. A test now pins what happens: an entry Claude writes in a leftover folder of the target's account reads as "another Profile". It should not: issue #85 changes it.
 
 ## Round 18: who goes first, and a Sync now bug (task 17)
 
@@ -133,6 +133,6 @@ The second gap came from the independent review of this round. "Switch Claude to
 ## Where it stands
 
 - The gate is green on the branch: format, lint, and 33 test binaries (397 tests), nine of them architecture checks.
-- Open: task 8, which waits on decision D1. Decisions D1 to D4 are in `TASKS.md`.
+- Open: issues #84 (one rule for an entry's kind, was task 8) and #85 (leftover folders and the Guided switch). `TASKS.md` lists them with the questions already answered.
 - Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
 - Persisted files and settings are unchanged. What the user can see changed in one place: "Sync now" is off while a Guided switch waits or Claude restarts.
