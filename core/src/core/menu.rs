@@ -2,8 +2,10 @@
 //! Profile rows, the Discovered rows and the fixed items. [`Core::view`]
 //! puts them in order.
 //!
-//! Each client's Active Profile is read once per menu and once per tick
-//! ([`ActiveProfiles`]) and passed down, so every part agrees on it.
+//! Each client's Active Profile is read once for the menu and once for a
+//! Limit monitor step ([`ActiveProfiles`]) and passed down, so the parts of
+//! one menu agree on it. The All Sessions detail and Sidebar sync's watch
+//! still read the desktop's account themselves.
 
 use std::path::PathBuf;
 

@@ -82,13 +82,13 @@ Behaviour unchanged; `a_leftover_folder_in_another_profiles_personal_organizatio
 
 This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates are in `TASKS.md`: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
 
-Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 18 take the task pool's open tasks.
+Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 19 take the task pool's open tasks.
 
 ## Round 12: one file stamp (task 9)
 
 The Session index, the Discovered Profiles, Sidebar sync and the self-check each defined "this file changed since I read it": size and modification time; size and an optional modification time; inode, size, modification and change time. They share `stamp::Stamp`, the strictest of the three, which Sidebar sync needs (ADR 0003). The Session index still saves a Transcript's size and modification time in `index/sessions.json`, taken from the stamp.
 
-One difference: the Discovered Profiles and Session index caches now also read an entry again when only its inode or change time differs. A test of the Discovered cache relied on the old rule (it made an entry unreadable with `chmod`, which changes the change time); what it proved is now `a_listing_reads_only_new_and_rewritten_entries` in `discovered.rs`, and the integration test keeps the folder-level half.
+Two differences. The Discovered Profiles and Session index caches now also read an entry again when only its inode or change time differs. And a file whose modification time the file system can't give is skipped, where the Session index used to record 0 and the Discovered scan compared sizes only; macOS always gives one. A test of the Discovered cache relied on the old rule (it made an entry unreadable with `chmod`, which changes the change time); what it proved is now `a_listing_reads_only_new_and_rewritten_entries` in `discovered.rs`, and the integration test keeps the folder-level half.
 
 ## Round 13: time wording in one module (task 11)
 
@@ -98,7 +98,7 @@ The clock time, a coming day ("today", "Thu", "Nov 3"), the countdown to a reset
 
 `Core::view` was one 160-line function. Its parts are functions in `core/menu.rs`: `status_lines`, `listed_profiles`, `default_login_part`, `add_desktop_items`, `header_line`, `discovered_parts` and `fixed_menu_items`; `view` puts them in order.
 
-The CLI's pointer and the desktop app's account were read five to seven times per tick. `ActiveProfiles` holds both as read once; one view and one monitor step read it once and pass it down, and `cli_switcher::present` takes the pointer instead of reading it again. Per tick the files are now read three times: once each for the monitor step, the view and the tick interval.
+The CLI's pointer and the desktop app's account were read five to seven times per tick. `ActiveProfiles` holds both as read once; one view and one monitor step read it once and pass it down, and `cli_switcher::present` takes the pointer instead of reading it again. For the menu and the Limit monitor that is three reads per tick: once each for the monitor step, the view and the tick interval. Two readers are left as they were: the All Sessions detail of a selected Session, and Sidebar sync's watch, which reads the desktop's account on every tick while sync is on.
 
 Not done as the task said: no test counts the reads of `config.json`. The files are read with `std::fs`, so counting would need a seam that exists only for the test. The existing menu tests cover the behaviour.
 
@@ -120,7 +120,9 @@ The Guided switch and the desktop's account don't apply the leftover rule. A tes
 
 Which of the Guided switch, Sidebar sync and Reopen Claude waits for which was spread over the tick, two command handlers and Settings. Three rules in `core/sidebar.rs` hold the whole order: `may_switch_desktop`, `may_reopen`, `may_sync`.
 
-Writing them down showed a gap. Automatic sync waited while a Guided switch waited for Claude to sign in, because its copies in the target's folder would read as Claude signing in; "Sync now" did not wait. `sync_now_waits_while_a_switch_waits_so_its_copies_confirm_nothing` failed before the change. "Sync now" is now off in Settings while a sync must wait.
+Writing them down showed two gaps. Automatic sync waited while a Guided switch waited for Claude to sign in, because its copies in the target's folder would read as Claude signing in; "Sync now" did not wait. `sync_now_waits_while_a_switch_waits_so_its_copies_confirm_nothing` failed before the change. "Sync now" is now off in Settings while a sync must wait.
+
+The second gap came from the independent review of this round. "Switch Claude to X, then open…" in All Sessions started a Guided switch without asking whether Reopen Claude was under way, which the menu's switch does ask. With `may_sync` in place, such a switch would have sat at "Syncing sidebars into X…" with no sync running. It now asks `may_switch_desktop` like the menu's (`switch_then_open_does_not_start_while_claude_is_being_reopened` failed before).
 
 ## Round 19: All Sessions' join, measured and left alone (task 18)
 
@@ -130,7 +132,7 @@ Writing them down showed a gap. Automatic sync waited while a Guided switch wait
 
 ## Where it stands
 
-- The gate is green on the branch: format, lint, and 33 test binaries (396 tests), nine of them architecture checks.
+- The gate is green on the branch: format, lint, and 33 test binaries (397 tests), nine of them architecture checks.
 - Open: task 8, which waits on decision D1. Decisions D1 to D4 are in `TASKS.md`.
 - Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
 - Persisted files and settings are unchanged. What the user can see changed in one place: "Sync now" is off while a Guided switch waits or Claude restarts.

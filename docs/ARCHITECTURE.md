@@ -36,7 +36,7 @@ They know none of the app's features.
 |---|---|
 | `interface` | The contract with the UI: `Command`, `Event`, `Effect`, `View` and its parts. |
 | `claude_files` | Where Claude Code and the desktop app keep their files, and how they name them. Lists folders; reads no file's contents. |
-| `stamp` | `Stamp`: a file as `stat` sees it, the one answer to "has this file changed since I read it" for every cache of Claude's files. |
+| `stamp` | `Stamp`: a file as `stat` sees it, the one answer to "has this file changed since I read it" for the caches of Sidebar entries and live-process files. A Transcript is compared by the size and modification time the Session index saved, taken from its stamp. |
 | `storage` | The app's own folder (`AppPaths`) and the one way a file is written: temp file, then rename. Versioned JSON files. |
 | `env` | The boundary with the rest of the Mac: home folder, inherited variables, spawning, the clock, OS facts, the login item. |
 | `logging` | `app.log`: redacted when written, rotated. The panic hook. |
@@ -94,7 +94,7 @@ Each owns its state, and its file under `state/` when it keeps one.
 
 | Module | Owns |
 |---|---|
-| `core` | `Core`: composes the features, handles every `Command` and `Event`, builds the `View`. Its submodules are what spans several features: `core/menu.rs` (the menu's parts, and each client's Active Profile read once per input), `cli.rs`, `open.rs`, `self_check.rs`, `sidebar.rs` (Sidebar sync as the core runs it, and which of the Guided switch, Sidebar sync and Reopen Claude may start), `uninstaller.rs`. |
+| `core` | `Core`: composes the features, handles every `Command` and `Event`, builds the `View`. Its submodules are what spans several features: `core/menu.rs` (the menu's parts, and each client's Active Profile read once for a menu or a Limit monitor step), `cli.rs`, `open.rs`, `self_check.rs`, `sidebar.rs` (Sidebar sync as the core runs it, and which of the Guided switch, Sidebar sync and Reopen Claude may start), `uninstaller.rs`. |
 | `driver` | The core's thread and its ticks. |
 | `watcher` | The real FSEvents watch behind the watch effects. |
 

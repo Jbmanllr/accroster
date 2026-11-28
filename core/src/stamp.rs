@@ -1,6 +1,8 @@
 //! A file as `stat` sees it: the one answer to "has this file changed since
-//! I read it" for every cache of Claude's files (the Session index, the
-//! Discovered Profiles, Sidebar sync and the self-check).
+//! I read it" for the caches of Claude's small files (Sidebar entries and
+//! live-process files in the Session index, the Discovered Profiles, Sidebar
+//! sync and the self-check). A Transcript is compared by the size and
+//! modification time the Session index saved, both taken from its stamp.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;

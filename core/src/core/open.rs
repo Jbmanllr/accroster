@@ -190,13 +190,17 @@ impl Core {
         effects
     }
 
-    /// "Switch Claude to <Profile>, then open…": a Guided switch that opens
-    /// the Profile's entry once confirmed.
+    /// "Switch Claude to `Profile`, then open…": a Guided switch that opens
+    /// the Profile's entry once confirmed. Like the menu's switch, it starts
+    /// only when it may ([`Core::may_switch_desktop`]).
     pub(super) fn switch_claude_then_open(
         &mut self,
         profile_id: &str,
         session: &str,
     ) -> Vec<Effect> {
+        if !self.may_switch_desktop() {
+            return Vec::new();
+        }
         let Some(facts) = self.sessions.facts(session) else {
             return Vec::new();
         };

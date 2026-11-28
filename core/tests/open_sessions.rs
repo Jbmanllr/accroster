@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use accroster_core::{
     Command, Core, Effect, Event, MenuItem, NicknameTarget, OpenChoice, ProfileKey, SessionDetail,
-    SessionFilter,
+    SessionFilter, SidebarSyncMode,
 };
 use accroster_fake_mac::{FakeMac, FixtureLogin, Reply, StubCall};
 use common::*;
@@ -567,6 +567,46 @@ fn switch_then_open_runs_the_guided_switch_and_opens_the_entry_once_confirmed() 
         )),
         "{effects:?}"
     );
+}
+
+/// One thing at a time with Claude: like the menu's switch, this one doesn't
+/// start while Reopen Claude quits and opens it. (It used to start, and its
+/// first sync then had to wait for the reopen with nothing to end it.)
+#[test]
+fn switch_then_open_does_not_start_while_claude_is_being_reopened() {
+    let (mac, mut core) = mac_with_two_profiles();
+    desktop_signed_in_as(&mac, &work());
+    mac.os.set_desktop_app_running(true);
+    entry(&mac, &work(), "other", S2, false);
+    entry(&mac, &FixtureLogin::perso(), "p1", S1, false);
+    transcript(&mac, S1, "Fix the login bug", "claude-desktop");
+    transcript(&mac, S2, "Other work", "claude-desktop");
+    select(&mut core, S1);
+    // A sync adds Perso's Session to the sidebar Claude has open, so Reopen
+    // Claude is offered; the user takes it.
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+    core.command(Command::SyncSidebarNow);
+    for _ in 0..5 {
+        core.event(Event::Tick);
+    }
+    assert_eq!(
+        core.command(Command::ReopenDesktopApp),
+        [Effect::QuitDesktopApp]
+    );
+
+    let effects = core.command(Command::SwitchClaudeThenOpen {
+        profile: profile_id(&core, 0),
+        session: S1.into(),
+    });
+
+    assert_eq!(effects, []);
+    let statuses: Vec<String> = (core.view().menu.items.iter())
+        .filter_map(|item| match item {
+            MenuItem::Status { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, ["Reopening Claude…"]);
 }
 
 #[test]

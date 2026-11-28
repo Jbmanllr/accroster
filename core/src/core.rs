@@ -619,7 +619,7 @@ impl Core {
                 // The user's click confirms the first write after a pause
                 // from the Sidebar entries check, as Resume does; the pause
                 // stays while that check fails (ADR 0004).
-                if self.sidebar_entries_paused_sync() {
+                if self.may_sync() && self.sidebar_entries_paused_sync() {
                     self.resume(SafetyFeature::SidebarSync);
                 }
                 self.sync_sidebar();
