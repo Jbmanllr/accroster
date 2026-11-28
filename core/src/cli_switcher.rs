@@ -148,15 +148,21 @@ pub(crate) enum Hold {
 
 /// Adds CLI switching to the listed Profiles' rows (the `CLI` badge, the row
 /// click, "Use for new CLI runs" and "Copy shell override"), and says what
-/// the menu bar and the header show. Under a `hold`, rows don't switch and
-/// the menu bar shows `?`; while checking, the header says so.
-pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -> CliMenu {
+/// the menu bar and the header show. `pointer` is the folder the pointer
+/// names, as the caller read it. Under a `hold`, rows don't switch and the
+/// menu bar shows `?`; while checking, the header says so.
+pub(crate) fn present(
+    paths: &AppPaths,
+    pointer: Option<&Path>,
+    listed: &mut [Listed<'_>],
+    hold: Hold,
+) -> CliMenu {
     let paused = hold != Hold::Free;
     let on = is_on(paths);
-    let pointer = if on { pointer(paths) } else { None };
+    let pointer = pointer.filter(|_| on);
     let mut active = None;
     for profile in listed.iter_mut() {
-        let is_active = pointer.as_deref() == Some(profile.config_dir);
+        let is_active = pointer == Some(profile.config_dir);
         let row = &mut profile.row;
         let mut items = Vec::new();
         // A signed-out Profile offers nothing to run `claude` with.
@@ -184,7 +190,7 @@ pub(crate) fn present(paths: &AppPaths, listed: &mut [Listed<'_>], hold: Hold) -
     }
     if let Some(index) = listed
         .iter()
-        .position(|profile| pointer.as_deref() == Some(profile.config_dir))
+        .position(|profile| pointer == Some(profile.config_dir))
     {
         ask_next_cli_on_removal(listed, index);
     }
