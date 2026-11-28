@@ -1,6 +1,8 @@
 # Architecture progress
 
-What each round changed, why, and how it was verified. Newest last. Open work is in `TASKS.md`; the target is `docs/ARCHITECTURE.md`.
+What each round changed, why, and how it was verified. Newest last. The target is `docs/ARCHITECTURE.md`.
+
+This log is closed after round 21 (2026-11-28): no rounds are added. Later architecture work is a GitHub issue labelled `ready-for-agent`, and its record is that issue's pull request. Parallel tickets each appending a round here conflicted with one another.
 
 Every round ended with the same gate green on the worktree: `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`.
 
@@ -80,7 +82,7 @@ A Sidebar folder that pairs an account with another Profile's personal Organizat
 
 Behaviour unchanged; `a_leftover_folder_in_another_profiles_personal_organization_is_read_but_never_written` and `a_profiles_sidebars_in_other_organizations_follow_it_and_leftovers_are_hidden` cover both uses.
 
-This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates are in `TASKS.md`: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
+This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates went into the task pool: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
 
 Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 20 take the task pool's open tasks.
 
@@ -147,6 +149,6 @@ Leaving leftovers out of the desktop's folder showed a third place: Sidebar sync
 ## Where it stands
 
 - The gate is green on the branch: format, lint, and 33 test binaries (400 tests), nine of them architecture checks.
-- Open: nothing in `TASKS.md`; it keeps the questions already answered.
+- Open: nothing. The questions left were answered: D2 in `docs/TESTING.md` (no automated AppKit tests for now), D3 in ADR 0006 (one core crate, layers checked by a test).
 - Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
 - Persisted files and settings are unchanged. What the user can see changed in three places: "Sync now" is off while a Guided switch waits or Claude restarts, All Sessions leaves out an entry whose `originCwd` is a scratch workspace (round 20; none on the owner's Mac), and a leftover folder no longer decides the desktop's Profile or a Guided switch's outcome (round 21; not seen on the owner's Mac).

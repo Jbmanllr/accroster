@@ -31,7 +31,7 @@ None: every event runs every check. T1 takes about 4 minutes and T2 about 10, bo
 ## Wiring
 
 - `check` runs cheapest first and stops at the first failure; `release-dry-run` waits for it, so a lint failure never pays for a release build.
-- `gate` is the single result to require: it fails when either job failed or was cancelled. `main` has no branch protection yet; when it gets some, require `gate` only.
+- `gate` is the single result to require: it fails when either job failed or was cancelled. `main` requires it (branch protection since 2026-11-28; admins can still bypass), and auto-merge is on, so merge with `gh pr merge --auto --merge` instead of watching the run.
 - A newer push to a pull request cancels its older run; `main`'s runs finish.
 - Only `main` writes the build caches pull requests read.
 

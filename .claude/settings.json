@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/sync-main-checkout.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
