@@ -221,6 +221,27 @@ fn the_same_login_in_two_organizations_is_told_apart_by_the_folder_written_last(
 }
 
 #[test]
+fn a_leftover_folder_written_last_does_not_hide_the_desktops_profile() {
+    let (mac, core) = mac_with_two_profiles();
+    desktop_signed_in_as(&mac, &work());
+    sidebar_entry(&mac, &work(), "a", "Old", Duration::from_secs(3600));
+    sidebar_entry(
+        &mac,
+        &work_leftover_in_persos_organization(),
+        "l",
+        "Left behind",
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(
+        header(&core).as_deref(),
+        Some("CLI: me@example.com (default login)    Desktop: me · Work Inc"),
+        "the newest folder that is not a leftover"
+    );
+    assert_eq!(row(&rows(&core), WORK).badges, [Badge::Desktop]);
+}
+
+#[test]
 fn the_desktop_config_is_read_for_its_account_only_and_never_logged() {
     let (mac, core) = mac_with_two_profiles();
     desktop_signed_in_as(&mac, &FixtureLogin::perso());
@@ -825,37 +846,51 @@ fn a_folder_of_another_account_is_flagged_as_a_mismatch() {
     );
 }
 
-/// What happens today, pinned until issue #85 changes it (see
-/// `docs/architecture/TASKS.md`): the Guided switch doesn't know leftover
-/// folders. An entry Claude writes in the target's account's folder in
-/// another Profile's personal Organization reads as another Profile, though
-/// the account is the target's. On the owner's Mac such folders held no
-/// Session of their own (ADR 0003), so this has not been seen.
-#[test]
-fn an_entry_in_a_leftover_folder_of_the_targets_account_is_flagged_as_a_mismatch() {
-    let (mac, mut core, _) = switch_started();
-    let perso = FixtureLogin::perso();
-    let leftover = FixtureLogin::new(
+/// Work's Sidebar folder in perso's personal Organization: a leftover of an
+/// account switch, which Claude lets no one else join (ADR 0003).
+fn work_leftover_in_persos_organization() -> FixtureLogin {
+    FixtureLogin::new(
         &work().account_uuid,
-        &perso.organization_uuid,
+        &FixtureLogin::perso().organization_uuid,
         "me@work.example",
         "me@example.com's Organization",
-    );
-    desktop_signed_in_as(&mac, &work());
-    sidebar_entry(&mac, &leftover, "l", "Left behind", Duration::ZERO);
+    )
+}
 
+/// A leftover folder says nothing about the Profile Claude uses: an entry
+/// written there neither confirms nor contradicts the switch, which keeps
+/// waiting for the target's folder (ADR 0003, leftovers amendment).
+#[test]
+fn an_entry_in_a_leftover_folder_of_the_targets_account_neither_confirms_nor_contradicts() {
+    let (mac, mut core, _) = switch_started();
+    desktop_signed_in_as(&mac, &work());
+    sidebar_entry(
+        &mac,
+        &work_leftover_in_persos_organization(),
+        "l",
+        "Left behind",
+        Duration::ZERO,
+    );
+
+    assert!(
+        core.event(Event::Tick).is_empty(),
+        "no mismatch notification"
+    );
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}")),
+        "still waiting"
+    );
+
+    sidebar_entry(&mac, &work(), "n", "New one", Duration::ZERO);
     let effects = core.event(Event::Tick);
 
     assert_eq!(
         effects,
         [Effect::Notify {
-            title: "Claude signed in to another Profile".into(),
-            body: format!("Claude signed in as another Profile, not {WORK}"),
+            title: "Claude switched".into(),
+            body: format!("Claude now uses {WORK}"),
         }]
-    );
-    assert_eq!(
-        header(&core).as_deref(),
-        Some("CLI: me@example.com (default login)    Desktop: another Profile")
     );
 }
 

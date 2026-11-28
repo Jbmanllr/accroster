@@ -11,9 +11,9 @@
 //!   next to them are never opened.
 //! - **Guided switch:** guard, then (the core) sync the sidebars, then bring
 //!   Claude forward with "Sign out in Claude, then sign in as …", then
-//!   confirm from the Sidebar folder Claude writes (or `main.log`). Each
-//!   step is one status line at the top of the menu, and each outcome a
-//!   notification.
+//!   confirm from the Sidebar folder Claude writes, leftovers left out (or
+//!   `main.log`). Each step is one status line at the top of the menu, and
+//!   each outcome a notification.
 //! - **Reopen Claude:** offered after a sync added entries to the sidebar
 //!   Claude is using while it runs (Claude reads it only at launch). Guard,
 //!   wait while busy, then quit Claude and open it again.
@@ -35,7 +35,7 @@ use crate::env::Environment;
 use crate::interface::{Command, Effect, MenuItem, ProfileKey, StatusTone};
 use crate::live_processes::{self, LiveProcess};
 use crate::logging::{Field, Level};
-use crate::profiles::SignedInProfile;
+use crate::profiles::{SidebarKind, SidebarKinds, SignedInProfile};
 
 /// A Guided switch still unconfirmed after this long is given up.
 const CONFIRM_TIMEOUT: SignedDuration = SignedDuration::from_mins(30);
@@ -362,11 +362,13 @@ impl DesktopBridge {
     /// Time passed: looks again when the guard couldn't tell, re-checks a
     /// blocked switch the user wants to hear about, and looks for the
     /// account a guided Claude signed in to. Returns the effects and the
-    /// target once the guard lets it through.
+    /// target once the guard lets it through. `kinds` tells which Sidebar
+    /// folders are leftovers, which confirm nothing.
     pub(crate) fn poll(
         &mut self,
         ctx: &Context,
         profiles: &[SignedInProfile],
+        kinds: &SidebarKinds,
     ) -> (Vec<Effect>, Option<Target>) {
         let paths = ClaudePaths::new(&ctx.env.home);
         let now = ctx.env.clock.now();
@@ -416,7 +418,14 @@ impl DesktopBridge {
                 before,
                 log_offset,
             }) => {
-                let outcome = confirmation(&paths, target, previous.as_ref(), before, *log_offset);
+                let outcome = confirmation(
+                    &paths,
+                    kinds,
+                    target,
+                    previous.as_ref(),
+                    before,
+                    *log_offset,
+                );
                 let timed_out = now.duration_since(*started_at) >= CONFIRM_TIMEOUT;
                 let target = target.clone();
                 (self.finish(ctx, target, outcome, timed_out, profiles), None)
@@ -529,9 +538,14 @@ impl DesktopBridge {
     /// Brings Claude forward with the instruction and starts watching for
     /// the result. Claude is never quit: the user signs out and in. The
     /// snapshot it confirms from is taken here, after any pre-switch sync.
-    pub(crate) fn guide(&mut self, ctx: &Context, target: Target) -> Vec<Effect> {
+    pub(crate) fn guide(
+        &mut self,
+        ctx: &Context,
+        target: Target,
+        kinds: &SidebarKinds,
+    ) -> Vec<Effect> {
         let paths = ClaudePaths::new(&ctx.env.home);
-        let previous = desktop_account(&paths).and_then(|account| {
+        let previous = desktop_account(&paths, kinds).and_then(|account| {
             account
                 .organization_uuid
                 .map(|organization_uuid| ProfileKey {
@@ -652,14 +666,20 @@ enum Outcome {
 /// folder other than the one it used before. Without one, a sign-in line in
 /// `main.log` plus `lastKnownAccountUuid` can still tell a different account,
 /// and confirm the target when its account has no other Organization folder.
+/// Leftover folders (`kinds`) count for nothing: an entry written there
+/// neither confirms nor contradicts (ADR 0003).
 fn confirmation(
     paths: &ClaudePaths,
+    kinds: &SidebarKinds,
     target: &Target,
     previous: Option<&Folder>,
     before: &Snapshot,
     log_offset: u64,
 ) -> Option<Outcome> {
-    let now = snapshot(paths);
+    let now: Snapshot = snapshot(paths)
+        .into_iter()
+        .filter(|(folder, _)| kinds.of(folder) != SidebarKind::Leftover)
+        .collect();
     let mut written: Vec<(SystemTime, &Folder)> = now
         .iter()
         .filter(|(folder, _)| Some(*folder) != previous)
@@ -686,7 +706,7 @@ fn confirmation(
     if !desktop_account::log_signed_in_since(&paths.desktop_main_log(), log_offset) {
         return None;
     }
-    let account = desktop_account(paths)?;
+    let account = desktop_account(paths, kinds)?;
     if account.account_uuid != target.key.account_uuid {
         return Some(Outcome::Other(DesktopAccount {
             organization_uuid: None,

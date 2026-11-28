@@ -5,7 +5,9 @@
 //!   `config.json`. That file also holds token caches, so only that one key
 //!   is ever deserialized, and the file is never logged.
 //! - **The Organization** isn't recorded anywhere: it is the
-//!   `claude-code-sessions/<account>/<org>/` folder the app wrote last.
+//!   `claude-code-sessions/<account>/<org>/` folder the app wrote last,
+//!   leaving out leftovers of an account switch, which say nothing about
+//!   the Profile it uses (ADR 0003).
 //! - **An account switch** shows as a sign-in line in `main.log`.
 
 use std::cell::RefCell;
@@ -19,7 +21,7 @@ use serde::Deserialize;
 
 use crate::claude_files::{self, ClaudePaths};
 use crate::interface::ProfileKey;
-use crate::profiles::SignedInProfile;
+use crate::profiles::{SidebarKind, SidebarKinds, SignedInProfile};
 
 /// What `main.log` says when Claude finishes signing in.
 const SIGNED_IN_LINE: &str = "Login-state transition (loggedOut: true → false";
@@ -28,7 +30,8 @@ const SIGNED_IN_LINE: &str = "Login-state transition (loggedOut: true → false"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DesktopAccount {
     pub account_uuid: String,
-    /// The Organization whose folder was written last, if any folder exists.
+    /// The Organization whose folder was written last, leftovers left out,
+    /// if any such folder exists.
     pub organization_uuid: Option<String>,
 }
 
@@ -89,9 +92,10 @@ pub(crate) fn last_known_account(paths: &ClaudePaths) -> Option<String> {
 }
 
 /// The desktop's account, or `None` when its `config.json` is missing,
-/// unreadable or names no account.
-pub(crate) fn desktop_account(paths: &ClaudePaths) -> Option<DesktopAccount> {
-    NewestEntries::default().desktop_account(paths)
+/// unreadable or names no account. `kinds` tells which of its folders are
+/// leftovers.
+pub(crate) fn desktop_account(paths: &ClaudePaths, kinds: &SidebarKinds) -> Option<DesktopAccount> {
+    NewestEntries::default().desktop_account(paths, kinds)
 }
 
 /// Each Sidebar folder's newest entry, remembered with the folder's mtime.
@@ -105,12 +109,17 @@ pub(crate) struct NewestEntries(RefCell<HashMap<PathBuf, (SystemTime, Option<Sys
 impl NewestEntries {
     /// [`desktop_account`], listing only the folders that changed since the
     /// last call.
-    pub(crate) fn desktop_account(&self, paths: &ClaudePaths) -> Option<DesktopAccount> {
+    pub(crate) fn desktop_account(
+        &self,
+        paths: &ClaudePaths,
+        kinds: &SidebarKinds,
+    ) -> Option<DesktopAccount> {
         let account_uuid = last_known_account(paths)?;
-        let organization_uuid =
-            newest_org_folder(&paths.sidebar_root().join(&account_uuid), |folder| {
-                self.newest_entry(folder)
-            });
+        let organization_uuid = newest_org_folder(
+            &paths.sidebar_root().join(&account_uuid),
+            |organization| kinds.of_folder(&account_uuid, organization) != SidebarKind::Leftover,
+            |folder| self.newest_entry(folder),
+        );
         Some(DesktopAccount {
             account_uuid,
             organization_uuid,
@@ -136,13 +145,15 @@ impl NewestEntries {
 }
 
 /// The Organization folder under an account folder holding the most recently
-/// written Sidebar entry, by `newest`.
+/// written Sidebar entry, by `newest`, among the Organizations `counts`.
 fn newest_org_folder(
     account_dir: &Path,
+    counts: impl Fn(&str) -> bool,
     newest: impl Fn(&Path) -> Option<SystemTime>,
 ) -> Option<String> {
     claude_files::uuid_folders(account_dir)
         .into_iter()
+        .filter(|(name, _)| counts(name))
         .filter_map(|(name, folder)| Some((newest(&folder)?, name)))
         .max()
         .map(|(_, name)| name)

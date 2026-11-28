@@ -136,9 +136,17 @@ The Session index (`EntryFile::skipped`) and Sidebar sync (`left_out`, with its 
 
 One difference, decided as D1: an entry whose `originCwd` is a scratch workspace and whose `cwd` is not is now a No-folder Session for the Session index too, so it is left out there; its Session keeps its row when its Transcript exists, with the Transcript's own title. `an_entry_whose_origin_is_a_scratch_workspace_is_skipped_and_a_null_marker_is_not_one` failed before the change. None of the 11,403 entries on the owner's Mac was in that case on 2026-11-28. The Session index now parses an entry as JSON before reading its fields, as sync already did.
 
+## Round 21: leftover folders count for nothing (issue #85, decision D4)
+
+The desktop's Organization and the Guided switch's confirmation took the Sidebar folder Claude wrote last, leftover or not, so round 17 pinned an entry in a leftover folder of the target's account reading as "another Profile". Decision D4 said leftover folders count for nothing in both places. `desktop_account` and `confirmation` now take `SidebarKinds` from their callers and leave leftover folders out; the rule itself is not written again. Every caller passes the same classifier: the menu and the open flows (through `Core::desktop_account`), All Sessions' title precedence, Sidebar sync's run and its watch, and the Guided switch.
+
+`an_entry_in_a_leftover_folder_of_the_targets_account_neither_confirms_nor_contradicts` replaces the pinning test and failed before the change: the switch notified a mismatch instead of waiting. `a_leftover_folder_written_last_does_not_hide_the_desktops_profile` failed too (the header read "Desktop: another Profile"). `a_folder_of_another_account_is_flagged_as_a_mismatch` passes unchanged.
+
+Leaving leftovers out of the desktop's folder showed a third place: Sidebar sync's watch counted an entry Claude writes outside its folder as the dormant multi-account mode, so a write in a leftover folder would now have paused sync. The watch skips leftover folders, which sync never writes. `an_entry_claude_writes_in_a_leftover_folder_does_not_pause_sync` failed with that skip taken out. ADR 0003 has an amendment.
+
 ## Where it stands
 
-- The gate is green on the branch: format, lint, and 33 test binaries (398 tests), nine of them architecture checks.
-- Open: issue #85 (leftover folders and the Guided switch). `TASKS.md` lists it with the questions already answered.
+- The gate is green on the branch: format, lint, and 33 test binaries (400 tests), nine of them architecture checks.
+- Open: nothing in `TASKS.md`; it keeps the questions already answered.
 - Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
-- Persisted files and settings are unchanged. What the user can see changed in two places: "Sync now" is off while a Guided switch waits or Claude restarts, and All Sessions leaves out an entry whose `originCwd` is a scratch workspace (round 20; none on the owner's Mac).
+- Persisted files and settings are unchanged. What the user can see changed in three places: "Sync now" is off while a Guided switch waits or Claude restarts, All Sessions leaves out an entry whose `originCwd` is a scratch workspace (round 20; none on the owner's Mac), and a leftover folder no longer decides the desktop's Profile or a Guided switch's outcome (round 21; not seen on the owner's Mac).

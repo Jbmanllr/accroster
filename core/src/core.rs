@@ -306,7 +306,8 @@ impl Core {
         core.monitor = LimitMonitor::load(&core.context());
         core.notifier = Notifier::load(&core.context());
         // Recent Sessions in the first menu: the index fills in by ticks.
-        core.sessions.warm_up(&core.env, &core.paths);
+        let kinds = core.profiles.sidebar_kinds();
+        core.sessions.warm_up(&core.env, &core.paths, &kinds);
         Ok(core)
     }
 
@@ -350,7 +351,8 @@ impl Core {
         }
         let mut effects = self.safety.take_effects();
         let sync_on = self.settings.sidebar_sync != SidebarSyncMode::Off;
-        effects.extend(self.sidebar_watch.reconcile(&self.env, sync_on));
+        let kinds = self.profiles.sidebar_kinds();
+        effects.extend(self.sidebar_watch.reconcile(&self.env, sync_on, &kinds));
         effects
     }
 
@@ -596,7 +598,8 @@ impl Core {
                 Vec::new()
             }
             Command::OpenAllSessions => {
-                let watch = self.sessions.open(&self.env, &self.paths);
+                let kinds = self.profiles.sidebar_kinds();
+                let watch = self.sessions.open(&self.env, &self.paths, &kinds);
                 let mut effects = vec![Effect::ShowAllSessions];
                 effects.extend(watch.map(Effect::WatchSessionFiles));
                 effects
@@ -709,12 +712,13 @@ impl Core {
                     self.settle();
                 }
                 let signed_in = self.profiles.signed_in();
+                let kinds = self.profiles.sidebar_kinds();
                 let (desktop, ctx) = self.desktop();
-                let (polled, cleared) = desktop.poll(&ctx, &signed_in);
+                let (polled, cleared) = desktop.poll(&ctx, &signed_in, &kinds);
                 effects.extend(polled);
                 effects.extend(self.guide_desktop_switch(cleared));
                 effects.extend(self.poll_reopen());
-                self.sidebar_watch.notice_switch(&self.env);
+                self.sidebar_watch.notice_switch(&self.env, &kinds);
                 // A due sync that must wait stays due.
                 if self.settings.sidebar_sync == SidebarSyncMode::Automatic
                     && self.may_sync()
@@ -740,7 +744,8 @@ impl Core {
                 // While the window is closed nothing is watched: a stat-only
                 // rescan keeps the index current.
                 if !self.sessions.window_open() {
-                    self.sessions.rescan(&self.env, &self.paths);
+                    let kinds = self.profiles.sidebar_kinds();
+                    self.sessions.rescan(&self.env, &self.paths, &kinds);
                 }
                 Vec::new()
             }
@@ -748,8 +753,9 @@ impl Core {
                 // A late batch after the window closed is left to the next
                 // rescan.
                 if self.sessions.window_open() {
+                    let kinds = self.profiles.sidebar_kinds();
                     self.sessions
-                        .files_changed(&self.env, &self.paths, &changed);
+                        .files_changed(&self.env, &self.paths, &kinds, &changed);
                     self.index_sessions();
                 }
                 Vec::new()

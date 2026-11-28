@@ -283,7 +283,8 @@ impl Core {
         }
         if feature == SafetyFeature::SidebarSync {
             // The user accepts the sidebars as they are now.
-            sidebar_sync::accept_current(&self.env, &self.paths, &mut self.sidebar_entries);
+            let kinds = self.profiles.sidebar_kinds();
+            sidebar_sync::accept_current(&self.env, &self.paths, &kinds, &mut self.sidebar_entries);
             self.sync_note = None;
             self.sync_result = None;
         }

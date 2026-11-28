@@ -328,13 +328,18 @@ pub(crate) struct Watch {
 impl Watch {
     /// Starts the watch while sync is `on` and the sidebars' folder exists
     /// (checked again on every input until it does); stops it when off.
-    pub(crate) fn reconcile(&mut self, env: &Environment, on: bool) -> Option<Effect> {
+    pub(crate) fn reconcile(
+        &mut self,
+        env: &Environment,
+        on: bool,
+        kinds: &SidebarKinds,
+    ) -> Option<Effect> {
         let root = ClaudePaths::new(&env.home).sidebar_root();
         if on && !self.watching && root.is_dir() {
             let desktop_paths = ClaudePaths::new(&env.home);
             *self = Watch {
                 watching: true,
-                desktop: active_key(&desktop_paths),
+                desktop: active_key(&desktop_paths, kinds),
                 main_log_length: desktop_account::main_log_length(&desktop_paths),
                 switched_at: env.clock.now(),
                 ..Watch::default()
@@ -350,12 +355,12 @@ impl Watch {
 
     /// Notes an account switch since the last look: another desktop folder,
     /// or a sign-in line in `main.log`.
-    pub(crate) fn notice_switch(&mut self, env: &Environment) {
+    pub(crate) fn notice_switch(&mut self, env: &Environment, kinds: &SidebarKinds) {
         if !self.watching {
             return;
         }
         let desktop_paths = ClaudePaths::new(&env.home);
-        let desktop = active_key(&desktop_paths);
+        let desktop = active_key(&desktop_paths, kinds);
         let signed_in =
             desktop_account::signed_in_since(&desktop_paths, self.main_log_length.unwrap_or(0));
         if desktop != self.desktop || signed_in {
@@ -369,18 +374,20 @@ impl Watch {
     /// were written by someone else: in the desktop's folder they schedule
     /// Automatic mode (when `automatic`); elsewhere, while Claude runs and
     /// not just after a switch, they are counted and returned (the dormant
-    /// multi-account mode's trace).
+    /// multi-account mode's trace). Leftover folders (`kinds`) count for
+    /// nothing: sync never writes them.
     pub(crate) fn files_changed(
         &mut self,
         env: &Environment,
         paths: &AppPaths,
+        kinds: &SidebarKinds,
         changed: &[PathBuf],
         automatic: bool,
     ) -> usize {
         if !self.watching {
             return 0;
         }
-        self.notice_switch(env);
+        self.notice_switch(env, kinds);
         let now = env.clock.now();
         let root = ClaudePaths::new(&env.home).sidebar_root();
         let record = load(paths);
@@ -389,6 +396,11 @@ impl Watch {
             let Some((key, name)) = entry_location(&root, path) else {
                 continue;
             };
+            if let Some((account, organization)) = key.split_once('/')
+                && kinds.of_folder(account, organization) == SidebarKind::Leftover
+            {
+                continue;
+            }
             let Some(body) = read_body(path) else {
                 continue;
             };
@@ -469,9 +481,10 @@ fn parse_body(bytes: &[u8]) -> Option<Map<String, Value>> {
     }
 }
 
-/// The desktop's Active Profile folder as `<account>/<org>`.
-fn active_key(desktop_paths: &ClaudePaths) -> Option<String> {
-    let account = desktop_account::desktop_account(desktop_paths)?;
+/// The desktop's Active Profile folder as `<account>/<org>`, leftovers
+/// left out.
+fn active_key(desktop_paths: &ClaudePaths, kinds: &SidebarKinds) -> Option<String> {
+    let account = desktop_account::desktop_account(desktop_paths, kinds)?;
     let org = account.organization_uuid?;
     Some(format!("{}/{org}", account.account_uuid))
 }
@@ -519,14 +532,14 @@ pub(crate) fn begin(
     cache: &mut EntryCache,
 ) -> Begun {
     let desktop_paths = ClaudePaths::new(&env.home);
-    let desktop = desktop_account::desktop_account(&desktop_paths);
+    let desktop = desktop_account::desktop_account(&desktop_paths, kinds);
     let running = env.os.desktop_app_running();
     if running && desktop.is_none() {
         return Begun::Ended(Run::DesktopAccountUnknown);
     }
     let read = read_all(&env.home, include_optional, cache);
     let record = load(paths);
-    let active_key = active_key(&desktop_paths);
+    let active_key = active_key(&desktop_paths, kinds);
     let active = read
         .folders
         .iter()
@@ -770,7 +783,12 @@ fn date_copy(file: &Path, bytes: &[u8], modified: SystemTime) -> Option<Stamp> {
 
 /// Resuming after a Safety pause: the user accepts the folders as they are
 /// now, so the next run compares against them.
-pub(crate) fn accept_current(env: &Environment, paths: &AppPaths, cache: &mut EntryCache) {
+pub(crate) fn accept_current(
+    env: &Environment,
+    paths: &AppPaths,
+    kinds: &SidebarKinds,
+    cache: &mut EntryCache,
+) {
     let desktop_paths = ClaudePaths::new(&env.home);
     let read = read_all(&env.home, false, cache);
     let mut record = load(paths);
@@ -779,7 +797,7 @@ pub(crate) fn accept_current(env: &Environment, paths: &AppPaths, cache: &mut En
         .iter()
         .map(|folder| (folder.key.clone(), copy_records(folder)))
         .collect();
-    record.desktop_folder = active_key(&desktop_paths);
+    record.desktop_folder = active_key(&desktop_paths, kinds);
     record.main_log_length = desktop_account::main_log_length(&desktop_paths);
     save(paths, &record);
 }
