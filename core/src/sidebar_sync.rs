@@ -63,6 +63,7 @@ use crate::desktop_account;
 use crate::env::Environment;
 use crate::interface::Effect;
 use crate::profiles::{SidebarKind, SidebarKinds};
+use crate::sidebar_entry;
 use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
 
@@ -93,24 +94,13 @@ const TITLE_FIELDS: [&str; 5] = [
 ];
 const ARCHIVE_FIELDS: [&str; 2] = ["isArchived", "autoArchiveExempt"];
 
-/// Entries with any of these are SSH Sessions.
-const SSH_MARKERS: [&str; 3] = ["sshConfig", "sshRemoteTranscriptPath", "sshRemoteProcessId"];
-/// … WSL Sessions.
-const WSL_MARKERS: [&str; 1] = ["wslConfig"];
-/// … scheduled-task Sessions.
-const SCHEDULED_MARKERS: [&str; 2] = ["scheduledTaskId", "notifySessionId"];
-
-/// The kind of a Session sync left out. SSH and No-folder Sessions only
-/// when "Include SSH and No-folder Sessions" is off; WSL and scheduled-task
-/// Sessions always: Claude runs those on one account only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum LeftOut {
-    Ssh,
-    /// A "No folder" Session, working in Claude's scratch workspace.
-    NoFolder,
-    Wsl,
-    ScheduledTask,
-}
+/// The kind of a Session sync left out ([`sidebar_entry::kind`]). SSH and
+/// No-folder Sessions only when "Include SSH and No-folder Sessions" is off;
+/// WSL and scheduled-task Sessions always ([`LeftOut::always`]): Claude runs
+/// those on one account only. A No-folder Session's copy keeps pointing at
+/// its scratch workspace (`scratch-workspaces/<account>/<org>/<id>`), which
+/// stays where it is.
+pub(crate) use crate::sidebar_entry::Kind as LeftOut;
 
 impl LeftOut {
     /// How the sync report names them ("17 SSH").
@@ -271,7 +261,7 @@ impl Entry {
             title: pick(body, &TITLE_FIELDS),
             archive: pick(body, &ARCHIVE_FIELDS),
             rest: rest_hash(body),
-            left_out: left_out(body),
+            left_out: sidebar_entry::kind(body),
             modified,
         }
     }
@@ -759,7 +749,7 @@ fn source_now(source: &Folder, name: &str, cache: &EntryCache) -> Option<Map<Str
     let body = parse_body(&fs::read(&path).ok()?)?;
     let stem = claude_files::sidebar_entry_id(name)?;
     (body.get("sessionId").and_then(Value::as_str) == Some(stem)
-        && left_out(&body) == planned.left_out)
+        && sidebar_entry::kind(&body) == planned.left_out)
         .then_some(body)
 }
 
@@ -1160,35 +1150,6 @@ fn read_folder(
             read.skipped.insert(name.clone(), why);
         }
         folder.copies.insert(name, summary);
-    }
-}
-
-/// Why sync doesn't copy this entry, if it doesn't: WSL and scheduled-task
-/// Sessions, and SSH and No-folder ones unless "Include SSH and No-folder
-/// Sessions" is on ([`LeftOut::always`]). A No-folder Session's copy keeps
-/// pointing at its scratch workspace
-/// (`scratch-workspaces/<account>/<org>/<id>`), which stays where it is.
-fn left_out(body: &Map<String, Value>) -> Option<LeftOut> {
-    let has = |markers: &[&str]| {
-        markers
-            .iter()
-            .any(|marker| body.get(*marker).is_some_and(|value| !value.is_null()))
-    };
-    let scratch = |field: &str| {
-        body.get(field)
-            .and_then(Value::as_str)
-            .is_some_and(claude_files::is_scratch_workspace)
-    };
-    if has(&WSL_MARKERS) {
-        Some(LeftOut::Wsl)
-    } else if has(&SCHEDULED_MARKERS) {
-        Some(LeftOut::ScheduledTask)
-    } else if has(&SSH_MARKERS) {
-        Some(LeftOut::Ssh)
-    } else if scratch("cwd") || scratch("originCwd") {
-        Some(LeftOut::NoFolder)
-    } else {
-        None
     }
 }
 

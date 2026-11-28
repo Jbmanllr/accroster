@@ -33,6 +33,7 @@ mod safety;
 mod sessions;
 mod settings;
 mod shell;
+mod sidebar_entry;
 mod sidebar_sync;
 mod stamp;
 mod storage;

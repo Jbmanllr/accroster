@@ -253,6 +253,28 @@ fn scratch_ssh_and_scheduled_task_entries_are_skipped() {
 }
 
 #[test]
+fn an_entry_whose_origin_is_a_scratch_workspace_is_skipped_and_a_null_marker_is_not_one() {
+    let mac = FakeMac::new();
+    transcript(&mac, S1, "moved out of scratch", 5, &[]);
+    transcript(&mac, S2, "null marker", 6, &[]);
+    let mut moved = entry(S1, "Moved title", "user", 1);
+    moved["cwd"] = json!("/Users/tester/Dev/app");
+    moved["originCwd"] = json!(format!(
+        "/Users/tester/Library/Application Support/Claude/scratch-workspaces/{ACCOUNT_A}/{ORG_A}/x"
+    ));
+    let mut null_marker = entry(S2, "Kept title", "user", 1);
+    null_marker["sshConfig"] = Value::Null;
+    mac.write_sidebar_entry(ACCOUNT_A, ORG_A, "x1", &moved);
+    mac.write_sidebar_entry(ACCOUNT_A, ORG_A, "x2", &null_marker);
+    let mut core = mac.launch();
+
+    assert_eq!(
+        titles(&open(&mut core)),
+        ["“moved out of scratch”", "Kept title"]
+    );
+}
+
+#[test]
 fn an_earlier_transcript_left_by_clear_is_its_own_row() {
     let mac = FakeMac::new();
     transcript(&mac, S1, "before clear", 60, &[]);

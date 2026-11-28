@@ -37,7 +37,13 @@ const LAYERS: &[(&str, &[&str])] = &[
     ),
     (
         "Claude's formats: one reader per undocumented format (ADR 0004).",
-        &["claude_json", "limit_offers", "usage", "live_processes"],
+        &[
+            "claude_json",
+            "limit_offers",
+            "usage",
+            "live_processes",
+            "sidebar_entry",
+        ],
     ),
     (
         "Services the features share.",

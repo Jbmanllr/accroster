@@ -59,6 +59,7 @@ One reader per undocumented format. Each checks the fields it uses every time it
 | `limit_offers` | Banked resets and Session refills in a usage reply. |
 | `usage` | The `get_usage` reply and the `/usage` fallback: a Limit reading. |
 | `live_processes` | `sessions/<pid>.json`: which Claude Code processes run, for which Session, busy or idle. |
+| `sidebar_entry` | What kind of Session a Sidebar entry is (SSH, WSL, scheduled-task, No-folder or ordinary), read from its marker fields and its `cwd` and `originCwd`. The Session index and Sidebar sync both ask `sidebar_entry::kind`. |
 
 ### Services
 
@@ -145,6 +146,7 @@ Each check reads the code's text (comments and test modules left out) and looks 
 - **Text shown to the user** uses the glossary's words.
 - **Who goes first.** Whether a Guided switch, a Sidebar sync or Reopen Claude may start is asked of `may_switch_desktop`, `may_reopen` and `may_sync` in `core/sidebar.rs`, nowhere else.
 - **What a Sidebar folder is** (a Profile's, the same Login in another Organization, a leftover, a Discovered Profile's) is asked of `profiles::SidebarKinds`.
+- **What kind of Session a Sidebar entry is** (SSH, WSL, scheduled-task, No-folder) is asked of `sidebar_entry::kind`.
 
 ## Adding something
 
