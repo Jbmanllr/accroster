@@ -1206,6 +1206,37 @@ fn claude_writes(mac: &FakeMac, profile: (&str, &str), id: &str) -> PathBuf {
     put(mac, profile, id, &body)
 }
 
+/// A leftover folder says nothing about the Profile Claude uses (ADR 0003):
+/// an entry Claude writes there doesn't read as the dormant multi-account
+/// mode, and is still copied out like any source.
+#[test]
+fn an_entry_claude_writes_in_a_leftover_folder_does_not_pause_sync() {
+    let mac = FakeMac::new();
+    let work = accroster_fake_mac::FixtureLogin::new(
+        WORK.0,
+        WORK.1,
+        "work@example.com",
+        "work@example.com's Organization",
+    );
+    mac.write_json(format!("{PROFILES}/p2/.claude.json"), &work.claude_json());
+    let leftover = (PERSO.0, WORK.1);
+    desktop_uses(&mac, PERSO);
+    put(&mac, PERSO, "s1", &entry("s1", "Fix login bug"));
+    empty_folder(&mac, WORK);
+    mac.os.set_desktop_app_running(true);
+    let mut core = manual(&mac);
+    sync(&mut core);
+    mac.clock.advance(seconds(60));
+
+    let parked = claude_writes(&mac, leftover, "p1");
+    changed(&mut core, &[parked]);
+
+    assert!(!is_paused(&core), "{:?}", warnings(&core));
+    sync(&mut core);
+    assert!(!is_paused(&core), "{:?}", warnings(&core));
+    assert!(read(&mac, WORK, "p1").is_some(), "read as a source");
+}
+
 #[test]
 fn an_entry_claude_writes_outside_its_folder_while_running_pauses_sync() {
     let (mac, mut core) = claude_running_on_perso();

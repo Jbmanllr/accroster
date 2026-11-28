@@ -39,8 +39,10 @@ impl Core {
 
     /// The desktop's account and Organization.
     pub(super) fn desktop_account(&self) -> Option<DesktopAccount> {
-        self.newest_entries
-            .desktop_account(&ClaudePaths::new(&self.env.home))
+        self.newest_entries.desktop_account(
+            &ClaudePaths::new(&self.env.home),
+            &self.profiles.sidebar_kinds(),
+        )
     }
 
     /// The signed-in Profiles the Limit monitor reads, with which are a

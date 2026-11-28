@@ -51,3 +51,13 @@ The desktop app now keeps two more fields that tie an entry to one account's con
 ## Amendment: Sync now waits while a Guided switch waits
 
 A Guided switch is confirmed by a new or changed entry in the target's Sidebar folder. Automatic sync already held back while a switch waited for Claude to sign in, because its copies in the target's folder would read as Claude signing in, and while Reopen Claude quits and opens Claude, so nothing is written while Claude shuts down or starts. "Sync now" did not, so clicking it during a switch confirmed the switch falsely. Every sync now asks one rule (`Core::may_sync`), and "Sync now" is off in Settings while that rule says wait. The sync a Guided switch begins with is unaffected: it runs before the switch starts waiting.
+
+## Amendment: leftover folders say nothing about the Profile Claude uses
+
+The desktop's Organization was the folder of its account that Claude wrote last, and a Guided switch was confirmed by the first folder Claude wrote after it began, leftover or not. An entry Claude wrote in a leftover folder of the target's account would then read as "Claude signed in as another Profile", and the menu header as "Desktop: another Profile", though the user signed in to the right account. Leftover folders now count for nothing in both places, judged by the one classifier of Sidebar folders (`SidebarKinds`):
+
+- The desktop's Organization is its account's folder written last among those that are not leftovers. The menu, All Sessions' title precedence and Sidebar sync's "which folder is Claude's" all take this answer.
+- In a Guided switch, an entry written in a leftover folder neither confirms nor contradicts. The switch keeps waiting for the target's folder, or for the sign-in line in `main.log`; a leftover folder of the target's account doesn't count as another Organization the account is in.
+- Sidebar sync's watch doesn't take an entry Claude writes in a leftover folder for the dormant multi-account mode: sync never writes there, so it says nothing about where the desktop writes in the background.
+
+This had not been seen on the owner's Mac, where leftover folders held no Session of their own.

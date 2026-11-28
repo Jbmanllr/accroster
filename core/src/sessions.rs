@@ -37,6 +37,7 @@ use crate::interface::{
     SidebarGroup, SidebarItem, SidebarPresence,
 };
 use crate::live_processes::{self, LiveProcess};
+use crate::profiles::SidebarKinds;
 use crate::sidebar_entry;
 use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
@@ -290,8 +291,9 @@ impl SessionIndex {
     /// A stat-only rescan of every source: re-reads only the Sidebar entries
     /// and live-process files that changed, and queues every new or changed
     /// Transcript for [`SessionIndex::step`], which saves the index once the
-    /// last batch is read.
-    pub(crate) fn rescan(&mut self, env: &Environment, paths: &AppPaths) {
+    /// last batch is read. `kinds` tells which Sidebar folders are leftovers,
+    /// which say nothing about the desktop's Organization.
+    pub(crate) fn rescan(&mut self, env: &Environment, paths: &AppPaths, kinds: &SidebarKinds) {
         self.home = env.home.clone();
         if !self.loaded {
             self.loaded = true;
@@ -305,22 +307,27 @@ impl SessionIndex {
             }
         }
         self.restat_transcripts();
-        self.restat_entries();
+        self.restat_entries(kinds);
         self.restat_live(env, paths);
         self.building = true;
     }
 
     /// The rescan at launch, so the first menu's Recent Sessions is filled:
     /// batches follow only when a Transcript is new or changed.
-    pub(crate) fn warm_up(&mut self, env: &Environment, paths: &AppPaths) {
-        self.rescan(env, paths);
+    pub(crate) fn warm_up(&mut self, env: &Environment, paths: &AppPaths, kinds: &SidebarKinds) {
+        self.rescan(env, paths, kinds);
         self.building = !self.pending.is_empty();
     }
 
     /// Opens the All Sessions window: a rescan, then the folders to watch
     /// while it stays open (only the first open asks for them).
-    pub(crate) fn open(&mut self, env: &Environment, paths: &AppPaths) -> Option<Vec<PathBuf>> {
-        self.rescan(env, paths);
+    pub(crate) fn open(
+        &mut self,
+        env: &Environment,
+        paths: &AppPaths,
+        kinds: &SidebarKinds,
+    ) -> Option<Vec<PathBuf>> {
+        self.rescan(env, paths, kinds);
         if self.window_open {
             return None;
         }
@@ -348,6 +355,7 @@ impl SessionIndex {
         &mut self,
         env: &Environment,
         paths: &AppPaths,
+        kinds: &SidebarKinds,
         changed: &[PathBuf],
     ) {
         let claude = ClaudePaths::new(&env.home);
@@ -384,7 +392,7 @@ impl SessionIndex {
             }
         }
         if entries {
-            self.restat_entries();
+            self.restat_entries(kinds);
         }
         if live {
             self.restat_live(env, paths);
@@ -498,7 +506,7 @@ impl SessionIndex {
     /// Claude writes entries temp-file-then-rename, so every write changes
     /// its folder's mtime: a folder whose mtime is unchanged since its last
     /// listing is skipped without a stat per entry.
-    fn restat_entries(&mut self) {
+    fn restat_entries(&mut self, kinds: &SidebarKinds) {
         let folders = entry_folders(&self.home);
         let listed: BTreeMap<PathBuf, u64> = folders
             .iter()
@@ -536,7 +544,7 @@ impl SessionIndex {
         self.entry_folders = listed;
         self.desktop = self
             .newest_entries
-            .desktop_account(&ClaudePaths::new(&self.home));
+            .desktop_account(&ClaudePaths::new(&self.home), kinds);
     }
 
     /// Re-reads the live-process files that changed, then which of their

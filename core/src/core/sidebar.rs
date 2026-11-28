@@ -305,9 +305,10 @@ impl Core {
             return;
         }
         let automatic = mode == SidebarSyncMode::Automatic && !paused;
+        let kinds = self.profiles.sidebar_kinds();
         let elsewhere =
             self.sidebar_watch
-                .files_changed(&self.env, &self.paths, changed, automatic);
+                .files_changed(&self.env, &self.paths, &kinds, changed, automatic);
         if elsewhere == 0 || paused {
             return;
         }
@@ -341,8 +342,9 @@ impl Core {
             return Vec::new();
         };
         if self.settings.sidebar_sync == SidebarSyncMode::Off {
+            let kinds = self.profiles.sidebar_kinds();
             let (desktop, ctx) = self.desktop();
-            return desktop.guide(&ctx, target);
+            return desktop.guide(&ctx, target, &kinds);
         }
         let (desktop, ctx) = self.desktop();
         desktop.syncing(&ctx, target);
@@ -360,8 +362,9 @@ impl Core {
         match desktop.confirm(&ctx) {
             Some(Confirmed::Unsure(target)) => self.guide_desktop_switch(Some(target)),
             Some(Confirmed::SyncStopped(target)) => {
+                let kinds = self.profiles.sidebar_kinds();
                 let (desktop, ctx) = self.desktop();
-                desktop.guide(&ctx, target)
+                desktop.guide(&ctx, target, &kinds)
             }
             None => Vec::new(),
         }
@@ -375,8 +378,9 @@ impl Core {
         };
         let reason = match ended {
             Run::Synced(_) => {
+                let kinds = self.profiles.sidebar_kinds();
                 let (desktop, ctx) = self.desktop();
-                return desktop.guide(&ctx, target);
+                return desktop.guide(&ctx, target, &kinds);
             }
             Run::Paused => self
                 .safety
