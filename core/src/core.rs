@@ -503,8 +503,7 @@ impl Core {
                     .iter()
                     .find(|profile| profile.id == id)
                     .map(Target::of);
-                // One thing at a time with Claude: a reopen under way first.
-                let Some(target) = target.filter(|_| !self.reopen.active()) else {
+                let Some(target) = target.filter(|_| self.may_switch_desktop()) else {
                     return Vec::new();
                 };
                 let (desktop, ctx) = self.desktop();
@@ -512,7 +511,7 @@ impl Core {
                 self.guide_desktop_switch(cleared)
             }
             Command::ReopenDesktopApp => {
-                if self.desktop.active() {
+                if !self.may_reopen() {
                     return Vec::new();
                 }
                 let (reopen, ctx) = self.reopen();
@@ -716,12 +715,9 @@ impl Core {
                 effects.extend(self.guide_desktop_switch(cleared));
                 effects.extend(self.poll_reopen());
                 self.sidebar_watch.notice_switch(&self.env);
-                // While a Guided switch waits, copies sync wrote would look
-                // like Claude writing the target's folder: sync waits too.
-                // So it does while Claude quits and opens again.
+                // A due sync that must wait stays due.
                 if self.settings.sidebar_sync == SidebarSyncMode::Automatic
-                    && !self.desktop.waiting()
-                    && !self.reopen.restarting()
+                    && self.may_sync()
                     && self.sidebar_watch.take_due(self.env.clock.now())
                 {
                     self.sync_sidebar();
@@ -940,8 +936,7 @@ impl Core {
             },
             sidebar_sync: SidebarSyncView {
                 mode: self.settings.sidebar_sync,
-                sync_now: (self.settings.sidebar_sync != SidebarSyncMode::Off)
-                    .then_some(Command::SyncSidebarNow),
+                sync_now: self.sync_now_offered().then_some(Command::SyncSidebarNow),
                 note: self.sync_settings_note(),
                 reopen: self.reopen_offered().then_some(Command::ReopenDesktopApp),
                 ssh_and_no_folder_sessions: Toggle {

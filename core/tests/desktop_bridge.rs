@@ -721,6 +721,46 @@ fn automatic_sync_waits_while_a_switch_waits_so_its_copies_confirm_nothing() {
 }
 
 #[test]
+fn sync_now_waits_while_a_switch_waits_so_its_copies_confirm_nothing() {
+    let (mac, mut core) = desktop_on_perso();
+    mac.os.set_desktop_app_running(true);
+    let work_folder = format!(
+        "Library/Application Support/Claude/claude-code-sessions/{}/{}",
+        work().account_uuid,
+        work().organization_uuid
+    );
+    std::fs::create_dir_all(mac.path(&work_folder)).unwrap();
+    core.command(Command::SetSidebarSync(SidebarSyncMode::Manual));
+    click_in_row(&mut core, WORK, SWITCH);
+    // The switch's own sync runs first, then it waits for the sign-in.
+    core.event(Event::Tick);
+    core.event(Event::Tick);
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
+    );
+
+    // Signed out, Claude keeps saving Perso's Sessions; the user syncs.
+    sidebar_entry(
+        &mac,
+        &FixtureLogin::perso(),
+        "c",
+        "New while signing out",
+        Duration::ZERO,
+    );
+    core.command(Command::SyncSidebarNow);
+    let effects = core.event(Event::Tick);
+    core.event(Event::Tick);
+
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(!mac.path(format!("{work_folder}/local_c.json")).exists());
+    assert_eq!(
+        status(&core).as_deref(),
+        Some(&*format!("Sign out in Claude, then sign in as {WORK}"))
+    );
+}
+
+#[test]
 fn the_switch_is_confirmed_from_the_folder_claude_writes() {
     let (mac, mut core, _) = switch_started();
     // Signed out: Claude keeps saving the old account's Sessions.
