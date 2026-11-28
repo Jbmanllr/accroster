@@ -32,6 +32,7 @@ use crate::desktop_account;
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 use crate::names::LoginNames;
 use crate::stamp::Stamp;
+use crate::times;
 
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +105,7 @@ impl Evidence {
                 n => format!("{n} Sessions"),
             }];
             if let Some(last) = self.last_activity {
-                parts.push(format!("last active {}", local(last, tz, "%b %-d")));
+                parts.push(format!("last active {}", times::date(last, tz)));
             }
             if self.desktop_last {
                 parts.push("Desktop's last Login".to_owned());
@@ -130,7 +131,7 @@ impl Evidence {
         if let Some(as_of) = self.login.as_ref().and_then(|login| login.as_of) {
             submenu.push(MenuItem::Detail(format!(
                 "as of {}",
-                local(as_of, tz, "%b %-d, %H:%M")
+                times::date_and_clock(as_of, tz)
             )));
         }
         submenu.push(MenuItem::Detail(format!(
@@ -324,10 +325,6 @@ fn cli_login(path: &Path) -> Option<(ProfileKey, Login)> {
 /// The first 8 characters of a uuid.
 fn short(uuid: &str) -> &str {
     uuid.get(..8).unwrap_or(uuid)
-}
-
-fn local(time: Timestamp, tz: &TimeZone, format: &str) -> String {
-    time.to_zoned(tz.clone()).strftime(format).to_string()
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -39,6 +39,7 @@ use crate::interface::{
 use crate::live_processes::{self, LiveProcess};
 use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
+use crate::times;
 
 /// Transcripts read per [`SessionIndex::step`].
 const BATCH: usize = 20;
@@ -1032,18 +1033,9 @@ fn project_folder(cwd: &str) -> &str {
         .map_or(cwd, |(repository, _)| repository)
 }
 
-/// `5 min ago`, `3 h ago`, `yesterday`, `4 days ago`.
+/// How long ago a Session was last active ([`times::ago`]).
 fn age(now: Timestamp, at_ms: i64) -> String {
-    let at = Timestamp::from_millisecond(at_ms).unwrap_or(now);
-    let elapsed = now.duration_since(at).max(SignedDuration::ZERO);
-    let minutes = elapsed.as_mins();
-    match minutes {
-        0 => "just now".into(),
-        1..60 => format!("{minutes} min ago"),
-        60..1440 => format!("{} h ago", minutes / 60),
-        1440..2880 => "yesterday".into(),
-        _ => format!("{} days ago", minutes / 1440),
-    }
+    times::ago(Timestamp::from_millisecond(at_ms).unwrap_or(now), now)
 }
 
 /// Every Session's Transcript, with its stamp.

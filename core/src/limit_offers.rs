@@ -10,6 +10,8 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
+use crate::times;
+
 /// CodexBar's parsing caps: at most this many grants are read, and the count
 /// shown never goes above [`MAX_RESETS`].
 const MAX_GRANTS: usize = 200;
@@ -158,7 +160,7 @@ pub(crate) fn lines(
         if refill.available {
             lines.push("Session refill available".to_owned());
         } else if let Some(next) = refill.next_available_at {
-            lines.push(format!("Next refill {}", day(next, now, tz)));
+            lines.push(format!("Next refill {}", times::day(next, now, tz)));
         }
     }
     lines
@@ -204,23 +206,7 @@ fn banked_line(banked: &BankedReset, now: Timestamp, tz: &TimeZone) -> Option<St
         } else {
             " · soonest expires "
         });
-        line.push_str(&day(soonest, now, tz));
+        line.push_str(&times::day(soonest, now, tz));
     }
     Some(line)
-}
-
-/// A day as the menu names it: "today", a weekday within the coming week,
-/// else the date ("Nov 3").
-pub(crate) fn day(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
-    let date = at.to_zoned(tz.clone()).date();
-    let today = now.to_zoned(tz.clone()).date();
-    let days_ahead = today
-        .until(date)
-        .map(|span| span.get_days())
-        .unwrap_or(i32::MAX);
-    match days_ahead {
-        0 => "today".to_owned(),
-        1..=6 => date.strftime("%a").to_string(),
-        _ => date.strftime("%b %-d").to_string(),
-    }
 }
