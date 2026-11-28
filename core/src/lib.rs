@@ -34,6 +34,7 @@ mod sessions;
 mod settings;
 mod shell;
 mod sidebar_sync;
+mod stamp;
 mod storage;
 mod usage;
 pub mod watcher;

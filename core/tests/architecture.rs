@@ -24,6 +24,7 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "interface",
             "claude_files",
+            "stamp",
             "storage",
             "env",
             "logging",

@@ -37,6 +37,7 @@ use crate::interface::{
     SidebarGroup, SidebarItem, SidebarPresence,
 };
 use crate::live_processes::{self, LiveProcess};
+use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
 
 /// Transcripts read per [`SessionIndex::step`].
@@ -253,9 +254,6 @@ struct SidebarEntry {
     last_activity_at: i64,
     cwd: Option<String>,
 }
-
-/// A file's size and mtime (ns): when either changes, it is read again.
-type Stamp = (u64, u64);
 
 /// A small source file as last read: its stamp and what it held (`None`
 /// when unreadable or skipped).
@@ -489,22 +487,23 @@ impl SessionIndex {
         self.transcripts.retain(|path, _| found.contains_key(path));
         self.pending = found
             .into_iter()
-            .filter(|(path, (size, mtime))| {
+            .map(|(path, stamp)| (path, stamp.len(), stamp.modified_ns()))
+            .filter(|(path, size, mtime)| {
                 self.transcripts
                     .get(path)
                     .is_none_or(|t| t.size != *size || t.mtime_ns != *mtime)
             })
-            .map(|(path, (size, mtime))| (path, size, mtime))
             .collect();
     }
 
     /// Stats one Transcript path FSEvents named.
     fn restat_transcript(&mut self, path: PathBuf) {
         self.pending.retain(|(queued, ..)| *queued != path);
-        let Some((size, mtime)) = regular_file_stamp(&path) else {
+        let Some(stamp) = Stamp::of_regular_file(&path) else {
             self.transcripts.remove(&path);
             return;
         };
+        let (size, mtime) = (stamp.len(), stamp.modified_ns());
         let known = self
             .transcripts
             .get(&path)
@@ -1047,27 +1046,11 @@ fn age(now: Timestamp, at_ms: i64) -> String {
     }
 }
 
-/// The size and mtime of a regular file that isn't a link.
-fn regular_file_stamp(path: &Path) -> Option<Stamp> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    meta.file_type().is_file().then(|| stamp_of(&meta))
-}
-
-/// A file's [`Stamp`], from its metadata.
-fn stamp_of(meta: &fs::Metadata) -> Stamp {
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_nanos() as u64);
-    (meta.len(), mtime)
-}
-
-/// Every Session's Transcript, with its size and mtime.
+/// Every Session's Transcript, with its stamp.
 fn transcript_files(home: &Path) -> BTreeMap<PathBuf, Stamp> {
     claude_files::transcript_files(&ClaudePaths::new(home).projects())
         .into_iter()
-        .map(|(path, meta)| (path, stamp_of(&meta)))
+        .filter_map(|(path, meta)| Some((path, Stamp::of(&meta)?)))
         .collect()
 }
 
@@ -1101,9 +1084,9 @@ fn entry_folders(home: &Path) -> Vec<(PathBuf, String, String, u64)> {
 fn entry_files(dir: &Path, account: &str, org: &str) -> Vec<(PathBuf, Stamp, Vec<String>)> {
     claude_files::sidebar_entry_files(dir)
         .into_iter()
-        .map(|(name, meta)| {
+        .filter_map(|(name, meta)| {
             let inside = vec![account.to_owned(), org.to_owned(), name.clone()];
-            (dir.join(name), stamp_of(&meta), inside)
+            Some((dir.join(name), Stamp::of(&meta)?, inside))
         })
         .collect()
 }
@@ -1157,7 +1140,7 @@ fn live_files(home: &Path, paths: &AppPaths) -> Vec<(PathBuf, Stamp, Vec<String>
         .iter()
         .flat_map(|config_dir| live_processes::files(config_dir))
         .filter_map(|path| {
-            let stamp = regular_file_stamp(&path)?;
+            let stamp = Stamp::of_regular_file(&path)?;
             Some((path, stamp, Vec::new()))
         })
         .collect()

@@ -31,6 +31,7 @@ use crate::claude_json;
 use crate::desktop_account;
 use crate::interface::{Command, DiscoveredRow, MenuItem, NicknameTarget, ProfileKey};
 use crate::names::LoginNames;
+use crate::stamp::Stamp;
 
 /// One discovered pair and what the Mac says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,8 +161,8 @@ impl Evidence {
 /// What the Sidebar folders held at the last scan, so a scan reads only what
 /// changed since. Claude writes entries temp-file-then-rename, so any write
 /// changes its folder's mtime: a folder whose mtime is unchanged is not
-/// listed again, and in a changed one only new or rewritten entries (by size
-/// and mtime) are read.
+/// listed again, and in a changed one only new or rewritten entries (by
+/// their [`Stamp`]) are read.
 #[derive(Debug, Default)]
 pub(crate) struct Scanner {
     folders: BTreeMap<PathBuf, Folder>,
@@ -175,9 +176,6 @@ struct Folder {
     /// with its newest activity.
     entries: BTreeMap<OsString, (Stamp, Option<Activity>)>,
 }
-
-/// A file's size and mtime.
-type Stamp = (u64, Option<SystemTime>);
 
 /// A readable entry's `lastActivityAt` (else `createdAt`).
 type Activity = Option<Timestamp>;
@@ -231,23 +229,23 @@ impl Scanner {
     }
 }
 
-/// A folder's `local_*.json` entries, reusing `known` for those whose size
-/// and mtime are unchanged and reading the rest.
+/// A folder's `local_*.json` entries, reusing `known` for those whose stamp
+/// is unchanged and reading the rest.
 fn list(
     folder: &Path,
     mut known: BTreeMap<OsString, (Stamp, Option<Activity>)>,
 ) -> BTreeMap<OsString, (Stamp, Option<Activity>)> {
     claude_files::sidebar_entry_files(folder)
         .into_iter()
-        .map(|(name, meta)| {
-            let stamp = (meta.len(), meta.modified().ok());
+        .filter_map(|(name, meta)| {
+            let stamp = Stamp::of(&meta)?;
             let path = folder.join(&name);
             let name = OsString::from(name);
             let activity = match known.remove(&name) {
                 Some((was, activity)) if was == stamp => activity,
                 _ => read_activity(&path, &meta),
             };
-            (name, (stamp, activity))
+            Some((name, (stamp, activity)))
         })
         .collect()
 }
@@ -330,4 +328,40 @@ fn short(uuid: &str) -> &str {
 
 fn local(time: Timestamp, tz: &TimeZone, format: &str) -> String {
     time.to_zoned(tz.clone()).strftime(format).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(ms: i64) -> Option<Activity> {
+        Some(Some(Timestamp::from_millisecond(ms).unwrap()))
+    }
+
+    /// A menu open must stay cheap with thousands of entries: an entry
+    /// whose stamp is unchanged keeps what was read from it, and only new
+    /// or rewritten ones are read.
+    #[test]
+    fn a_listing_reads_only_new_and_rewritten_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        fs::write(folder.join("local_a.json"), r#"{"lastActivityAt":1000}"#).unwrap();
+        fs::write(folder.join("local_b.json"), r#"{"lastActivityAt":2000}"#).unwrap();
+        let mut known = list(folder, BTreeMap::new());
+        assert_eq!(known[&OsString::from("local_a.json")].1, at(1000));
+        // What the files don't hold: reading one again would lose this.
+        known.get_mut(&OsString::from("local_a.json")).unwrap().1 = at(5);
+        known.get_mut(&OsString::from("local_b.json")).unwrap().1 = at(5);
+
+        let rewritten = folder.join("local_b.json.tmp");
+        fs::write(&rewritten, r#"{"lastActivityAt":3000}"#).unwrap();
+        fs::rename(&rewritten, folder.join("local_b.json")).unwrap();
+        fs::write(folder.join("local_c.json"), r#"{"createdAt":4000}"#).unwrap();
+        let listed = list(folder, known);
+
+        assert_eq!(listed[&OsString::from("local_a.json")].1, at(5));
+        assert_eq!(listed[&OsString::from("local_b.json")].1, at(3000));
+        assert_eq!(listed[&OsString::from("local_c.json")].1, at(4000));
+        assert_eq!(listed.len(), 3);
+    }
 }
