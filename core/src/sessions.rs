@@ -7,8 +7,8 @@
 //!   Transcripts and links skipped), read incrementally and remembered in the
 //!   disposable `index/sessions.json`, keyed by path, size and mtime;
 //! - every Sidebar entry in every `claude-code-sessions/<account>/<org>/`
-//!   folder, joined to its Transcript by `cliSessionId` (scratch, SSH/WSL and
-//!   scheduled-task entries skipped);
+//!   folder, joined to its Transcript by `cliSessionId` (SSH, WSL,
+//!   scheduled-task and No-folder entries skipped);
 //! - live-process files `sessions/<pid>.json` in `~/.claude` and every Profile
 //!   folder, for the running dots.
 //!
@@ -27,7 +27,7 @@ use std::time::UNIX_EPOCH;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::claude_files::{self, ClaudePaths, DESKTOP_ENTRYPOINT};
 use crate::desktop_account::{DesktopAccount, NewestEntries};
@@ -37,6 +37,7 @@ use crate::interface::{
     SidebarGroup, SidebarItem, SidebarPresence,
 };
 use crate::live_processes::{self, LiveProcess};
+use crate::sidebar_entry;
 use crate::stamp::Stamp;
 use crate::storage::{self, AppPaths, VersionedFile};
 use crate::times;
@@ -214,29 +215,6 @@ struct EntryFile {
     is_archived: Option<bool>,
     last_activity_at: Option<i64>,
     cwd: Option<String>,
-    ssh_config: Option<Value>,
-    ssh_remote_transcript_path: Option<Value>,
-    ssh_remote_process_id: Option<Value>,
-    wsl_config: Option<Value>,
-    scheduled_task_id: Option<Value>,
-    notify_session_id: Option<Value>,
-}
-
-impl EntryFile {
-    /// Scratch, SSH/WSL and scheduled-task entries aren't Sessions of this
-    /// Mac's Transcripts.
-    fn skipped(&self) -> bool {
-        self.ssh_config.is_some()
-            || self.ssh_remote_transcript_path.is_some()
-            || self.ssh_remote_process_id.is_some()
-            || self.wsl_config.is_some()
-            || self.scheduled_task_id.is_some()
-            || self.notify_session_id.is_some()
-            || self
-                .cwd
-                .as_deref()
-                .is_some_and(claude_files::is_scratch_workspace)
-    }
 }
 
 /// One Sidebar entry, in one Profile's folder.
@@ -1116,14 +1094,18 @@ fn modified_ns(path: &Path) -> Option<u64> {
 }
 
 /// A Sidebar entry the index uses: non-empty, at most 10 MB, parsable, and
-/// not skipped.
+/// an ordinary Session. SSH, WSL, scheduled-task and No-folder entries
+/// ([`sidebar_entry::kind`]) aren't Sessions of this Mac's Transcripts.
 fn read_entry(path: &Path) -> Option<EntryFile> {
     let size = fs::metadata(path).ok()?.len();
     if size == 0 || size > claude_files::MAX_ENTRY_BYTES {
         return None;
     }
-    let entry: EntryFile = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (!entry.skipped()).then_some(entry)
+    let body: Map<String, Value> = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if sidebar_entry::kind(&body).is_some() {
+        return None;
+    }
+    serde_json::from_value(Value::Object(body)).ok()
 }
 
 /// Every live-process file, in `~/.claude` and in every Profile folder.

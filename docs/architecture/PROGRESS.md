@@ -82,7 +82,7 @@ Behaviour unchanged; `a_leftover_folder_in_another_profiles_personal_organizatio
 
 This came from an architecture review of 2026-11-02 whose findings had not been acted on. Its other candidates are in `TASKS.md`: two were done by rounds 1 and 2 (one reader of the Sidebar folders' layout, one reader of live-process files), one is task 8, and four are tasks 15 to 18.
 
-Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 19 take the task pool's open tasks.
+Rounds 1 to 11 were merged as pull request 82. Rounds 12 to 20 take the task pool's open tasks.
 
 ## Round 12: one file stamp (task 9)
 
@@ -130,9 +130,15 @@ The second gap came from the independent review of this round. "Switch Claude to
 
 7 to 12 ms per input is not slow enough to earn a cache with its own invalidation, so the join stays as it is. The probe was a temporary ignored test and is not kept.
 
+## Round 20: one rule for what kind of Session a Sidebar entry is (task 8, decision D1)
+
+The Session index (`EntryFile::skipped`) and Sidebar sync (`left_out`, with its own lists of marker fields) each decided whether a Sidebar entry is an SSH, WSL, scheduled-task or No-folder Session. Both ask `sidebar_entry::kind`, a new module among Claude's formats, which keeps sync's rule: WSL, then scheduled-task, then SSH, then No-folder, a JSON `null` marker counting as absent. Sync's `LeftOut` is that kind under its old name; what it reports and logs is unchanged, and `claude_files::is_scratch_workspace` still says what a scratch workspace is.
+
+One difference, decided as D1: an entry whose `originCwd` is a scratch workspace and whose `cwd` is not is now a No-folder Session for the Session index too, so it is left out there; its Session keeps its row when its Transcript exists, with the Transcript's own title. `an_entry_whose_origin_is_a_scratch_workspace_is_skipped_and_a_null_marker_is_not_one` failed before the change. None of the 11,403 entries on the owner's Mac was in that case on 2026-11-28. The Session index now parses an entry as JSON before reading its fields, as sync already did.
+
 ## Where it stands
 
-- The gate is green on the branch: format, lint, and 33 test binaries (397 tests), nine of them architecture checks.
-- Open: issues #84 (one rule for an entry's kind, was task 8) and #85 (leftover folders and the Guided switch). `TASKS.md` lists them with the questions already answered.
+- The gate is green on the branch: format, lint, and 33 test binaries (398 tests), nine of them architecture checks.
+- Open: issue #85 (leftover folders and the Guided switch). `TASKS.md` lists it with the questions already answered.
 - Not checked by any test: the AppKit layer (round 16 says how it was checked by hand).
-- Persisted files and settings are unchanged. What the user can see changed in one place: "Sync now" is off while a Guided switch waits or Claude restarts.
+- Persisted files and settings are unchanged. What the user can see changed in two places: "Sync now" is off while a Guided switch waits or Claude restarts, and All Sessions leaves out an entry whose `originCwd` is a scratch workspace (round 20; none on the owner's Mac).
